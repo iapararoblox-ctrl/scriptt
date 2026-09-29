@@ -13,29 +13,27 @@ screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 local toggleButton = Instance.new("TextButton")
 toggleButton.Name = "ToggleButton"
 toggleButton.Size = UDim2.new(0, 50, 0, 50)
-toggleButton.Position = UDim2.new(0.02, 0, 0.4, 0) -- Posición adaptable en pantalla
+toggleButton.Position = UDim2.new(0.02, 0, 0.4, 0)
 toggleButton.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
 toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 toggleButton.Text = "🌐"
 toggleButton.TextSize = 24
-toggleButton.Visible = false -- Oculto al inicio
+toggleButton.Visible = false
 toggleButton.Parent = screenGui
 
 local toggleCorner = Instance.new("UICorner")
 toggleCorner.CornerRadius = UDim2.new(0, 12)
 toggleCorner.Parent = toggleButton
 
--- Panel Principal Adaptable
+-- Panel Principal
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
--- Usamos Size relativo (Scale) para adaptarse a teléfonos y computadoras
 mainFrame.Size = UDim2.new(0.85, 0, 0.7, 0) 
 mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.Parent = screenGui
 
--- Mantener proporción visual máxima en pantallas muy grandes/pequeñas
 local uiAspectRatio = Instance.new("UIAspectRatioConstraint")
 uiAspectRatio.AspectRatio = 1.4
 uiAspectRatio.AspectType = Enum.AspectType.FitWithinMaxSize
@@ -45,7 +43,7 @@ local frameCorner = Instance.new("UICorner")
 frameCorner.CornerRadius = UDim2.new(0, 10)
 frameCorner.Parent = mainFrame
 
--- Barra Superior (Título y Botón X)
+-- Barra Superior
 local titleBar = Instance.new("Frame")
 titleBar.Size = UDim2.new(1, 0, 0, 40)
 titleBar.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
@@ -65,7 +63,7 @@ titleText.TextXAlignment = Enum.TextXAlignment.Left
 titleText.TextScaled = true
 titleText.Parent = titleBar
 
--- Botón Cerrar (X)
+-- Botón Cerrar
 local closeButton = Instance.new("TextButton")
 closeButton.Size = UDim2.new(0, 30, 0, 30)
 closeButton.Position = UDim2.new(0.98, -30, 0.5, -15)
@@ -79,7 +77,7 @@ local closeCorner = Instance.new("UICorner")
 closeCorner.CornerRadius = UDim2.new(0, 6)
 closeCorner.Parent = closeButton
 
--- Contenedor de la lista de servidores (ScrollingFrame)
+-- Contenedor de lista
 local scrollFrame = Instance.new("ScrollingFrame")
 scrollFrame.Size = UDim2.new(0.94, 0, 0.8, 0)
 scrollFrame.Position = UDim2.new(0.03, 0, 0.16, 0)
@@ -92,7 +90,7 @@ uiListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 uiListLayout.Padding = UDim.new(0, 8)
 uiListLayout.Parent = scrollFrame
 
--- Funcionalidad de Abrir / Cerrar Panel
+-- Eventos de visibilidad
 closeButton.MouseButton1Click:Connect(function()
     mainFrame.Visible = false
     toggleButton.Visible = true
@@ -105,7 +103,6 @@ end)
 
 -- Función para Obtener y Mostrar Servidores Activos
 local function loadServers()
-    -- Limpiar lista anterior
     for _, child in pairs(scrollFrame:GetChildren()) do
         if child:IsA("Frame") then child:Destroy() end
     end
@@ -113,9 +110,9 @@ local function loadServers()
     local placeId = game.PlaceId
     local currentJobId = game.JobId
 
-    -- Solicitud a la API pública de Roblox para obtener servidores
+    -- SOLUCIÓN 1: URL corregida a /servers/Public
     local success, response = pcall(function()
-        local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/0?sortOrder=Asc&limit=25"
+        local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=25"
         return game:HttpGet(url)
     end)
 
@@ -124,7 +121,6 @@ local function loadServers()
         
         if data and data.data then
             for _, server in ipairs(data.data) do
-                -- Filtrar para no mostrar el servidor actual ni servidores llenos
                 if server.id ~= currentJobId and server.playing < server.maxPlayers then
                     
                     local serverCard = Instance.new("Frame")
@@ -159,18 +155,19 @@ local function loadServers()
                     joinCorner.CornerRadius = UDim2.new(0, 6)
                     joinCorner.Parent = joinButton
 
-                    -- Evento para unirse al servidor especificado
                     joinButton.MouseButton1Click:Connect(function()
                         joinButton.Text = "Teleport..."
                         TeleportService:TeleportToPlaceInstance(placeId, server.id, LocalPlayer)
                     end)
                 end
             end
-            -- Ajustar el tamaño del canvas según los elementos
+
+            -- SOLUCIÓN 2: Espera breve para que Roblox procese los tamaños antes de ajustar el Canvas
+            task.wait(0.1)
             scrollFrame.CanvasSize = UDim2.new(0, 0, 0, uiListLayout.AbsoluteContentSize.Y + 10)
         end
     end
 end
 
--- Cargar servidores al iniciar
+-- Cargar servidores
 loadServers()
