@@ -243,6 +243,7 @@ local modeNames = { "Solo Modelos", "Modelos + Carpetas", "Todo (cualquier objet
 -- "Pen_3_12" -> "Pen_#_#" ; uuid -> <uuid>
 local function normName(n)
     n = n:gsub("%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x", "<uuid>")
+    n = n:gsub("^(HeldPet_).+(_%a+)$", "%1<usuario>%2")
     n = n:gsub("%d+", "#")
     return n
 end
@@ -502,6 +503,93 @@ local function myCharReport()
         end
     end
     return scrub(table.concat(out, "\n"))
+end
+
+-- Detalle objeto por objeto (Pet_<uuid>, HeldPet_<usuario>_left, etc.)
+local DETAIL_MAX = 60
+
+local function valueOf(inst)
+    local ok, v = pcall(function() return inst.Value end)
+    return ok and ser(v, 0) or "?"
+end
+
+local function describe(d, indent, depth, out)
+    local pad = string.rep("  ", indent)
+    local line = pad .. d.ClassName .. ": " .. d.Name
+    if d:IsA("ValueBase") then line = line .. " = " .. valueOf(d) end
+    local okA, attrs = pcall(d.GetAttributes, d)
+    if okA and attrs and next(attrs) then line = line .. "  attrs=" .. ser(attrs, 0) end
+    out[#out + 1] = line
+    if depth <= 0 then return end
+
+    local n, counts = 0, {}
+    for _, c in ipairs(d:GetChildren()) do
+        if c:IsA("ValueBase") or c:IsA("Folder") or c:IsA("Model") or c:IsA("Configuration")
+            or c:IsA("Tool") or c:IsA("ProximityPrompt") then
+            n += 1
+            if n <= 25 then describe(c, indent + 1, depth - 1, out) end
+        else
+            counts[c.ClassName] = (counts[c.ClassName] or 0) + 1
+        end
+    end
+    if n > 25 then out[#out + 1] = pad .. "  … (" .. (n - 25) .. " más)" end
+    local parts = {}
+    for k, v in pairs(counts) do parts[#parts + 1] = k .. " x" .. v end
+    table.sort(parts)
+    if #parts > 0 then out[#out + 1] = pad .. "  (+ " .. table.concat(parts, ", ") .. ")" end
+end
+
+local function detailReport(filterText)
+    local filter = (filterText or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    local needles = filter ~= "" and { filter } or { "pet_", "heldpet_" }
+    local out = {
+        "=== DETALLE DE OBJETOS ===",
+        "Juego: " .. gameName() .. " | PlaceId: " .. game.PlaceId,
+        "Buscando nombres que contengan: " .. table.concat(needles, " / "),
+        "",
+    }
+
+    local described, found, n = {}, 0, 0
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        n += 1
+        if n % 400 == 0 then task.wait() end
+        if d:IsA("Model") or d:IsA("Folder") or d:IsA("Tool") then
+            local nm = d.Name:lower()
+            local match = false
+            for _, p in ipairs(needles) do
+                if nm:find(p, 1, true) then match = true break end
+            end
+            if match then
+                -- no repetir hijos de algo ya descrito
+                local nested, a = false, d.Parent
+                while a and a ~= Workspace do
+                    if described[a] then nested = true break end
+                    a = a.Parent
+                end
+                if not nested then
+                    described[d] = true
+                    found += 1
+                    if found <= DETAIL_MAX then
+                        local mine = false
+                        if d:GetAttribute("OwnerUserId") == player.UserId then mine = true end
+                        if d.Name:find(player.Name, 1, true) then mine = true end
+                        out[#out + 1] = "### " .. relPath(d) .. (mine and "   (MÍO)" or "")
+                        local pos = instPos(d)
+                        if pos then
+                            out[#out + 1] = string.format("  pos: %.1f, %.1f, %.1f", pos.X, pos.Y, pos.Z)
+                        end
+                        describe(d, 1, 2, out)
+                        out[#out + 1] = ""
+                    end
+                end
+            end
+        end
+    end
+    out[2] = out[2]
+    out[#out + 1] = "Coincidencias: " .. found .. (found > DETAIL_MAX and (" (mostrando " .. DETAIL_MAX .. "; usa un filtro más concreto)") or "")
+    local text = scrub(table.concat(out, "\n"))
+    if #text > MAX_SCAN then text = text:sub(1, MAX_SCAN) .. "\n… (recortado)" end
+    return text, found
 end
 
 ----------------------------------------------------------------
@@ -825,6 +913,23 @@ previewLabel.Font = Enum.Font.Code
 
 local charBtn = bigButton(pageScan, "👤  Ver mi personaje y mochila (copia)", C.Accent, 42)
 charBtn.TextSize = 12
+local detailBtn = bigButton(pageScan, "🐾  Detalle objeto por objeto (filtro vacío = Pet_ y HeldPet_)", C.Accent, 46)
+detailBtn.TextSize = 12
+detailBtn.TextWrapped = true
+detailBtn.Activated:Connect(function()
+    if scan.busy then return end
+    scan.busy = true
+    scan.status = "Leyendo detalle…"
+    task.spawn(function()
+        local ok, text, found = pcall(detailReport, filterBox.Text)
+        scan.busy = false
+        if not ok then scan.status = "⚠ Error: " .. tostring(text):sub(1, 70) return end
+        scan.report = text
+        scan.preview = "Detalle: " .. found .. " objetos encontrados"
+        scan.status = (copyText(text) and "📋 Copiado" or "⚠ No se pudo copiar (usa Guardar)")
+            .. " — " .. found .. " objetos, " .. #text .. " car."
+    end)
+end)
 local scanCopy = bigButton(pageScan, "📋  Copiar informe del scanner", C.Green, 50)
 local scanSave = bigButton(pageScan, "💾  Guardar scanner en archivo", C.Btn, 40)
 
