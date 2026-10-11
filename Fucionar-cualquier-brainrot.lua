@@ -83,7 +83,7 @@ pcall(function()
     end
 end)
 S.Interval = clamp(S.Interval, 5, 300)
-S.Delay    = clamp(S.Delay, 100, 2000)
+S.Delay    = clamp(S.Delay, 20, 2000)
 S.Mode     = clamp(math.floor(S.Mode), 1, 3)
 S.Scale    = clamp(S.Scale, 70, 150)
 
