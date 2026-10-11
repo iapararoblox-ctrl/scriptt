@@ -1,131 +1,169 @@
 --[[
     ═══════════════════════════════════════════════════════════
-    SCRIPT PARA DELTA - Steal a Brainrot (estilo)
-    Basado en el volcado de juego_pruebaaaa.txt
+    DELTA SCRIPT v2 - Steal a Brainrot (CORREGIDO)
+    ═══════════════════════════════════════════════════════════
+    ✓ Auto Steal (ProximityPrompts "Steal?")
+    ✓ Auto Sell (vía remotes y GUI)
+    ✓ Auto Claim Earnings
+    ✓ Auto Rebirth
+    ✓ Auto Collect All (Jail)
+    ✓ Auto Polish
+    ✓ Speed Hack
+    ✓ Noclip
+    ✓ Anti-AFK
+    ✓ ESP de Items
     ═══════════════════════════════════════════════════════════
 ]]
 
 -- ═══════════════════════════════════════════════════════════
--- SERVICIOS Y VARIABLES GLOBALES
+-- SERVICIOS
 -- ═══════════════════════════════════════════════════════════
-local Players = game:GetService("Players")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local StarterGui = game:GetService("StarterGui")
-local Workspace = game:GetService("Workspace")
-local Lighting = game:GetService("Lighting")
+local RunService        = game:GetService("RunService")
+local StarterGui        = game:GetService("StarterGui")
+local Workspace         = game:GetService("Workspace")
+local VirtualUser       = game:GetService("VirtualUser")
+local UserInputService  = game:GetService("UserInputService")
 
-local LocalPlayer = Players.LocalPlayer
-local Backpack = LocalPlayer:WaitForChild("Backpack")
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-local leaderstats = LocalPlayer:WaitForChild("leaderstats")
-local dataFolder = LocalPlayer:WaitForChild("data")
+local LP     = Players.LocalPlayer
+local Char   = LP.Character or LP.CharacterAdded:Wait()
+local Hum    = Char:WaitForChild("Humanoid")
+local Root   = Char:WaitForChild("HumanoidRootPart")
+local PlayerGui = LP:WaitForChild("PlayerGui")
+local Backpack = LP:WaitForChild("Backpack")
+local Leaderstats = LP:WaitForChild("leaderstats")
 
--- Remotes
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+-- ═══════════════════════════════════════════════════════════
+-- REMOTES (verificados del volcado)
+-- ═══════════════════════════════════════════════════════════
+local Remotes       = ReplicatedStorage:WaitForChild("Remotes")
 local ServerRemotes = Remotes:WaitForChild("Server")
 local ClientRemotes = Remotes:WaitForChild("Client")
+
+local function getRemote(name)
+    return ServerRemotes:FindFirstChild(name)
+end
 
 -- ═══════════════════════════════════════════════════════════
 -- CONFIGURACIÓN
 -- ═══════════════════════════════════════════════════════════
-local Config = {
-    AutoSteal = false,
-    AutoSell = false,
-    AutoClaim = false,
-    AutoRebirth = false,
-    AutoPolish = false,
-    SpeedHack = false,
-    SpeedValue = 100,
-    InstantProximity = false,
-    NoClip = false,
-    AntiAFK = true,
-    AutoCollectAll = false,
-    AutoClaimEarnings = false,
-    AutoClaimGroupReward = false,
-    AutoTutorial = false,
-    AutoWatchedCutscene = false,
-    AutoPlaceItem = false,
-    AutoSellItems = false,
+local CFG = {
+    AutoSteal       = false,
+    AutoSell        = false,
+    AutoClaim       = false,
+    AutoRebirth     = false,
+    AutoPolish      = false,
+    AutoCollect     = false,
+    AutoTutorial    = false,
+    AutoTreadmill   = false,
+    SpeedHack       = false,
+    SpeedValue      = 100,
+    Noclip          = false,
+    AntiAFK         = true,
+    ESP             = false,
+    StealRange      = 15,  -- Distancia para teletransportar al item
 }
 
 -- ═══════════════════════════════════════════════════════════
--- UTILIDADES
+-- NOTIFICACIONES
 -- ═══════════════════════════════════════════════════════════
-local function notify(title, text, duration)
+local function notify(title, text, dur)
     pcall(function()
         StarterGui:SetCore("SendNotification", {
-            Title = title,
-            Text = text,
-            Duration = duration or 3,
+            Title = title, Text = text, Duration = dur or 3
         })
     end)
 end
 
-local function getRemote(folder, name)
-    local remote = folder:FindFirstChild(name)
-    if remote and remote:IsA("RemoteEvent") then
-        return remote
-    end
-    return nil
+-- ═══════════════════════════════════════════════════════════
+-- TELETRANSPORTE
+-- ═══════════════════════════════════════════════════════════
+local function tpTo(pos)
+    if not Root or not Root.Parent then return end
+    pcall(function()
+        Root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+    end)
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 1. AUTO STEAL (ProximityPrompts)
+-- 1. AUTO STEAL (ProximityPrompts "Steal?")
 -- ═══════════════════════════════════════════════════════════
-local function getAllProximityPrompts()
-    local prompts = {}
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") and obj.Enabled then
-            table.insert(prompts, obj)
-        end
-    end
-    return prompts
-end
-
-local function fireProximityPrompt(prompt)
+local function firePrompt(prompt)
     if not prompt or not prompt.Parent then return end
-    local character = LocalPlayer.Character
-    if not character then return end
-    
     pcall(function()
         if fireproximityprompt then
-            fireproximityprompt(prompt, 0)
-        elseif prompt:IsA("ProximityPrompt") then
-            prompt:InputHoldBegin()
-            task.wait(0.05)
-            prompt:InputHoldEnd()
+            fireproximityprompt(prompt)
         end
     end)
 end
 
 local function autoStealLoop()
-    while Config.AutoSteal do
-        task.wait(0.1)
-        local prompts = getAllProximityPrompts()
-        for _, prompt in ipairs(prompts) do
-            if prompt.ActionText == "Steal?" or prompt.ActionText == "Steal" then
-                fireProximityPrompt(prompt)
+    while CFG.AutoSteal do
+        task.wait(0.15)
+        if not Char or not Char.Parent then 
+            Char = LP.Character or LP.CharacterAdded:Wait()
+            Hum = Char:WaitForChild("Humanoid")
+            Root = Char:WaitForChild("HumanoidRootPart")
+        end
+        
+        -- Buscar todos los ProximityPrompts en Stages (donde están los items robables)
+        local stages = Workspace:FindFirstChild("Stages")
+        if not stages then task.wait(1) continue end
+        
+        for _, prompt in ipairs(stages:GetDescendants()) do
+            if prompt:IsA("ProximityPrompt") 
+               and prompt.ActionText == "Steal?" 
+               and prompt.Enabled then
+                -- Teletransportarse al item y disparar prompt
+                local itemPart = prompt.Parent
+                if itemPart and itemPart:IsA("BasePart") then
+                    tpTo(itemPart.Position)
+                    task.wait(0.05)
+                end
+                firePrompt(prompt)
+                task.wait(0.05)
             end
         end
     end
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 2. AUTO SELL
+-- 2. AUTO SELL (remotes + GUI fallback)
 -- ═══════════════════════════════════════════════════════════
 local function autoSellLoop()
-    while Config.AutoSell do
+    while CFG.AutoSell do
         task.wait(0.5)
-        local sellRemote = getRemote(ServerRemotes, "SellItem")
-        if sellRemote then
-            -- Buscar items en la mochila para vender
-            for _, tool in ipairs(Backpack:GetChildren()) do
-                if tool:IsA("Tool") then
-                    pcall(function()
-                        sellRemote:FireServer(tool)
-                    end)
+        
+        -- Método 1: Buscar items en el plot y hacer Pickup
+        local plots = Workspace:FindFirstChild("Plots")
+        if plots then
+            for _, prompt in ipairs(plots:GetDescendants()) do
+                if prompt:IsA("ProximityPrompt") 
+                   and prompt.ActionText == "Pickup" 
+                   and prompt.Enabled then
+                    firePrompt(prompt)
+                    task.wait(0.1)
+                end
+            end
+        end
+        
+        -- Método 2: Buscar items que ya tenemos y venderlos via GUI
+        local sellFrame = PlayerGui:FindFirstChild("Main")
+        if sellFrame then
+            sellFrame = sellFrame:FindFirstChild("SellingFrame")
+            if sellFrame then
+                local bottom = sellFrame:FindFirstChild("BottomFrame")
+                if bottom then
+                    local btns = bottom:FindFirstChild("Buttons")
+                    if btns then
+                        local sellAll = btns:FindFirstChild("SellAllButton")
+                        if sellAll and sellAll:IsA("ImageButton") then
+                            pcall(function()
+                                sellAll.MouseButton1Click:Fire()
+                            end)
+                        end
+                    end
                 end
             end
         end
@@ -136,32 +174,16 @@ end
 -- 3. AUTO CLAIM EARNINGS
 -- ═══════════════════════════════════════════════════════════
 local function autoClaimLoop()
-    while Config.AutoClaim do
-        task.wait(1)
-        local claimAllRemote = getRemote(ServerRemotes, "ClaimAllEarnings")
-        local claimRemote = getRemote(ServerRemotes, "ClaimEarnings")
+    while CFG.AutoClaim do
+        task.wait(1.5)
         
-        if claimAllRemote then
-            pcall(function()
-                claimAllRemote:FireServer()
-            end)
-        end
+        local claimAll = getRemote("ClaimAllEarnings")
+        local claim = getRemote("ClaimEarnings")
+        local group = getRemote("ClaimGroupReward")
         
-        if claimRemote then
-            pcall(function()
-                claimRemote:FireServer()
-            end)
-        end
-        
-        -- ClaimGroupReward
-        if Config.AutoClaimGroupReward then
-            local groupRemote = getRemote(ServerRemotes, "ClaimGroupReward")
-            if groupRemote then
-                pcall(function()
-                    groupRemote:FireServer()
-                end)
-            end
-        end
+        if claimAll then pcall(function() claimAll:FireServer() end) end
+        if claim then pcall(function() claim:FireServer() end) end
+        if group then pcall(function() group:FireServer() end) end
     end
 end
 
@@ -169,13 +191,11 @@ end
 -- 4. AUTO REBIRTH
 -- ═══════════════════════════════════════════════════════════
 local function autoRebirthLoop()
-    while Config.AutoRebirth do
+    while CFG.AutoRebirth do
         task.wait(2)
-        local rebirthRemote = getRemote(ServerRemotes, "Rebirth")
-        if rebirthRemote then
-            pcall(function()
-                rebirthRemote:FireServer()
-            end)
+        local remote = getRemote("Rebirth")
+        if remote then
+            pcall(function() remote:FireServer() end)
         end
     end
 end
@@ -184,22 +204,19 @@ end
 -- 5. AUTO POLISH
 -- ═══════════════════════════════════════════════════════════
 local function autoPolishLoop()
-    while Config.AutoPolish do
-        task.wait(1)
-        -- Buscar la máquina de pulir
-        local polishingMachine = Workspace:FindFirstChild("Map")
-        if polishingMachine then
-            local machines = polishingMachine:FindFirstChild("Machines")
+    while CFG.AutoPolish do
+        task.wait(0.8)
+        local map = Workspace:FindFirstChild("Map")
+        if map then
+            local machines = map:FindFirstChild("Machines")
             if machines then
-                local polishMachine = machines:FindFirstChild("Polishing Machine")
-                if polishMachine then
-                    local marker = polishMachine:FindFirstChild("Marker")
-                    if marker then
-                        local startPrompt = marker:FindFirstChild("StartPromptAttachment")
-                        if startPrompt then
-                            local prompt = startPrompt:FindFirstChild("StartPrompt")
-                            if prompt and prompt.Enabled then
-                                fireProximityPrompt(prompt)
+                local pm = machines:FindFirstChild("Polishing Machine")
+                if pm then
+                    for _, prompt in ipairs(pm:GetDescendants()) do
+                        if prompt:IsA("ProximityPrompt") and prompt.Enabled then
+                            if prompt.ActionText == "Start?" 
+                               or prompt.ActionText == "Place Item?" then
+                                firePrompt(prompt)
                             end
                         end
                     end
@@ -210,65 +227,66 @@ local function autoPolishLoop()
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 6. SPEED HACK
+-- 6. AUTO COLLECT ALL (Jail)
 -- ═══════════════════════════════════════════════════════════
-local function applySpeed()
-    local character = LocalPlayer.Character
-    if character then
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid.WalkSpeed = Config.SpeedValue
-        end
-    end
-end
-
-local function speedHackLoop()
-    while Config.SpeedHack do
+local function autoCollectLoop()
+    while CFG.AutoCollect do
+        task.wait(1)
+        if not Root or not Root.Parent then continue end
+        
+        local map = Workspace:FindFirstChild("Map")
+        if not map then continue end
+        local jail = map:FindFirstChild("Jail")
+        if not jail then continue end
+        local pad = jail:FindFirstChild("CollectAllPad")
+        if not pad then continue end
+        local hitbox = pad:FindFirstChild("Hitbox")
+        if not hitbox then continue end
+        
+        -- Teletransportar al pad y tocar
+        tpTo(hitbox.Position)
         task.wait(0.1)
-        applySpeed()
-    end
-end
-
--- ═══════════════════════════════════════════════════════════
--- 7. INSTANT PROXIMITY PROMPT
--- ═══════════════════════════════════════════════════════════
-local function enableInstantProximity()
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then
+        
+        if firetouchinterest then
             pcall(function()
-                obj.HoldDuration = 0
+                firetouchinterest(Root, hitbox, 0)
+                task.wait(0.05)
+                firetouchinterest(Root, hitbox, 1)
             end)
         end
     end
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 8. NOCLIP
+-- 7. AUTO TUTORIAL
 -- ═══════════════════════════════════════════════════════════
-local noclipConnection
-local function toggleNoclip(state)
-    Config.NoClip = state
-    if state then
-        noclipConnection = RunService.Stepped:Connect(function()
-            local character = LocalPlayer.Character
-            if character then
-                for _, part in ipairs(character:GetDescendants()) do
-                    if part:IsA("BasePart") then
-                        part.CanCollide = false
-                    end
-                end
-            end
-        end)
-    else
-        if noclipConnection then
-            noclipConnection:Disconnect()
-            noclipConnection = nil
-        end
-        local character = LocalPlayer.Character
-        if character then
-            for _, part in ipairs(character:GetDescendants()) do
-                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                    part.CanCollide = true
+local function autoTutorialLoop()
+    while CFG.AutoTutorial do
+        task.wait(2)
+        local complete = getRemote("TutorialComplete")
+        local step = getRemote("TutorialStep")
+        local watched = getRemote("WatchedCutscene")
+        
+        if step then pcall(function() step:FireServer(1) end) end
+        if watched then pcall(function() watched:FireServer() end) end
+        if complete then pcall(function() complete:FireServer() end) end
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- 8. AUTO TREADMILL (equipar automáticamente)
+-- ═══════════════════════════════════════════════════════════
+local function autoTreadmillLoop()
+    while CFG.AutoTreadmill do
+        task.wait(1)
+        -- Buscar herramienta con IsTreadmill en backpack
+        for _, tool in ipairs(Backpack:GetChildren()) do
+            if tool:IsA("Tool") then
+                local hasAttr = tool:GetAttribute("IsTreadmill")
+                if hasAttr then
+                    pcall(function()
+                        Hum:EquipTool(tool)
+                    end)
                 end
             end
         end
@@ -276,81 +294,73 @@ local function toggleNoclip(state)
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 9. ANTI-AFK
+-- 9. SPEED HACK
 -- ═══════════════════════════════════════════════════════════
-local antiAfkConnection
+local function speedLoop()
+    while CFG.SpeedHack do
+        task.wait(0.1)
+        if Hum and Hum.Parent then
+            Hum.WalkSpeed = CFG.SpeedValue
+        end
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- 10. NOCLIP
+-- ═══════════════════════════════════════════════════════════
+local noclipConn
+local function setNoclip(state)
+    if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+    if state then
+        noclipConn = RunService.Stepped:Connect(function()
+            if Char then
+                for _, p in ipairs(Char:GetDescendants()) do
+                    if p:IsA("BasePart") then p.CanCollide = false end
+                end
+            end
+        end)
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- 11. ANTI-AFK
+-- ═══════════════════════════════════════════════════════════
 local function enableAntiAFK()
-    if antiAfkConnection then antiAfkConnection:Disconnect() end
-    antiAfkConnection = LocalPlayer.Idled:Connect(function()
+    LP.Idled:Connect(function()
         pcall(function()
-            game:GetService("VirtualUser"):CaptureController()
-            game:GetService("VirtualUser"):ClickButton2(Vector2.new())
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
         end)
     end)
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 10. AUTO COLLECT ALL (CollectAllPad)
+-- 12. ESP DE ITEMS (Highlight)
 -- ═══════════════════════════════════════════════════════════
-local function autoCollectAllLoop()
-    while Config.AutoCollectAll do
-        task.wait(2)
-        -- Buscar el CollectAllPad en Jail
-        local map = Workspace:FindFirstChild("Map")
-        if map then
-            local jail = map:FindFirstChild("Jail")
-            if jail then
-                local collectPad = jail:FindFirstChild("CollectAllPad")
-                if collectPad then
-                    local hitbox = collectPad:FindFirstChild("Hitbox")
-                    if hitbox then
-                        local touchInterest = hitbox:FindFirstChild("TouchInterest")
-                        if touchInterest and firetouchinterest then
-                            local character = LocalPlayer.Character
-                            if character and character:FindFirstChild("HumanoidRootPart") then
-                                firetouchinterest(character.HumanoidRootPart, hitbox, 0)
-                                task.wait(0.1)
-                                firetouchinterest(character.HumanoidRootPart, hitbox, 1)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
+local espFolder = Instance.new("Folder", Workspace)
+espFolder.Name = "DeltaESP"
+
+local function clearESP()
+    for _, c in ipairs(espFolder:GetChildren()) do c:Destroy() end
 end
 
--- ═══════════════════════════════════════════════════════════
--- 11. AUTO PLACE ITEM (Plots)
--- ═══════════════════════════════════════════════════════════
-local function autoPlaceItemLoop()
-    while Config.AutoPlaceItem do
+local function espLoop()
+    while CFG.ESP do
         task.wait(1)
-        local placeRemote = getRemote(ServerRemotes, "PlaceItem")
-        if placeRemote then
-            -- Buscar slots disponibles en el plot
-            local plots = Workspace:FindFirstChild("Plots")
-            if plots then
-                for _, plot in ipairs(plots:GetChildren()) do
-                    if plot.Name:find("Plot") then
-                        local floors = plot:FindFirstChild("Floors")
-                        if floors then
-                            for _, floor in ipairs(floors:GetChildren()) do
-                                local slots = floor:FindFirstChild("Slots")
-                                if slots then
-                                    for _, slot in ipairs(slots:GetChildren()) do
-                                        local marker = slot:FindFirstChild("Marker")
-                                        if marker then
-                                            local prompt = marker:FindFirstChild("ActionPrompt")
-                                            if prompt and prompt.Enabled and prompt.ActionText == "Place" then
-                                                fireProximityPrompt(prompt)
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
+        clearESP()
+        local stages = Workspace:FindFirstChild("Stages")
+        if not stages then continue end
+        
+        for _, prompt in ipairs(stages:GetDescendants()) do
+            if prompt:IsA("ProximityPrompt") and prompt.ActionText == "Steal?" then
+                local item = prompt.Parent
+                if item and item:IsA("BasePart") then
+                    local hl = Instance.new("Highlight")
+                    hl.Adornee = item
+                    hl.FillColor = Color3.fromRGB(255, 50, 50)
+                    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    hl.FillTransparency = 0.5
+                    hl.Parent = espFolder
                 end
             end
         end
@@ -358,402 +368,164 @@ local function autoPlaceItemLoop()
 end
 
 -- ═══════════════════════════════════════════════════════════
--- 12. AUTO TUTORIAL
--- ═══════════════════════════════════════════════════════════
-local function autoTutorialLoop()
-    while Config.AutoTutorial do
-        task.wait(2)
-        local tutorialComplete = getRemote(ServerRemotes, "TutorialComplete")
-        local tutorialStep = getRemote(ServerRemotes, "TutorialStep")
-        
-        if tutorialComplete then
-            pcall(function()
-                tutorialComplete:FireServer()
-            end)
-        end
-        
-        if tutorialStep then
-            pcall(function()
-                tutorialStep:FireServer()
-            end)
-        end
-        
-        if Config.AutoWatchedCutscene then
-            local watchedCutscene = getRemote(ServerRemotes, "WatchedCutscene")
-            if watchedCutscene then
-                pcall(function()
-                    watchedCutscene:FireServer()
-                end)
-            end
-        end
-    end
-end
-
--- ═══════════════════════════════════════════════════════════
--- 13. AUTO SELL ITEMS (desde Selling Shop)
--- ═══════════════════════════════════════════════════════════
-local function autoSellItemsLoop()
-    while Config.AutoSellItems do
-        task.wait(0.5)
-        local sellRemote = getRemote(ServerRemotes, "SellItem")
-        if sellRemote then
-            -- Buscar items en el plot para vender
-            local plots = Workspace:FindFirstChild("Plots")
-            if plots then
-                for _, plot in ipairs(plots:GetChildren()) do
-                    if plot.Name:find("Plot") then
-                        local floors = plot:FindFirstChild("Floors")
-                        if floors then
-                            for _, floor in ipairs(floors:GetChildren()) do
-                                local slots = floor:FindFirstChild("Slots")
-                                if slots then
-                                    for _, slot in ipairs(slots:GetChildren()) do
-                                        local marker = slot:FindFirstChild("Marker")
-                                        if marker then
-                                            local prompt = marker:FindFirstChild("ActionPrompt")
-                                            if prompt and prompt.Enabled and prompt.ActionText == "Pickup" then
-                                                fireProximityPrompt(prompt)
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
--- ═══════════════════════════════════════════════════════════
--- 14. FUNCIONES DE UTILIDAD EXTRA
--- ═══════════════════════════════════════════════════════════
-local function getSpeed()
-    return leaderstats and leaderstats:FindFirstChild("Speed") and leaderstats.Speed.Value or "0"
-end
-
-local function getCash()
-    return leaderstats and leaderstats:FindFirstChild("Cash") and leaderstats.Cash.Value or "0"
-end
-
-local function getRebirths()
-    return dataFolder and dataFolder:FindFirstChild("Rebirths") and dataFolder.Rebirths.Value or 0
-end
-
--- ═══════════════════════════════════════════════════════════
--- 15. INTERFAZ GRÁFICA (UI)
+-- 13. INTERFAZ GRÁFICA
 -- ═══════════════════════════════════════════════════════════
 local function createUI()
-    local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "DeltaScriptUI"
-    screenGui.ResetOnSpawn = false
-    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    screenGui.Parent = PlayerGui
-
-    local mainFrame = Instance.new("Frame")
-    mainFrame.Name = "MainFrame"
-    mainFrame.Size = UDim2.new(0, 300, 0, 450)
-    mainFrame.Position = UDim2.new(0, 20, 0, 100)
-    mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Active = true
-    mainFrame.Draggable = true
-    mainFrame.Parent = screenGui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = mainFrame
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(100, 100, 255)
+    -- Eliminar UI previa
+    local old = PlayerGui:FindFirstChild("DeltaUI")
+    if old then old:Destroy() end
+    
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "DeltaUI"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = PlayerGui
+    
+    local main = Instance.new("Frame")
+    main.Size = UDim2.new(0, 260, 0, 420)
+    main.Position = UDim2.new(0, 15, 0.5, -210)
+    main.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Draggable = true
+    main.Parent = sg
+    
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", main)
+    stroke.Color = Color3.fromRGB(120, 80, 255)
     stroke.Thickness = 2
-    stroke.Parent = mainFrame
-
-    local title = Instance.new("TextLabel")
-    title.Name = "Title"
-    title.Size = UDim2.new(1, 0, 0, 40)
-    title.Position = UDim2.new(0, 0, 0, 0)
-    title.BackgroundColor3 = Color3.fromRGB(50, 50, 80)
-    title.BorderSizePixel = 0
-    title.Text = "⚡ Delta Script - Steal a Brainrot"
+    
+    -- Header
+    local header = Instance.new("Frame", main)
+    header.Size = UDim2.new(1, 0, 0, 35)
+    header.BackgroundColor3 = Color3.fromRGB(40, 30, 70)
+    header.BorderSizePixel = 0
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+    
+    local title = Instance.new("TextLabel", header)
+    title.Size = UDim2.new(1, -40, 1, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "⚡ DELTA - Lucky Farm"
     title.TextColor3 = Color3.fromRGB(255, 255, 255)
     title.TextSize = 14
     title.Font = Enum.Font.GothamBold
-    title.Parent = mainFrame
-
-    local titleCorner = Instance.new("UICorner")
-    titleCorner.CornerRadius = UDim.new(0, 8)
-    titleCorner.Parent = title
-
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Name = "Close"
-    closeBtn.Size = UDim2.new(0, 30, 0, 30)
-    closeBtn.Position = UDim2.new(1, -35, 0, 5)
-    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    closeBtn.BorderSizePixel = 0
-    closeBtn.Text = "X"
-    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    closeBtn.TextSize = 14
-    closeBtn.Font = Enum.Font.GothamBold
-    closeBtn.Parent = title
-
-    local closeCorner = Instance.new("UICorner")
-    closeCorner.CornerRadius = UDim.new(0, 6)
-    closeCorner.Parent = closeBtn
-
-    local scrollFrame = Instance.new("ScrollingFrame")
-    scrollFrame.Name = "Scroll"
-    scrollFrame.Size = UDim2.new(1, -10, 1, -50)
-    scrollFrame.Position = UDim2.new(0, 5, 0, 45)
-    scrollFrame.BackgroundTransparency = 1
-    scrollFrame.BorderSizePixel = 0
-    scrollFrame.ScrollBarThickness = 4
-    scrollFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 255)
-    scrollFrame.Parent = mainFrame
-
-    local uiList = Instance.new("UIListLayout")
-    uiList.SortOrder = Enum.SortOrder.LayoutOrder
-    uiList.Padding = UDim.new(0, 5)
-    uiList.Parent = scrollFrame
-
-    local function createButton(text, callback, order)
-        local btn = Instance.new("TextButton")
-        btn.Name = text:gsub("%s", "")
-        btn.Size = UDim2.new(1, -10, 0, 35)
-        btn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    title.Position = UDim2.new(0, 10, 0, 0)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    
+    -- Botón cerrar
+    local close = Instance.new("TextButton", header)
+    close.Size = UDim2.new(0, 25, 0, 25)
+    close.Position = UDim2.new(1, -30, 0, 5)
+    close.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    close.Text = "✕"
+    close.TextColor3 = Color3.fromRGB(255, 255, 255)
+    close.TextSize = 14
+    close.Font = Enum.Font.GothamBold
+    close.BorderSizePixel = 0
+    Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+    close.MouseButton1Click:Connect(function() sg:Destroy() end)
+    
+    -- Info del jugador
+    local info = Instance.new("TextLabel", main)
+    info.Size = UDim2.new(1, -20, 0, 30)
+    info.Position = UDim2.new(0, 10, 0, 40)
+    info.BackgroundColor3 = Color3.fromRGB(30, 30, 45)
+    info.BorderSizePixel = 0
+    info.Text = "💰 Cash: 0  |  ⚡ Speed: 0"
+    info.TextColor3 = Color3.fromRGB(200, 200, 255)
+    info.TextSize = 11
+    info.Font = Enum.Font.Gotham
+    Instance.new("UICorner", info).CornerRadius = UDim.new(0, 6)
+    
+    -- Scroll
+    local scroll = Instance.new("ScrollingFrame", main)
+    scroll.Size = UDim2.new(1, -10, 1, -85)
+    scroll.Position = UDim2.new(0, 5, 0, 75)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 4
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    
+    local layout = Instance.new("UIListLayout", scroll)
+    layout.Padding = UDim.new(0, 4)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    
+    -- Función para crear toggle
+    local function mkToggle(text, key, order, callback)
+        local btn = Instance.new("TextButton", scroll)
+        btn.Size = UDim2.new(1, -5, 0, 32)
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
         btn.BorderSizePixel = 0
-        btn.Text = text
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Text = "  " .. text .. "  [ OFF ]"
+        btn.TextColor3 = Color3.fromRGB(220, 220, 220)
         btn.TextSize = 12
-        btn.Font = Enum.Font.Gotham
-        btn.LayoutOrder = order or 1
-        btn.Parent = scrollFrame
-
-        local btnCorner = Instance.new("UICorner")
-        btnCorner.CornerRadius = UDim.new(0, 6)
-        btnCorner.Parent = btn
-
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.LayoutOrder = order
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        
         btn.MouseButton1Click:Connect(function()
-            btn.BackgroundColor3 = Color3.fromRGB(80, 80, 120)
-            task.wait(0.1)
-            btn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
-            callback()
-        end)
-    end
-
-    local function createToggle(text, configKey, order)
-        local btn = Instance.new("TextButton")
-        btn.Name = text:gsub("%s", "")
-        btn.Size = UDim2.new(1, -10, 0, 35)
-        btn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
-        btn.BorderSizePixel = 0
-        btn.Text = text .. ": OFF"
-        btn.TextColor3 = Color3.fromRGB(255, 100, 100)
-        btn.TextSize = 12
-        btn.Font = Enum.Font.Gotham
-        btn.LayoutOrder = order or 1
-        btn.Parent = scrollFrame
-
-        local btnCorner = Instance.new("UICorner")
-        btnCorner.CornerRadius = UDim.new(0, 6)
-        btnCorner.Parent = btn
-
-        btn.MouseButton1Click:Connect(function()
-            Config[configKey] = not Config[configKey]
-            if Config[configKey] then
-                btn.Text = text .. ": ON"
-                btn.TextColor3 = Color3.fromRGB(100, 255, 100)
+            CFG[key] = not CFG[key]
+            if CFG[key] then
+                btn.Text = "  " .. text .. "  [ ON ]"
+                btn.BackgroundColor3 = Color3.fromRGB(60, 140, 60)
+                btn.TextColor3 = Color3.fromRGB(200, 255, 200)
+                if callback then task.spawn(callback) end
             else
-                btn.Text = text .. ": OFF"
-                btn.TextColor3 = Color3.fromRGB(255, 100, 100)
+                btn.Text = "  " .. text .. "  [ OFF ]"
+                btn.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+                btn.TextColor3 = Color3.fromRGB(220, 220, 220)
             end
         end)
     end
-
+    
     -- Botones
-    createButton("🚀 Auto Steal", function()
-        Config.AutoSteal = not Config.AutoSteal
-        if Config.AutoSteal then
-            task.spawn(autoStealLoop)
-            notify("Delta", "Auto Steal: ON")
-        else
-            notify("Delta", "Auto Steal: OFF")
+    mkToggle("🚀 Auto Steal", "AutoSteal", 1, autoStealLoop)
+    mkToggle("💰 Auto Sell", "AutoSell", 2, autoSellLoop)
+    mkToggle("💵 Auto Claim Earnings", "AutoClaim", 3, autoClaimLoop)
+    mkToggle("🔄 Auto Rebirth", "AutoRebirth", 4, autoRebirthLoop)
+    mkToggle("✨ Auto Polish", "AutoPolish", 5, autoPolishLoop)
+    mkToggle("📦 Auto Collect All (Jail)", "AutoCollect", 6, autoCollectLoop)
+    mkToggle("📚 Auto Tutorial", "AutoTutorial", 7, autoTutorialLoop)
+    mkToggle("🏃 Auto Treadmill", "AutoTreadmill", 8, autoTreadmillLoop)
+    mkToggle("👻 Noclip", "Noclip", 9, function() setNoclip(true) end)
+    mkToggle("⚡ Speed Hack (100)", "SpeedHack", 10, speedLoop)
+    mkToggle("👁️ ESP Items", "ESP", 11, espLoop)
+    
+    -- Botón limpiar (no toggle)
+    local cleanBtn = Instance.new("TextButton", scroll)
+    cleanBtn.Size = UDim2.new(1, -5, 0, 32)
+    cleanBtn.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+    cleanBtn.BorderSizePixel = 0
+    cleanBtn.Text = "  🧹 Limpiar todos los toggles"
+    cleanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    cleanBtn.TextSize = 12
+    cleanBtn.Font = Enum.Font.GothamMedium
+    cleanBtn.LayoutOrder = 12
+    cleanBtn.TextXAlignment = Enum.TextXAlignment.Left
+    Instance.new("UICorner", cleanBtn).CornerRadius = UDim.new(0, 6)
+    cleanBtn.MouseButton1Click:Connect(function()
+        for k, _ in pairs(CFG) do
+            if type(CFG[k]) == "boolean" then CFG[k] = false end
         end
-    end, 1)
-
-    createButton("💰 Auto Sell", function()
-        Config.AutoSell = not Config.AutoSell
-        if Config.AutoSell then
-            task.spawn(autoSellLoop)
-            notify("Delta", "Auto Sell: ON")
-        else
-            notify("Delta", "Auto Sell: OFF")
-        end
-    end, 2)
-
-    createButton("💵 Auto Claim Earnings", function()
-        Config.AutoClaim = not Config.AutoClaim
-        if Config.AutoClaim then
-            task.spawn(autoClaimLoop)
-            notify("Delta", "Auto Claim: ON")
-        else
-            notify("Delta", "Auto Claim: OFF")
-        end
-    end, 3)
-
-    createButton("🔄 Auto Rebirth", function()
-        Config.AutoRebirth = not Config.AutoRebirth
-        if Config.AutoRebirth then
-            task.spawn(autoRebirthLoop)
-            notify("Delta", "Auto Rebirth: ON")
-        else
-            notify("Delta", "Auto Rebirth: OFF")
-        end
-    end, 4)
-
-    createButton("✨ Auto Polish", function()
-        Config.AutoPolish = not Config.AutoPolish
-        if Config.AutoPolish then
-            task.spawn(autoPolishLoop)
-            notify("Delta", "Auto Polish: ON")
-        else
-            notify("Delta", "Auto Polish: OFF")
-        end
-    end, 5)
-
-    createButton("🏃 Speed Hack (100)", function()
-        Config.SpeedHack = not Config.SpeedHack
-        if Config.SpeedHack then
-            task.spawn(speedHackLoop)
-            notify("Delta", "Speed Hack: ON (100)")
-        else
-            notify("Delta", "Speed Hack: OFF")
-        end
-    end, 6)
-
-    createButton("⚡ Instant Proximity", function()
-        enableInstantProximity()
-        notify("Delta", "Proximity Prompts instantáneos")
-    end, 7)
-
-    createButton("👻 Noclip", function()
-        toggleNoclip(not Config.NoClip)
-        notify("Delta", "Noclip: " .. (Config.NoClip and "ON" or "OFF"))
-    end, 8)
-
-    createButton("🤖 Anti-AFK", function()
-        Config.AntiAFK = not Config.AntiAFK
-        if Config.AntiAFK then
-            enableAntiAFK()
-            notify("Delta", "Anti-AFK: ON")
-        else
-            if antiAfkConnection then
-                antiAfkConnection:Disconnect()
-                antiAfkConnection = nil
-            end
-            notify("Delta", "Anti-AFK: OFF")
-        end
-    end, 9)
-
-    createButton("📦 Auto Collect All", function()
-        Config.AutoCollectAll = not Config.AutoCollectAll
-        if Config.AutoCollectAll then
-            task.spawn(autoCollectAllLoop)
-            notify("Delta", "Auto Collect: ON")
-        else
-            notify("Delta", "Auto Collect: OFF")
-        end
-    end, 10)
-
-    createButton("📥 Auto Place Item", function()
-        Config.AutoPlaceItem = not Config.AutoPlaceItem
-        if Config.AutoPlaceItem then
-            task.spawn(autoPlaceItemLoop)
-            notify("Delta", "Auto Place: ON")
-        else
-            notify("Delta", "Auto Place: OFF")
-        end
-    end, 11)
-
-    createButton("📚 Auto Tutorial", function()
-        Config.AutoTutorial = not Config.AutoTutorial
-        Config.AutoWatchedCutscene = Config.AutoTutorial
-        if Config.AutoTutorial then
-            task.spawn(autoTutorialLoop)
-            notify("Delta", "Auto Tutorial: ON")
-        else
-            notify("Delta", "Auto Tutorial: OFF")
-        end
-    end, 12)
-
-    createButton("💸 Auto Sell Items", function()
-        Config.AutoSellItems = not Config.AutoSellItems
-        if Config.AutoSellItems then
-            task.spawn(autoSellItemsLoop)
-            notify("Delta", "Auto Sell Items: ON")
-        else
-            notify("Delta", "Auto Sell Items: OFF")
-        end
-    end, 13)
-
-    -- Información
-    local infoLabel = Instance.new("TextLabel")
-    infoLabel.Name = "Info"
-    infoLabel.Size = UDim2.new(1, -10, 0, 60)
-    infoLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
-    infoLabel.BorderSizePixel = 0
-    infoLabel.Text = "📊 Speed: " .. tostring(getSpeed()) .. "\n💰 Cash: " .. tostring(getCash())
-    infoLabel.TextColor3 = Color3.fromRGB(200, 200, 255)
-    infoLabel.TextSize = 11
-    infoLabel.Font = Enum.Font.Gotham
-    infoLabel.LayoutOrder = 14
-    infoLabel.Parent = scrollFrame
-
-    local infoCorner = Instance.new("UICorner")
-    infoCorner.CornerRadius = UDim.new(0, 6)
-    infoCorner.Parent = infoLabel
-
+        setNoclip(false)
+        clearESP()
+        sg:Destroy()
+        notify("Delta", "Todos los toggles reiniciados", 2)
+        task.wait(0.1)
+        createUI()
+    end)
+    
     -- Actualizar info cada segundo
     task.spawn(function()
-        while screenGui.Parent do
+        while sg.Parent do
             task.wait(1)
-            pcall(function()
-                infoLabel.Text = "📊 Speed: " .. tostring(getSpeed()) .. "\n💰 Cash: " .. tostring(getCash())
-            end)
-        end
-    end)
-
-    closeBtn.MouseButton1Click:Connect(function()
-        screenGui:Destroy()
-    end)
-
-    -- Minimizar
-    local minimizeBtn = Instance.new("TextButton")
-    minimizeBtn.Name = "Minimize"
-    minimizeBtn.Size = UDim2.new(0, 30, 0, 30)
-    minimizeBtn.Position = UDim2.new(1, -70, 0, 5)
-    minimizeBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 120)
-    minimizeBtn.BorderSizePixel = 0
-    minimizeBtn.Text = "—"
-    minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    minimizeBtn.TextSize = 16
-    minimizeBtn.Font = Enum.Font.GothamBold
-    minimizeBtn.Parent = title
-
-    local minCorner = Instance.new("UICorner")
-    minCorner.CornerRadius = UDim.new(0, 6)
-    minCorner.Parent = minimizeBtn
-
-    local minimized = false
-    minimizeBtn.MouseButton1Click:Connect(function()
-        minimized = not minimized
-        if minimized then
-            mainFrame.Size = UDim2.new(0, 300, 0, 40)
-            scrollFrame.Visible = false
-        else
-            mainFrame.Size = UDim2.new(0, 300, 0, 450)
-            scrollFrame.Visible = true
+            local cash = Leaderstats:FindFirstChild("Cash")
+            local speed = Leaderstats:FindFirstChild("Speed")
+            info.Text = "💰 Cash: " .. (cash and cash.Value or "?") 
+                     .. "  |  ⚡ Speed: " .. (speed and speed.Value or "?")
         end
     end)
 end
@@ -761,28 +533,23 @@ end
 -- ═══════════════════════════════════════════════════════════
 -- INICIALIZACIÓN
 -- ═══════════════════════════════════════════════════════════
-local function init()
-    -- Esperar a que el personaje cargue
-    if not LocalPlayer.Character then
-        LocalPlayer.CharacterAdded:Wait()
-    end
-    
+-- Reconectar al respawn
+LP.CharacterAdded:Connect(function(c)
+    Char = c
+    Hum = c:WaitForChild("Humanoid")
+    Root = c:WaitForChild("HumanoidRootPart")
     task.wait(1)
-    
-    -- Crear UI
-    createUI()
-    
-    -- Anti-AFK por defecto
-    enableAntiAFK()
-    
-    -- Notificar
-    notify("⚡ Delta Script", "Cargado correctamente", 5)
-    
-    -- Aplicar speed si está activado
-    if Config.SpeedHack then
-        task.spawn(speedHackLoop)
-    end
-end
+    if CFG.Noclip then setNoclip(true) end
+end)
 
--- Ejecutar
-init()
+-- Anti-AFK siempre activo
+enableAntiAFK()
+
+-- Crear UI
+task.wait(1)
+createUI()
+
+notify("⚡ Delta Script", "¡Cargado correctamente!", 4)
+print("[Delta] Script cargado")
+print("[Delta] fireproximityprompt:", tostring(fireproximityprompt ~= nil))
+print("[Delta] firetouchinterest:", tostring(firetouchinterest ~= nil))
