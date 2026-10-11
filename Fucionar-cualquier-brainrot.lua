@@ -1,18 +1,15 @@
 --[[
-    AUTO-RECOLECTOR v2 para "Fusiona cualquier cosa en Brainrot"
+    AUTO-RECOLECTOR v3 para "Fusiona cualquier cosa en Brainrot"
     Delta (Mobile/PC)
 
-    ARREGLO: ahora el personaje se acerca a cada colector (como cuando caminas),
-    envía su posición real y al final vuelve a donde estaba.
+    NUEVO v3:
+    - Pestaña 🛒 Brainrot: comprar salvajes (WildService.BuyPet) y fusionar (WildService.FuseWildPet)
+      automático o manual, con filtro de monedas/s mínimas y límite por ronda.
+    - Copiar última respuesta de compra/fusión para depurar.
+    - Diagnóstico ampliado.
 
-    - 3 modos de posición: Teletransportar (recomendado) / Mi personaje / Colector
-    - Elegir qué pisos recoger
-    - Salta corrales vacíos durante 5 min (menos llamadas, menos errores)
-    - Total cobrado en la sesión, última ronda y estimado por minuto
-    - Anti-AFK
-    - Extras: ver datos de salvajes/mochila/brainrots (para copiar), vender mascota en mano
-    - Diagnóstico: copia lo que respondió el servidor si algo falla
-    - Botón flotante 💰, tecla F8 en PC, ajustes guardados
+    Incluye todo lo de v2: 3 modos de posición, pisos a elegir, salto de corrales vacíos,
+    totales, Anti-AFK, extras, botón flotante 💰, tecla F8, ajustes guardados.
 ]]
 
 ----------------------------------------------------------------
@@ -62,14 +59,22 @@ local function clamp(n, lo, hi) return math.max(lo, math.min(hi, n)) end
 -- AJUSTES (se guardan por juego)
 ----------------------------------------------------------------
 local S = {
-    Interval = 15,     -- segundos entre rondas
+    Interval = 15,     -- segundos entre rondas de cobro
     Delay = 400,       -- ms entre corrales
     Mode = 1,          -- 1 teletransportar, 2 mi personaje, 3 colector
-    ReturnBack = true, -- volver a la posición inicial al terminar la ronda
-    SkipEmpty = true,  -- saltar corrales vacíos 5 minutos
+    ReturnBack = true,
+    SkipEmpty = true,
     AntiAFK = true,
     Scale = 100,
     Skip = {},         -- pisos desactivados: { ["3"] = true }
+
+    -- Tienda / fusión
+    AutoBuy = false,
+    AutoFuse = false,
+    BuyMinExp = 0,     -- mínimo de monedas/s = 10^N (0 = sin filtro)
+    BuyMax = 3,        -- compras máximas por ronda
+    FuseMax = 3,       -- fusiones máximas por ronda
+    ShopInterval = 5,  -- segundos entre rondas de tienda
 }
 
 pcall(function()
@@ -82,10 +87,14 @@ pcall(function()
         end
     end
 end)
-S.Interval = clamp(S.Interval, 5, 300)
-S.Delay    = clamp(S.Delay, 20, 2000)
-S.Mode     = clamp(math.floor(S.Mode), 1, 3)
-S.Scale    = clamp(S.Scale, 70, 150)
+S.Interval     = clamp(S.Interval, 2, 300)
+S.Delay        = clamp(S.Delay, 2, 2000)
+S.Mode         = clamp(math.floor(S.Mode), 1, 3)
+S.Scale        = clamp(S.Scale, 70, 150)
+S.BuyMinExp    = clamp(math.floor(S.BuyMinExp), 0, 40)
+S.BuyMax       = clamp(math.floor(S.BuyMax), 1, 20)
+S.FuseMax      = clamp(math.floor(S.FuseMax), 1, 20)
+S.ShopInterval = clamp(S.ShopInterval, 1, 120)
 
 local function save()
     pcall(function() writefile(FILE, HttpService:JSONEncode(S)) end)
@@ -140,7 +149,7 @@ local function scrub(s)
     return s
 end
 
--- Las monedas pueden venir como número o como texto "mantisa|exponente" (3.15|16 = 3.15e16)
+-- Las monedas pueden venir como número o como texto "mantisa|exponente"
 local function parseNum(v)
     if type(v) == "number" then return v end
     if type(v) == "string" then
@@ -174,7 +183,7 @@ local function track(c) table.insert(connections, c) return c end
 local pens, lastScan = {}, 0
 local stats = { ok = 0, empty = 0, err = 0, skipped = 0, rounds = 0, coins = 0, lastRound = 0, active = 0 }
 local lastError, statusText = "", "Listo."
-local diag = {} -- últimas respuestas con error
+local diag = {}
 
 local function pushDiag(line)
     table.insert(diag, scrub(line))
@@ -227,7 +236,7 @@ local function scanPens()
     local found, seen, n = {}, {}, 0
     for _, d in ipairs(Workspace:GetDescendants()) do
         n += 1
-        if n % 500 == 0 then task.wait() end -- no congela el móvil
+        if n % 500 == 0 then task.wait() end
         local f, s = d.Name:match("^Pen_(%d+)_(%d+)$")
         if f and not seen[f .. "_" .. s] then
             local col = d:FindFirstChild("Collector")
@@ -276,7 +285,7 @@ local function cycle(keepGoing)
             if not hrp then lastError = "No hay personaje" break end
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.CFrame = p.collector.CFrame + Vector3.new(0, 3, 0)
-            task.wait(0.12) -- da tiempo a que el servidor vea tu posición
+            task.wait(0.12)
             pos = hrp.Position
         elseif S.Mode == 2 then
             pos = hrp and hrp.Position or p.collector.Position
@@ -298,7 +307,6 @@ local function cycle(keepGoing)
                 p.emptyUntil = nil
             elseif res.error == "no_coins" then
                 stats.empty += 1
-                -- Corral sin brainrot (0 monedas/s): no se vuelve a pedir durante 5 min
                 if parseNum(res.coinsPerSecond) == 0 then p.emptyUntil = os.clock() + 300 end
             else
                 stats.err += 1
@@ -332,6 +340,113 @@ local function runCycle(keepGoing)
     if not ok then
         lastError = tostring(err):sub(1, 60)
         pushDiag("CICLO => " .. tostring(err))
+    end
+end
+
+----------------------------------------------------------------
+-- TIENDA: comprar y fusionar salvajes
+----------------------------------------------------------------
+local shop = { bought = 0, fused = 0, fail = 0, rounds = 0, last = "—", lastBuyRaw = "", lastFuseRaw = "" }
+local shopBusy = false
+
+-- Busca recursivamente los salvajes dentro de la respuesta (estructura desconocida)
+local function findPets(res)
+    local out, seen = {}, {}
+    local function walk(t, depth)
+        if depth > 6 or type(t) ~= "table" or seen[t] then return end
+        seen[t] = true
+        if type(t.id) == "string" and (t.coinsPerSecond ~= nil or t.type ~= nil) then
+            out[#out + 1] = t
+            return
+        end
+        for _, v in pairs(t) do walk(v, depth + 1) end
+    end
+    walk(res, 0)
+    return out
+end
+
+local function getWild()
+    local r = getRemote("WildService", "GetAllWildPets")
+    if not r then shop.last = "No encontré GetAllWildPets" return nil end
+    local ok, res = pcall(r.InvokeServer, r)
+    if not ok then
+        shop.last = "Error: " .. tostring(res):sub(1, 40)
+        pushDiag("WILD => " .. tostring(res))
+        return nil
+    end
+    local minCps = S.BuyMinExp == 0 and 0 or 10 ^ S.BuyMinExp
+    local out = {}
+    for _, p in ipairs(findPets(res)) do
+        local cps = parseNum(p.coinsPerSecond)
+        if cps >= minCps then
+            out[#out + 1] = { id = p.id, cps = cps, kind = tostring(p.type or "?") }
+        end
+    end
+    table.sort(out, function(a, b) return a.cps > b.cps end)
+    return out
+end
+
+local function buyOne(p)
+    local r = getRemote("WildService", "BuyPet")
+    if not r then shop.last = "No encontré BuyPet" return false end
+    local ok, res = pcall(r.InvokeServer, r, p.id, false)
+    shop.lastBuyRaw = scrub(ok and ser(res, 0, 4, 20) or tostring(res))
+    if ok and type(res) == "table" and res.pet and not res.error then
+        shop.bought += 1
+        shop.last = "Compré " .. p.kind .. " (" .. fmt(p.cps) .. "/s)"
+        return true
+    end
+    shop.fail += 1
+    local why = ok and (type(res) == "table" and tostring(res.error) or ser(res)) or tostring(res)
+    shop.last = "No compré: " .. why:sub(1, 40)
+    pushDiag("BUY " .. p.id .. " => " .. shop.lastBuyRaw)
+    return false
+end
+
+local function fuseOne(p)
+    local r = getRemote("WildService", "FuseWildPet")
+    if not r then shop.last = "No encontré FuseWildPet" return false end
+    local ok, res = pcall(r.InvokeServer, r, p.id, false)
+    shop.lastFuseRaw = scrub(ok and ser(res, 0, 4, 20) or tostring(res))
+    if ok and type(res) == "table" and res.success then
+        shop.fused += 1
+        shop.last = "Fusioné " .. p.kind .. " (" .. fmt(p.cps) .. "/s)"
+        return true
+    end
+    shop.fail += 1
+    local why = ok and (type(res) == "table" and tostring(res.error) or ser(res)) or tostring(res)
+    shop.last = "No fusioné: " .. why:sub(1, 40)
+    pushDiag("FUSE " .. p.id .. " => " .. shop.lastFuseRaw)
+    return false
+end
+
+-- Una pasada: recorre los salvajes (mejores primero) hasta el límite o 3 fallos seguidos
+local function shopPass(action, limit)
+    local list = getWild()
+    if not list or #list == 0 then
+        if list then shop.last = "Sin salvajes que cumplan el filtro" end
+        return
+    end
+    local n, fails = 0, 0
+    for _, p in ipairs(list) do
+        if not running or n >= limit or fails >= 3 then break end
+        if action(p) then n += 1 fails = 0 else fails += 1 end
+        task.wait(0.35)
+    end
+end
+
+local function runShop(doBuy, doFuse, buyLimit, fuseLimit)
+    if shopBusy then return end
+    shopBusy = true
+    local ok, err = pcall(function()
+        if doBuy then shopPass(buyOne, buyLimit) end
+        if doFuse then shopPass(fuseOne, fuseLimit) end
+        shop.rounds += 1
+    end)
+    shopBusy = false
+    if not ok then
+        shop.last = "Error: " .. tostring(err):sub(1, 40)
+        pushDiag("TIENDA => " .. tostring(err))
     end
 end
 
@@ -429,6 +544,8 @@ end
 ----------------------------------------------------------------
 -- INTERFAZ: ventana y pestañas
 ----------------------------------------------------------------
+local layoutFrame -- se define abajo
+
 local gui = Instance.new("ScreenGui")
 gui.Name = GUI_NAME
 gui.ResetOnSpawn = false
@@ -457,7 +574,7 @@ local grad = Instance.new("UIGradient")
 grad.Color = ColorSequence.new(Color3.fromRGB(60, 80, 160), C.Card)
 grad.Parent = header
 
-makeLabel(header, "💰 Auto-Recolector v2", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
+makeLabel(header, "💰 Auto-Recolector v3", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
 makeLabel(header, "Fusiona cualquier cosa en Brainrot", UDim2.new(1, -90, 0, 16), UDim2.new(0, 14, 0, 26), 11, C.Sub)
 local minBtn   = makeButton(header, "–", UDim2.fromOffset(32, 32), UDim2.new(1, -78, 0.5, -16))
 local closeBtn = makeButton(header, "✕", UDim2.fromOffset(32, 32), UDim2.new(1, -40, 0.5, -16), C.Red)
@@ -475,7 +592,7 @@ tabBar.BackgroundTransparency = 1
 tabBar.Parent = body
 local tabLayout = Instance.new("UIListLayout")
 tabLayout.FillDirection = Enum.FillDirection.Horizontal
-tabLayout.Padding = UDim.new(0, 6)
+tabLayout.Padding = UDim.new(0, 5)
 tabLayout.Parent = tabBar
 
 local content = Instance.new("Frame")
@@ -507,7 +624,7 @@ local function newPage()
     return s
 end
 
-local pageMain, pageExtra, pageSet = newPage(), newPage(), newPage()
+local pageMain, pageShop, pageExtra, pageSet = newPage(), newPage(), newPage(), newPage()
 local tabs = {}
 local function selectTab(i)
     for idx, t in ipairs(tabs) do
@@ -517,13 +634,14 @@ local function selectTab(i)
     end
 end
 local function addTab(text, page)
-    local b = makeButton(tabBar, text, UDim2.new(1 / 3, -4, 1, 0), nil, C.Card)
-    b.TextSize = 12
+    local b = makeButton(tabBar, text, UDim2.new(0.25, -4, 1, 0), nil, C.Card)
+    b.TextSize = 11
     table.insert(tabs, { btn = b, page = page })
     local idx = #tabs
     b.Activated:Connect(function() selectTab(idx) end)
 end
-addTab("💰 Recolectar", pageMain)
+addTab("💰 Cobrar", pageMain)
+addTab("🛒 Brainrot", pageShop)
 addTab("🧰 Extras", pageExtra)
 addTab("⚙ Ajustes", pageSet)
 
@@ -541,6 +659,35 @@ local function bigButton(parent, text, color, h)
     local b = makeButton(parent, text, UDim2.new(1, 0, 0, h or 44), nil, color)
     b.LayoutOrder = nextOrder()
     return b
+end
+
+local function addToggle(parent, text, get, set)
+    local b = bigButton(parent, "", C.Btn, 42)
+    b.TextSize = 12
+    local function r()
+        b.Text = text .. ":  " .. (get() and "SÍ" or "NO")
+        b.BackgroundColor3 = get() and C.Green or C.Btn
+    end
+    b.Activated:Connect(function() set(not get()) r() saveSoon() end)
+    r()
+    return r
+end
+
+local function addStepper(parent, text, get, set, mn, mx, step, suffix, show)
+    local row = card(parent, 48)
+    makeLabel(row, text, UDim2.new(1, -160, 1, 0), UDim2.new(0, 12, 0, 8), 13)
+    local minus = makeButton(row, "–", UDim2.fromOffset(40, 36), UDim2.new(1, -152, 0.5, -18))
+    local val = makeLabel(row, "", UDim2.fromOffset(56, 36), UDim2.new(1, -108, 0.5, -10), 13)
+    val.TextXAlignment = Enum.TextXAlignment.Center
+    val.Font = Enum.Font.GothamBold
+    local plus = makeButton(row, "+", UDim2.fromOffset(40, 36), UDim2.new(1, -48, 0.5, -18))
+    local function refresh()
+        val.Text = show and show(get()) or (tostring(get()) .. (suffix or ""))
+    end
+    local function change(d) set(clamp(get() + d, mn, mx)) refresh() saveSoon() end
+    minus.Activated:Connect(function() change(-step) end)
+    plus.Activated:Connect(function() change(step) end)
+    refresh()
 end
 
 -- Avisos flotantes
@@ -596,7 +743,7 @@ local fst = Instance.new("UIStroke", floatBtn)
 fst.Color, fst.Transparency, fst.Thickness = Color3.fromRGB(255, 255, 255), 0.2, 2
 
 ----------------------------------------------------------------
--- PESTAÑA 1: RECOLECTAR
+-- PESTAÑA 1: COBRAR
 ----------------------------------------------------------------
 local mainBtn = bigButton(pageMain, "", C.Red, 52)
 mainBtn.TextSize = 17
@@ -626,7 +773,6 @@ nowBtn.Activated:Connect(function()
     end)
 end)
 
--- Pisos a recolectar
 local floorTag = makeLabel(pageMain, "PISOS A RECOLECTAR (toca para activar/desactivar)", UDim2.new(1, 0, 0, 30), nil, 11, C.Sub)
 floorTag.Font = Enum.Font.GothamBold
 floorTag.LayoutOrder = nextOrder()
@@ -676,32 +822,62 @@ resetBtn.TextSize = 12
 resetBtn.Activated:Connect(function()
     for k in pairs(stats) do stats[k] = 0 end
     for _, p in ipairs(pens) do p.emptyUntil = nil end
+    shop.bought, shop.fused, shop.fail, shop.rounds = 0, 0, 0, 0
     lastError = ""
     toast("Contadores reiniciados")
 end)
 
 ----------------------------------------------------------------
--- PESTAÑA 2: EXTRAS
+-- PESTAÑA 2: BRAINROT (comprar / fusionar)
 ----------------------------------------------------------------
-local function addToggle(parent, text, get, set)
-    local b = bigButton(parent, "", C.Btn, 42)
-    b.TextSize = 12
-    local function r()
-        b.Text = text .. ":  " .. (get() and "SÍ" or "NO")
-        b.BackgroundColor3 = get() and C.Green or C.Btn
-    end
-    b.Activated:Connect(function() set(not get()) r() saveSoon() end)
-    r()
-    return r
-end
+local shopCard = card(pageShop, 92)
+local shopLabel = makeLabel(shopCard, "", UDim2.new(1, -20, 1, -12), UDim2.new(0, 10, 0, 6), 12)
 
+addToggle(pageShop, "🛒 Comprar salvajes automático", function() return S.AutoBuy end, function(v) S.AutoBuy = v end)
+addToggle(pageShop, "🧬 Fusionar salvajes automático", function() return S.AutoFuse end, function(v) S.AutoFuse = v end)
+
+addStepper(pageShop, "Mín. monedas/s", function() return S.BuyMinExp end, function(v) S.BuyMinExp = v end, 0, 40, 1, "",
+    function(v) return v == 0 and "todos" or ("1e" .. v) end)
+addStepper(pageShop, "Compras por ronda", function() return S.BuyMax end, function(v) S.BuyMax = v end, 1, 20, 1, "")
+addStepper(pageShop, "Fusiones por ronda", function() return S.FuseMax end, function(v) S.FuseMax = v end, 1, 20, 1, "")
+addStepper(pageShop, "Cada cuántos segundos", function() return S.ShopInterval end, function(v) S.ShopInterval = v end, 1, 120, 1, " s")
+
+local buyNowBtn = bigButton(pageShop, "🛒  Comprar el mejor salvaje (1 vez)", C.Accent, 42)
+buyNowBtn.TextSize = 12
+buyNowBtn.Activated:Connect(function()
+    if shopBusy then toast("Espera, hay una ronda en curso") return end
+    task.spawn(function() runShop(true, false, 1, 0) toast(shop.last) end)
+end)
+
+local fuseNowBtn = bigButton(pageShop, "🧬  Fusionar el mejor salvaje (1 vez)", C.Accent, 42)
+fuseNowBtn.TextSize = 12
+fuseNowBtn.Activated:Connect(function()
+    if shopBusy then toast("Espera, hay una ronda en curso") return end
+    task.spawn(function() runShop(false, true, 0, 1) toast(shop.last) end)
+end)
+
+local rawBtn = bigButton(pageShop, "📋  Copiar última respuesta de compra/fusión", C.Amber, 42)
+rawBtn.TextSize = 12
+rawBtn.Activated:Connect(function()
+    local text = scrub("BuyPet:\n" .. (shop.lastBuyRaw ~= "" and shop.lastBuyRaw or "(nada)")
+        .. "\n\nFuseWildPet:\n" .. (shop.lastFuseRaw ~= "" and shop.lastFuseRaw or "(nada)"))
+    toast(copyText(text) and "📋 Respuestas copiadas" or "⚠ No se pudo copiar")
+end)
+
+local shopInfo = makeLabel(pageShop,
+    "Los salvajes se ordenan por monedas/s (el mejor primero). Si 3 intentos seguidos fallan (sin dinero, lejos, etc.) la ronda se corta. Si algo no funciona, copia la última respuesta.",
+    UDim2.new(1, 0, 0, 70), nil, 11, C.Sub)
+shopInfo.LayoutOrder = nextOrder()
+
+----------------------------------------------------------------
+-- PESTAÑA 3: EXTRAS
+----------------------------------------------------------------
 addToggle(pageExtra, "Anti-AFK (evita que te expulsen)", function() return S.AntiAFK end, function(v) S.AntiAFK = v end)
 
 local datosTag = makeLabel(pageExtra, "VER DATOS DEL JUEGO (se copian al portapapeles para pasármelos)", UDim2.new(1, 0, 0, 30), nil, 11, C.Sub)
 datosTag.Font = Enum.Font.GothamBold
 datosTag.LayoutOrder = nextOrder()
 
--- Llama a un remote de CONSULTA (los mismos que usa el juego) y copia el resultado
 local function explore(service, name, label)
     task.spawn(function()
         local r = getRemote(service, name)
@@ -751,10 +927,12 @@ local diagBtn = bigButton(pageExtra, "📋  Copiar diagnóstico (si algo falla)"
 diagBtn.TextSize = 12
 diagBtn.Activated:Connect(function()
     local lines = {
-        "DIAGNÓSTICO Auto-Recolector v2",
+        "DIAGNÓSTICO Auto-Recolector v3",
         "Modo: " .. S.Mode .. " | Corrales: " .. #pens .. " | Rondas: " .. stats.rounds,
         "Cobradas: " .. stats.ok .. " | Vacías: " .. stats.empty .. " | Errores: " .. stats.err,
         "Último error: " .. (lastError ~= "" and lastError or "ninguno"),
+        "Tienda: compras " .. shop.bought .. " | fusiones " .. shop.fused .. " | fallos " .. shop.fail,
+        "Tienda último: " .. shop.last,
         "",
     }
     for _, l in ipairs(diag) do lines[#lines + 1] = l end
@@ -764,25 +942,8 @@ diagBtn.Activated:Connect(function()
 end)
 
 ----------------------------------------------------------------
--- PESTAÑA 3: AJUSTES
+-- PESTAÑA 4: AJUSTES
 ----------------------------------------------------------------
-local layoutFrame -- se define abajo
-
-local function addStepper(parent, text, get, set, mn, mx, step, suffix)
-    local row = card(parent, 48)
-    makeLabel(row, text, UDim2.new(1, -160, 1, 0), UDim2.new(0, 12, 0, 8), 13)
-    local minus = makeButton(row, "–", UDim2.fromOffset(40, 36), UDim2.new(1, -152, 0.5, -18))
-    local val = makeLabel(row, "", UDim2.fromOffset(56, 36), UDim2.new(1, -108, 0.5, -10), 13)
-    val.TextXAlignment = Enum.TextXAlignment.Center
-    val.Font = Enum.Font.GothamBold
-    local plus = makeButton(row, "+", UDim2.fromOffset(40, 36), UDim2.new(1, -48, 0.5, -18))
-    local function refresh() val.Text = tostring(get()) .. suffix end
-    local function change(d) set(clamp(get() + d, mn, mx)) refresh() saveSoon() end
-    minus.Activated:Connect(function() change(-step) end)
-    plus.Activated:Connect(function() change(step) end)
-    refresh()
-end
-
 addStepper(pageSet, "Intervalo entre rondas", function() return S.Interval end, function(v) S.Interval = v end, 5, 300, 5, " s")
 addStepper(pageSet, "Pausa entre corrales", function() return S.Delay end, function(v) S.Delay = v end, 100, 2000, 100, " ms")
 addStepper(pageSet, "Tamaño de interfaz", function() return S.Scale end, function(v) S.Scale = v layoutFrame() end, 70, 150, 10, "%")
@@ -826,6 +987,22 @@ task.spawn(function()
     end
 end)
 
+-- Compra / fusión automática
+task.spawn(function()
+    while running do
+        if (S.AutoBuy or S.AutoFuse) and not shopBusy then
+            runShop(S.AutoBuy, S.AutoFuse, S.BuyMax, S.FuseMax)
+            local waited = 0
+            while running and (S.AutoBuy or S.AutoFuse) and waited < S.ShopInterval do
+                task.wait(0.25)
+                waited += 0.25
+            end
+        else
+            task.wait(0.3)
+        end
+    end
+end)
+
 -- Estado en pantalla
 task.spawn(function()
     local last = os.clock()
@@ -841,6 +1018,9 @@ task.spawn(function()
             stats.ok, stats.empty, stats.skipped, stats.err,
             fmt(stats.coins), fmt(stats.lastRound), fmt(perMin),
             lastError ~= "" and ("\n⚠ Último error: " .. lastError) or "")
+        shopLabel.Text = string.format(
+            "Compradas: %d | Fusionadas: %d | Fallos: %d\nRondas tienda: %d%s\nÚltimo: %s",
+            shop.bought, shop.fused, shop.fail, shop.rounds, shopBusy and " (en curso)" or "", shop.last)
     end
 end)
 
@@ -867,7 +1047,7 @@ function layoutFrame()
     local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
     local sc = S.Scale / 100
     uiScale.Scale = sc
-    local w = clamp(vp.X * 0.92 / sc, 250, 340)
+    local w = clamp(vp.X * 0.92 / sc, 270, 350)
     local h = clamp(vp.Y * 0.82 / sc, 240, 520)
     frame.Size = minimized and UDim2.fromOffset(w, HEADER_H) or UDim2.fromOffset(w, h)
 end
@@ -887,6 +1067,7 @@ makeDraggable(floatBtn, floatBtn, function() setEnabled(not enabled) end)
 
 closeBtn.Activated:Connect(function()
     running, enabled = false, false
+    S.AutoBuy, S.AutoFuse = false, false
     save()
     for _, c in ipairs(connections) do c:Disconnect() end
     gui:Destroy()
