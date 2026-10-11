@@ -1,13 +1,18 @@
 --[[
-    AUTO-RECOLECTOR DE MONEDAS para "Fusiona cualquier cosa en Brainrot"
+    AUTO-RECOLECTOR v2 para "Fusiona cualquier cosa en Brainrot"
     Delta (Mobile/PC)
 
-    - Busca tus corrales (Pen_piso_número) y llama a PenService.RF.CollectCoins
-    - Botón flotante 💰 ON/OFF (toque corto) y arrastrable
-    - Intervalo entre rondas y pausa entre llamadas ajustables
-    - Modo de posición: colector (desde lejos) o tu personaje
-    - Muestra cobradas / vacías / errores y el último error del servidor
-    - Guarda tus ajustes por juego (writefile/readfile)
+    ARREGLO: ahora el personaje se acerca a cada colector (como cuando caminas),
+    envía su posición real y al final vuelve a donde estaba.
+
+    - 3 modos de posición: Teletransportar (recomendado) / Mi personaje / Colector
+    - Elegir qué pisos recoger
+    - Salta corrales vacíos durante 5 min (menos llamadas, menos errores)
+    - Total cobrado en la sesión, última ronda y estimado por minuto
+    - Anti-AFK
+    - Extras: ver datos de salvajes/mochila/brainrots (para copiar), vender mascota en mano
+    - Diagnóstico: copia lo que respondió el servidor si algo falla
+    - Botón flotante 💰, tecla F8 en PC, ajustes guardados
 ]]
 
 ----------------------------------------------------------------
@@ -16,6 +21,7 @@
 local GUI_NAME = "AutoCollectGUI"
 local FILE     = "AutoCollect_" .. game.PlaceId .. ".json"
 local HEADER_H = 46
+local HOTKEY   = Enum.KeyCode.F8
 
 local C = {
     Bg = Color3.fromRGB(16, 18, 26), Card = Color3.fromRGB(28, 31, 43), Btn = Color3.fromRGB(44, 48, 64),
@@ -31,8 +37,10 @@ local Players           = game:GetService("Players")
 local UserInputService  = game:GetService("UserInputService")
 local CoreGui           = game:GetService("CoreGui")
 local HttpService       = game:GetService("HttpService")
+local TweenService      = game:GetService("TweenService")
 local Workspace         = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser       = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 
@@ -53,23 +61,107 @@ local function clamp(n, lo, hi) return math.max(lo, math.min(hi, n)) end
 ----------------------------------------------------------------
 -- AJUSTES (se guardan por juego)
 ----------------------------------------------------------------
-local S = { Interval = 15, Delay = 200, Mode = 1 } -- segundos, milisegundos, 1=colector 2=personaje
+local S = {
+    Interval = 15,     -- segundos entre rondas
+    Delay = 400,       -- ms entre corrales
+    Mode = 1,          -- 1 teletransportar, 2 mi personaje, 3 colector
+    ReturnBack = true, -- volver a la posición inicial al terminar la ronda
+    SkipEmpty = true,  -- saltar corrales vacíos 5 minutos
+    AntiAFK = true,
+    Scale = 100,
+    Skip = {},         -- pisos desactivados: { ["3"] = true }
+}
+
 pcall(function()
     if isfile and isfile(FILE) then
         local d = HttpService:JSONDecode(readfile(FILE))
         if type(d) == "table" then
-            for k in pairs(S) do
-                if type(d[k]) == "number" then S[k] = d[k] end
+            for k, v in pairs(S) do
+                if type(d[k]) == type(v) then S[k] = d[k] end
             end
         end
     end
 end)
 S.Interval = clamp(S.Interval, 5, 300)
-S.Delay    = clamp(S.Delay, 50, 1000)
-S.Mode     = (S.Mode == 2) and 2 or 1
+S.Delay    = clamp(S.Delay, 100, 2000)
+S.Mode     = clamp(math.floor(S.Mode), 1, 3)
+S.Scale    = clamp(S.Scale, 70, 150)
 
 local function save()
     pcall(function() writefile(FILE, HttpService:JSONEncode(S)) end)
+end
+local saveQueued = false
+local function saveSoon()
+    if saveQueued then return end
+    saveQueued = true
+    task.delay(1, function() saveQueued = false save() end)
+end
+
+----------------------------------------------------------------
+-- UTILIDADES
+----------------------------------------------------------------
+local function ser(v, depth, maxDepth, maxEntries)
+    depth, maxDepth, maxEntries = depth or 0, maxDepth or 3, maxEntries or 20
+    local t = typeof(v)
+    if t == "string" then
+        return '"' .. (#v > 80 and (v:sub(1, 80) .. "…") or v) .. '"'
+    elseif t == "number" or t == "boolean" or t == "nil" then
+        return tostring(v)
+    elseif t == "Instance" then
+        return "<" .. v.ClassName .. ":" .. v.Name .. ">"
+    elseif t == "table" then
+        if depth >= maxDepth then return "{…}" end
+        local parts, n = {}, 0
+        for k, val in pairs(v) do
+            n += 1
+            if n > maxEntries then parts[#parts + 1] = "…" break end
+            parts[#parts + 1] = "[" .. ser(k, depth + 1, maxDepth, maxEntries) .. "]=" .. ser(val, depth + 1, maxDepth, maxEntries)
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    elseif t == "function" then
+        return "fn"
+    else
+        return t .. ":" .. tostring(v)
+    end
+end
+
+-- Oculta nombres de usuario e IDs de todos los jugadores del servidor
+local function scrub(s)
+    for i, pl in ipairs(Players:GetPlayers()) do
+        local alias = (pl == player) and "LocalPlayer" or ("Jugador" .. i)
+        for _, n in ipairs({ pl.Name, pl.DisplayName }) do
+            if n and #n > 1 then
+                local pat = n:gsub("%p", "%%%0")
+                s = s:gsub(pat, alias)
+            end
+        end
+        s = s:gsub(tostring(pl.UserId), "UID")
+    end
+    return s
+end
+
+-- Las monedas pueden venir como número o como texto "mantisa|exponente" (3.15|16 = 3.15e16)
+local function parseNum(v)
+    if type(v) == "number" then return v end
+    if type(v) == "string" then
+        local m, e = v:match("^([%d%.]+)|(%-?%d+)$")
+        if m then return tonumber(m) * 10 ^ tonumber(e) end
+        return tonumber(v) or 0
+    end
+    return 0
+end
+
+local SUF = { "", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc" }
+local function fmt(n)
+    if n < 1000 then return string.format("%.0f", n) end
+    local i = math.floor(math.log10(n) / 3)
+    if i >= #SUF then return string.format("%.2e", n) end
+    return string.format("%.2f %s", n / 10 ^ (i * 3), SUF[i + 1])
+end
+
+local function copyText(text)
+    local copier = setclipboard or toclipboard
+    return copier ~= nil and pcall(copier, text)
 end
 
 ----------------------------------------------------------------
@@ -80,29 +172,44 @@ local connections = {}
 local function track(c) table.insert(connections, c) return c end
 
 local pens, lastScan = {}, 0
-local stats = { ok = 0, empty = 0, err = 0, rounds = 0 }
+local stats = { ok = 0, empty = 0, err = 0, skipped = 0, rounds = 0, coins = 0, lastRound = 0, active = 0 }
 local lastError, statusText = "", "Listo."
+local diag = {} -- últimas respuestas con error
 
-----------------------------------------------------------------
--- LÓGICA: remote, corrales y recolección
-----------------------------------------------------------------
-local remoteCache
-local function getRemote()
-    if remoteCache and remoteCache.Parent then return remoteCache end
-    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-        if d.Name == "CollectCoins" and d.ClassName == "RemoteFunction"
-            and d.Parent and d.Parent.Name == "RF"
-            and d.Parent.Parent and d.Parent.Parent.Name == "PenService" then
-            remoteCache = d
-            return d
-        end
-    end
-    return nil
+local function pushDiag(line)
+    table.insert(diag, scrub(line))
+    if #diag > 12 then table.remove(diag, 1) end
 end
 
--- ¿Este modelo pertenece a mi rancho?
-local function isMine(model)
-    local cur = model.Parent
+----------------------------------------------------------------
+-- REMOTES (Knit: ReplicatedStorage...Services.<Servicio>.RF.<Nombre>)
+----------------------------------------------------------------
+local index, indexed = {}, false
+local function buildIndex()
+    local n = 0
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        n += 1
+        if n % 500 == 0 then task.wait() end
+        if d.ClassName == "RemoteFunction" and d.Parent and d.Parent.Name == "RF" and d.Parent.Parent then
+            index[d.Parent.Parent.Name .. "." .. d.Name] = d
+        end
+    end
+    indexed = true
+end
+
+local function getRemote(service, name)
+    local key = service .. "." .. name
+    local r = index[key]
+    if r and r.Parent then return r end
+    if not indexed or not r then buildIndex() end
+    return index[key]
+end
+
+----------------------------------------------------------------
+-- CORRALES
+----------------------------------------------------------------
+local function isMine(inst)
+    local cur = inst
     while cur and cur ~= Workspace do
         local owner = cur:GetAttribute("OwnerUserId")
         if owner ~= nil then return owner == player.UserId end
@@ -137,59 +244,99 @@ local function scanPens()
     pens, lastScan = found, os.clock()
 end
 
-local function getPos(p)
-    if S.Mode == 2 then
-        local char = player.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then return hrp.Position end
-    end
-    return p.collector.Position + Vector3.new(0, 3, 0)
+local function getHRP()
+    local char = player.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
 end
 
--- Una ronda: recoge de todos tus corrales. keepGoing() decide si se sigue.
-local function runCycle(keepGoing)
-    if busy then return end
-    busy = true
-    local remote = getRemote()
-    if not remote then
-        lastError = "No encontré PenService.CollectCoins"
-        busy = false
-        return
-    end
-    if #pens == 0 or os.clock() - lastScan > 60 then scanPens() end
-    if #pens == 0 then
-        lastError = "No encontré tus corrales"
-        busy = false
-        return
-    end
+----------------------------------------------------------------
+-- RECOLECCIÓN
+----------------------------------------------------------------
+local function cycle(keepGoing)
+    local remote = getRemote("PenService", "CollectCoins")
+    if not remote then lastError = "No encontré PenService.CollectCoins" return end
+    if #pens == 0 or os.clock() - lastScan > 120 then scanPens() end
+    if #pens == 0 then lastError = "No encontré tus corrales" return end
+
+    local startHRP = getHRP()
+    local origin = startHRP and startHRP.CFrame
+    local roundCoins = 0
 
     for _, p in ipairs(pens) do
         if not running or not keepGoing() then break end
-        local ok, res = pcall(function() return remote:InvokeServer(p.id, getPos(p)) end)
+        if S.Skip[tostring(p.floor)] then continue end
+        if S.SkipEmpty and p.emptyUntil and os.clock() < p.emptyUntil then
+            stats.skipped += 1
+            continue
+        end
+
+        local hrp = getHRP()
+        local pos
+        if S.Mode == 1 then
+            if not hrp then lastError = "No hay personaje" break end
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.CFrame = p.collector.CFrame + Vector3.new(0, 3, 0)
+            task.wait(0.12) -- da tiempo a que el servidor vea tu posición
+            pos = hrp.Position
+        elseif S.Mode == 2 then
+            pos = hrp and hrp.Position or p.collector.Position
+        else
+            pos = p.collector.Position
+        end
+
+        local ok, res = pcall(remote.InvokeServer, remote, p.id, pos)
         if not ok then
             stats.err += 1
             lastError = tostring(res):sub(1, 60)
+            pushDiag(p.id .. " => ERROR: " .. tostring(res))
         elseif type(res) == "table" then
             if res.success then
                 stats.ok += 1
+                local c = parseNum(res.coins)
+                stats.coins += c
+                roundCoins += c
+                p.emptyUntil = nil
             elseif res.error == "no_coins" then
                 stats.empty += 1
+                -- Corral sin brainrot (0 monedas/s): no se vuelve a pedir durante 5 min
+                if parseNum(res.coinsPerSecond) == 0 then p.emptyUntil = os.clock() + 300 end
             else
                 stats.err += 1
                 lastError = tostring(res.error)
+                pushDiag(p.id .. " => " .. ser(res, 0, 3, 12))
             end
         else
             stats.err += 1
             lastError = "respuesta inesperada"
+            pushDiag(p.id .. " => " .. ser(res))
         end
         task.wait(S.Delay / 1000)
     end
+
+    if S.Mode == 1 and S.ReturnBack and origin then
+        local hrp = getHRP()
+        if hrp then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.CFrame = origin
+        end
+    end
     stats.rounds += 1
+    stats.lastRound = roundCoins
+end
+
+local function runCycle(keepGoing)
+    if busy then return end
+    busy = true
+    local ok, err = pcall(cycle, keepGoing)
     busy = false
+    if not ok then
+        lastError = tostring(err):sub(1, 60)
+        pushDiag("CICLO => " .. tostring(err))
+    end
 end
 
 ----------------------------------------------------------------
--- INTERFAZ
+-- INTERFAZ: helpers
 ----------------------------------------------------------------
 local function corner(obj, r)
     local c = Instance.new("UICorner")
@@ -255,6 +402,33 @@ local function makeDraggable(handle, target, onTap)
     end))
 end
 
+local function confirmable(btn, idleText, action)
+    local armed = false
+    local idleColor = btn.BackgroundColor3
+    btn.Activated:Connect(function()
+        if not armed then
+            armed = true
+            btn.Text = "¿Seguro? Toca otra vez"
+            btn.BackgroundColor3 = C.Red
+            task.delay(2.5, function()
+                if btn.Parent and armed then
+                    armed = false
+                    btn.Text = idleText
+                    btn.BackgroundColor3 = idleColor
+                end
+            end)
+        else
+            armed = false
+            btn.Text = idleText
+            btn.BackgroundColor3 = idleColor
+            action()
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- INTERFAZ: ventana y pestañas
+----------------------------------------------------------------
 local gui = Instance.new("ScreenGui")
 gui.Name = GUI_NAME
 gui.ResetOnSpawn = false
@@ -271,6 +445,7 @@ frame.Parent = gui
 corner(frame, 16)
 local fs = Instance.new("UIStroke", frame)
 fs.Color, fs.Transparency, fs.Thickness = C.Accent, 0.6, 1.5
+local uiScale = Instance.new("UIScale", frame)
 
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, HEADER_H)
@@ -282,48 +457,126 @@ local grad = Instance.new("UIGradient")
 grad.Color = ColorSequence.new(Color3.fromRGB(60, 80, 160), C.Card)
 grad.Parent = header
 
-makeLabel(header, "💰 Auto-Recolector", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
+makeLabel(header, "💰 Auto-Recolector v2", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
 makeLabel(header, "Fusiona cualquier cosa en Brainrot", UDim2.new(1, -90, 0, 16), UDim2.new(0, 14, 0, 26), 11, C.Sub)
 local minBtn   = makeButton(header, "–", UDim2.fromOffset(32, 32), UDim2.new(1, -78, 0.5, -16))
 local closeBtn = makeButton(header, "✕", UDim2.fromOffset(32, 32), UDim2.new(1, -40, 0.5, -16), C.Red)
 
 local body = Instance.new("Frame")
-body.Size = UDim2.new(1, -16, 1, -HEADER_H - 8)
-body.Position = UDim2.new(0, 8, 0, HEADER_H + 8)
+body.Size = UDim2.new(1, 0, 1, -HEADER_H)
+body.Position = UDim2.new(0, 0, 0, HEADER_H)
 body.BackgroundTransparency = 1
 body.Parent = frame
 
-local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, 0, 1, 0)
-scroll.BackgroundTransparency = 1
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 3
-scroll.ScrollBarImageColor3 = C.Accent
-scroll.CanvasSize = UDim2.new()
-scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-scroll.Parent = body
-local list = Instance.new("UIListLayout")
-list.Padding = UDim.new(0, 6)
-list.SortOrder = Enum.SortOrder.LayoutOrder
-list.Parent = scroll
-local pad = Instance.new("UIPadding", scroll)
-pad.PaddingRight, pad.PaddingBottom = UDim.new(0, 6), UDim.new(0, 6)
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -16, 0, 38)
+tabBar.Position = UDim2.new(0, 8, 0, 8)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = body
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 6)
+tabLayout.Parent = tabBar
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -16, 1, -62)
+content.Position = UDim2.new(0, 8, 0, 54)
+content.BackgroundTransparency = 1
+content.Parent = body
 
 local lo = 0
 local function nextOrder() lo += 1 return lo end
-local function card(h)
+
+local function newPage()
+    local s = Instance.new("ScrollingFrame")
+    s.Size = UDim2.new(1, 0, 1, 0)
+    s.BackgroundTransparency = 1
+    s.BorderSizePixel = 0
+    s.ScrollBarThickness = 3
+    s.ScrollBarImageColor3 = C.Accent
+    s.CanvasSize = UDim2.new()
+    s.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    s.Visible = false
+    s.Parent = content
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, 6)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Parent = s
+    local pad = Instance.new("UIPadding", s)
+    pad.PaddingRight, pad.PaddingBottom = UDim.new(0, 6), UDim.new(0, 6)
+    return s
+end
+
+local pageMain, pageExtra, pageSet = newPage(), newPage(), newPage()
+local tabs = {}
+local function selectTab(i)
+    for idx, t in ipairs(tabs) do
+        t.page.Visible = (idx == i)
+        t.btn.BackgroundColor3 = (idx == i) and C.Accent or C.Card
+        t.btn.TextColor3 = (idx == i) and Color3.fromRGB(255, 255, 255) or C.Sub
+    end
+end
+local function addTab(text, page)
+    local b = makeButton(tabBar, text, UDim2.new(1 / 3, -4, 1, 0), nil, C.Card)
+    b.TextSize = 12
+    table.insert(tabs, { btn = b, page = page })
+    local idx = #tabs
+    b.Activated:Connect(function() selectTab(idx) end)
+end
+addTab("💰 Recolectar", pageMain)
+addTab("🧰 Extras", pageExtra)
+addTab("⚙ Ajustes", pageSet)
+
+local function card(parent, h)
     local f = Instance.new("Frame")
     f.Size = UDim2.new(1, 0, 0, h)
     f.BackgroundColor3 = C.Card
     f.LayoutOrder = nextOrder()
-    f.Parent = scroll
+    f.Parent = parent
     corner(f, 12)
     return f
 end
-local function bigButton(text, color, h)
-    local b = makeButton(scroll, text, UDim2.new(1, 0, 0, h or 44), nil, color)
+
+local function bigButton(parent, text, color, h)
+    local b = makeButton(parent, text, UDim2.new(1, 0, 0, h or 44), nil, color)
     b.LayoutOrder = nextOrder()
     return b
+end
+
+-- Avisos flotantes
+local toastLabel = Instance.new("TextLabel")
+toastLabel.AnchorPoint = Vector2.new(0.5, 1)
+toastLabel.Position = UDim2.new(0.5, 0, 1, -28)
+toastLabel.Size = UDim2.fromOffset(0, 36)
+toastLabel.AutomaticSize = Enum.AutomaticSize.X
+toastLabel.BackgroundColor3 = C.Bg
+toastLabel.BackgroundTransparency = 1
+toastLabel.TextTransparency = 1
+toastLabel.TextColor3 = C.Text
+toastLabel.Font = Enum.Font.GothamBold
+toastLabel.TextSize = 14
+toastLabel.ZIndex = 50
+toastLabel.Parent = gui
+corner(toastLabel, 18)
+local tp = Instance.new("UIPadding", toastLabel)
+tp.PaddingLeft, tp.PaddingRight = UDim.new(0, 18), UDim.new(0, 18)
+local toastStroke = Instance.new("UIStroke", toastLabel)
+toastStroke.Color, toastStroke.Transparency, toastStroke.Thickness = C.Accent, 1, 1.5
+
+local toastToken = 0
+local function toast(text)
+    toastToken += 1
+    local my = toastToken
+    toastLabel.Text = text
+    local info = TweenInfo.new(0.2)
+    TweenService:Create(toastLabel, info, { BackgroundTransparency = 0.1, TextTransparency = 0 }):Play()
+    TweenService:Create(toastStroke, info, { Transparency = 0.2 }):Play()
+    task.delay(2.4, function()
+        if toastToken == my and toastLabel.Parent then
+            TweenService:Create(toastLabel, info, { BackgroundTransparency = 1, TextTransparency = 1 }):Play()
+            TweenService:Create(toastStroke, info, { Transparency = 1 }):Play()
+        end
+    end)
 end
 
 -- Botón flotante
@@ -339,11 +592,13 @@ floatBtn.AutoButtonColor = false
 floatBtn.ZIndex = 20
 floatBtn.Parent = gui
 corner(floatBtn, 26)
-local st = Instance.new("UIStroke", floatBtn)
-st.Color, st.Transparency, st.Thickness = Color3.fromRGB(255, 255, 255), 0.2, 2
+local fst = Instance.new("UIStroke", floatBtn)
+fst.Color, fst.Transparency, fst.Thickness = Color3.fromRGB(255, 255, 255), 0.2, 2
 
--- ON/OFF
-local mainBtn = bigButton("", C.Red, 52)
+----------------------------------------------------------------
+-- PESTAÑA 1: RECOLECTAR
+----------------------------------------------------------------
+local mainBtn = bigButton(pageMain, "", C.Red, 52)
 mainBtn.TextSize = 17
 local function refreshMain()
     mainBtn.Text = enabled and "💰  ACTIVADO" or "💰  DESACTIVADO"
@@ -351,53 +606,17 @@ local function refreshMain()
     floatBtn.BackgroundColor3 = enabled and C.Green or C.Red
 end
 local function setEnabled(v)
+    if not running then return end
     enabled = v
     refreshMain()
+    toast(enabled and "💰 Recolección activada" or "Recolección detenida")
 end
 mainBtn.Activated:Connect(function() setEnabled(not enabled) end)
 
--- Estado
-local statusCard = card(96)
+local statusCard = card(pageMain, 150)
 local statusLabel = makeLabel(statusCard, "", UDim2.new(1, -20, 1, -12), UDim2.new(0, 10, 0, 6), 12)
 
--- Stepper (– valor +)
-local function addStepper(text, get, set, mn, mx, step, suffix)
-    local row = card(48)
-    makeLabel(row, text, UDim2.new(1, -160, 1, 0), UDim2.new(0, 12, 0, 14), 13)
-    local minus = makeButton(row, "–", UDim2.fromOffset(40, 36), UDim2.new(1, -152, 0.5, -18))
-    local val = makeLabel(row, "", UDim2.fromOffset(56, 36), UDim2.new(1, -108, 0.5, -10), 13)
-    val.TextXAlignment = Enum.TextXAlignment.Center
-    val.Font = Enum.Font.GothamBold
-    local plus = makeButton(row, "+", UDim2.fromOffset(40, 36), UDim2.new(1, -48, 0.5, -18))
-    local function refresh() val.Text = tostring(get()) .. suffix end
-    local function change(d)
-        set(clamp(get() + d, mn, mx))
-        refresh()
-        save()
-    end
-    minus.Activated:Connect(function() change(-step) end)
-    plus.Activated:Connect(function() change(step) end)
-    refresh()
-end
-
-addStepper("Intervalo entre rondas", function() return S.Interval end, function(v) S.Interval = v end, 5, 300, 5, " s")
-addStepper("Pausa entre corrales", function() return S.Delay end, function(v) S.Delay = v end, 50, 1000, 50, " ms")
-
--- Modo de posición
-local modeBtn = bigButton("", C.Btn, 42)
-modeBtn.TextSize = 12
-local function refreshMode()
-    modeBtn.Text = S.Mode == 1 and "Posición enviada: COLECTOR (desde lejos)" or "Posición enviada: MI PERSONAJE"
-end
-modeBtn.Activated:Connect(function()
-    S.Mode = S.Mode == 1 and 2 or 1
-    refreshMode()
-    save()
-end)
-refreshMode()
-
--- Acciones manuales
-local nowBtn = bigButton("▶  Recolectar ahora (1 ronda)", C.Accent, 44)
+local nowBtn = bigButton(pageMain, "▶  Recolectar ahora (1 ronda)", C.Accent, 44)
 nowBtn.Activated:Connect(function()
     if busy then statusText = "Ya hay una ronda en curso." return end
     statusText = "Recolectando…"
@@ -407,29 +626,195 @@ nowBtn.Activated:Connect(function()
     end)
 end)
 
-local scanBtn = bigButton("🔎  Volver a buscar mis corrales", C.Btn, 40)
+-- Pisos a recolectar
+local floorTag = makeLabel(pageMain, "PISOS A RECOLECTAR (toca para activar/desactivar)", UDim2.new(1, 0, 0, 30), nil, 11, C.Sub)
+floorTag.Font = Enum.Font.GothamBold
+floorTag.LayoutOrder = nextOrder()
+local floorCard = card(pageMain, 50)
+local floorGrid = Instance.new("UIGridLayout", floorCard)
+floorGrid.CellSize = UDim2.fromOffset(56, 36)
+floorGrid.CellPadding = UDim2.fromOffset(6, 6)
+local floorPad = Instance.new("UIPadding", floorCard)
+floorPad.PaddingTop, floorPad.PaddingLeft = UDim.new(0, 7), UDim.new(0, 8)
+
+local function rebuildFloors()
+    for _, c in ipairs(floorCard:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    local floors, seen = {}, {}
+    for _, p in ipairs(pens) do
+        if not seen[p.floor] then seen[p.floor] = true floors[#floors + 1] = p.floor end
+    end
+    table.sort(floors)
+    for _, f in ipairs(floors) do
+        local b = makeButton(floorCard, "P" .. f, UDim2.fromOffset(56, 36), nil, C.Green)
+        local function r() b.BackgroundColor3 = S.Skip[tostring(f)] and C.Btn or C.Green end
+        r()
+        b.Activated:Connect(function()
+            S.Skip[tostring(f)] = (not S.Skip[tostring(f)]) or nil
+            r()
+            saveSoon()
+        end)
+    end
+    local rows = math.max(1, math.ceil(#floors / 5))
+    floorCard.Size = UDim2.new(1, 0, 0, 14 + rows * 42)
+end
+
+local scanBtn = bigButton(pageMain, "🔎  Volver a buscar mis corrales", C.Btn, 40)
 scanBtn.Activated:Connect(function()
     statusText = "Buscando corrales…"
     task.spawn(function()
         scanPens()
+        rebuildFloors()
         statusText = "Encontré " .. #pens .. " corrales."
+        toast("🔎 " .. #pens .. " corrales")
     end)
 end)
 
-local resetBtn = bigButton("🧹  Reiniciar contadores", C.Btn, 40)
+local resetBtn = bigButton(pageMain, "🧹  Reiniciar contadores y corrales vacíos", C.Btn, 40)
+resetBtn.TextSize = 12
 resetBtn.Activated:Connect(function()
-    stats.ok, stats.empty, stats.err, stats.rounds = 0, 0, 0, 0
+    for k in pairs(stats) do stats[k] = 0 end
+    for _, p in ipairs(pens) do p.emptyUntil = nil end
     lastError = ""
+    toast("Contadores reiniciados")
 end)
 
 ----------------------------------------------------------------
--- BUCLE PRINCIPAL
+-- PESTAÑA 2: EXTRAS
 ----------------------------------------------------------------
+local function addToggle(parent, text, get, set)
+    local b = bigButton(parent, "", C.Btn, 42)
+    b.TextSize = 12
+    local function r()
+        b.Text = text .. ":  " .. (get() and "SÍ" or "NO")
+        b.BackgroundColor3 = get() and C.Green or C.Btn
+    end
+    b.Activated:Connect(function() set(not get()) r() saveSoon() end)
+    r()
+    return r
+end
+
+addToggle(pageExtra, "Anti-AFK (evita que te expulsen)", function() return S.AntiAFK end, function(v) S.AntiAFK = v end)
+
+local datosTag = makeLabel(pageExtra, "VER DATOS DEL JUEGO (se copian al portapapeles para pasármelos)", UDim2.new(1, 0, 0, 30), nil, 11, C.Sub)
+datosTag.Font = Enum.Font.GothamBold
+datosTag.LayoutOrder = nextOrder()
+
+-- Llama a un remote de CONSULTA (los mismos que usa el juego) y copia el resultado
+local function explore(service, name, label)
+    task.spawn(function()
+        local r = getRemote(service, name)
+        if not r then toast("No encontré " .. service .. "." .. name) return end
+        local ok, res = pcall(r.InvokeServer, r)
+        local text = ok and ser(res, 0, 5, 60) or ("error: " .. tostring(res))
+        text = scrub(label .. " (" .. service .. "." .. name .. "):\n" .. text)
+        if #text > 20000 then text = text:sub(1, 20000) .. "\n… (recortado)" end
+        if copyText(text) then
+            toast("📋 Copiado: " .. label .. " (" .. #text .. " car.)")
+        else
+            toast("⚠ No se pudo copiar")
+        end
+    end)
+end
+
+local wildBtn = bigButton(pageExtra, "🔍  Ver salvajes (GetAllWildPets)", C.Accent, 42)
+wildBtn.TextSize = 12
+wildBtn.Activated:Connect(function() explore("WildService", "GetAllWildPets", "Salvajes") end)
+local bagBtn = bigButton(pageExtra, "🎒  Ver mochila (GetBagData)", C.Accent, 42)
+bagBtn.TextSize = 12
+bagBtn.Activated:Connect(function() explore("BagService", "GetBagData", "Mochila") end)
+local ranchBtn = bigButton(pageExtra, "🏠  Ver mis brainrots (GetAllRanchPets)", C.Accent, 42)
+ranchBtn.TextSize = 12
+ranchBtn.Activated:Connect(function() explore("PetService", "GetAllRanchPets", "Rancho") end)
+
+local sellTag = makeLabel(pageExtra, "ACCIONES MANUALES", UDim2.new(1, 0, 0, 20), nil, 11, C.Sub)
+sellTag.Font = Enum.Font.GothamBold
+sellTag.LayoutOrder = nextOrder()
+local sellBtn = bigButton(pageExtra, "💸  Vender el brainrot que llevo en la mano", C.Btn, 44)
+sellBtn.TextSize = 12
+confirmable(sellBtn, "💸  Vender el brainrot que llevo en la mano", function()
+    task.spawn(function()
+        local r = getRemote("NPCService", "ExecuteNPCAction")
+        if not r then toast("No encontré NPCService.ExecuteNPCAction") return end
+        local ok, res = pcall(r.InvokeServer, r, "petSeller", "sellHeldPet", nil)
+        if ok and type(res) == "table" and res.success then
+            toast("💸 Vendido: " .. fmt(parseNum(res.totalAmount)))
+        else
+            toast("⚠ No se vendió: " .. tostring(ok and (type(res) == "table" and res.error) or res):sub(1, 40))
+            pushDiag("VENDER => " .. ser(res))
+        end
+    end)
+end)
+
+local diagBtn = bigButton(pageExtra, "📋  Copiar diagnóstico (si algo falla)", C.Amber, 44)
+diagBtn.TextSize = 12
+diagBtn.Activated:Connect(function()
+    local lines = {
+        "DIAGNÓSTICO Auto-Recolector v2",
+        "Modo: " .. S.Mode .. " | Corrales: " .. #pens .. " | Rondas: " .. stats.rounds,
+        "Cobradas: " .. stats.ok .. " | Vacías: " .. stats.empty .. " | Errores: " .. stats.err,
+        "Último error: " .. (lastError ~= "" and lastError or "ninguno"),
+        "",
+    }
+    for _, l in ipairs(diag) do lines[#lines + 1] = l end
+    if #diag == 0 then lines[#lines + 1] = "(sin errores guardados)" end
+    local text = scrub(table.concat(lines, "\n"))
+    toast(copyText(text) and "📋 Diagnóstico copiado" or "⚠ No se pudo copiar")
+end)
+
+----------------------------------------------------------------
+-- PESTAÑA 3: AJUSTES
+----------------------------------------------------------------
+local layoutFrame -- se define abajo
+
+local function addStepper(parent, text, get, set, mn, mx, step, suffix)
+    local row = card(parent, 48)
+    makeLabel(row, text, UDim2.new(1, -160, 1, 0), UDim2.new(0, 12, 0, 8), 13)
+    local minus = makeButton(row, "–", UDim2.fromOffset(40, 36), UDim2.new(1, -152, 0.5, -18))
+    local val = makeLabel(row, "", UDim2.fromOffset(56, 36), UDim2.new(1, -108, 0.5, -10), 13)
+    val.TextXAlignment = Enum.TextXAlignment.Center
+    val.Font = Enum.Font.GothamBold
+    local plus = makeButton(row, "+", UDim2.fromOffset(40, 36), UDim2.new(1, -48, 0.5, -18))
+    local function refresh() val.Text = tostring(get()) .. suffix end
+    local function change(d) set(clamp(get() + d, mn, mx)) refresh() saveSoon() end
+    minus.Activated:Connect(function() change(-step) end)
+    plus.Activated:Connect(function() change(step) end)
+    refresh()
+end
+
+addStepper(pageSet, "Intervalo entre rondas", function() return S.Interval end, function(v) S.Interval = v end, 5, 300, 5, " s")
+addStepper(pageSet, "Pausa entre corrales", function() return S.Delay end, function(v) S.Delay = v end, 100, 2000, 100, " ms")
+addStepper(pageSet, "Tamaño de interfaz", function() return S.Scale end, function(v) S.Scale = v layoutFrame() end, 70, 150, 10, "%")
+
+local modeBtn = bigButton(pageSet, "", C.Btn, 54)
+modeBtn.TextSize = 12
+modeBtn.TextWrapped = true
+local modeNames = {
+    "Posición: TELETRANSPORTAR al colector (recomendado)",
+    "Posición: MI PERSONAJE (sin moverme, hay que estar cerca)",
+    "Posición: COLECTOR (desde lejos, puede fallar)",
+}
+local function refreshMode() modeBtn.Text = modeNames[S.Mode] .. "\nToca para cambiar" end
+modeBtn.Activated:Connect(function() S.Mode = S.Mode % 3 + 1 refreshMode() saveSoon() end)
+refreshMode()
+
+addToggle(pageSet, "Volver a mi posición al terminar (modo 1)", function() return S.ReturnBack end, function(v) S.ReturnBack = v end)
+addToggle(pageSet, "Saltar corrales vacíos 5 min", function() return S.SkipEmpty end, function(v) S.SkipEmpty = v end)
+
+local info = makeLabel(pageSet,
+    "Tecla rápida en PC: F8. Si falla la recolección, prueba otro modo de posición y usa «Copiar diagnóstico» en Extras.",
+    UDim2.new(1, 0, 0, 56), nil, 11, C.Sub)
+info.LayoutOrder = nextOrder()
+
+----------------------------------------------------------------
+-- BUCLES
+----------------------------------------------------------------
+-- Recolección automática
 task.spawn(function()
     while running do
         if enabled and not busy then
             runCycle(function() return enabled end)
-            -- Espera el intervalo (se corta si apagas el script)
             local waited = 0
             while running and enabled and waited < S.Interval do
                 task.wait(0.25)
@@ -443,29 +828,54 @@ end)
 
 -- Estado en pantalla
 task.spawn(function()
+    local last = os.clock()
     while running do
         task.wait(0.5)
+        local now = os.clock()
+        if enabled then stats.active += now - last end
+        last = now
+        local perMin = stats.active > 5 and (stats.coins / (stats.active / 60)) or 0
         statusLabel.Text = string.format(
-            "%s\nCorrales: %d | Rondas: %d\nCobradas: %d | Vacías: %d | Errores: %d%s",
-            statusText, #pens, stats.rounds, stats.ok, stats.empty, stats.err,
-            lastError ~= "" and ("\nÚltimo error: " .. lastError) or "")
+            "%s\nCorrales: %d | Rondas: %d%s\nCobradas: %d | Vacías: %d | Saltadas: %d | Errores: %d\n💰 Total sesión: %s\nÚltima ronda: %s | ≈ %s/min%s",
+            statusText, #pens, stats.rounds, busy and " (en curso)" or "",
+            stats.ok, stats.empty, stats.skipped, stats.err,
+            fmt(stats.coins), fmt(stats.lastRound), fmt(perMin),
+            lastError ~= "" and ("\n⚠ Último error: " .. lastError) or "")
     end
 end)
+
+-- Anti-AFK
+track(player.Idled:Connect(function()
+    if S.AntiAFK then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end
+end))
+
+-- Tecla rápida (PC)
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == HOTKEY then setEnabled(not enabled) end
+end))
 
 ----------------------------------------------------------------
 -- VENTANA
 ----------------------------------------------------------------
-local function layoutFrame()
+function layoutFrame()
     local cam = Workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-    local w = clamp(vp.X * 0.92, 260, 340)
-    local h = clamp(vp.Y * 0.82, 260, 520)
+    local sc = S.Scale / 100
+    uiScale.Scale = sc
+    local w = clamp(vp.X * 0.92 / sc, 250, 340)
+    local h = clamp(vp.Y * 0.82 / sc, 240, 520)
     frame.Size = minimized and UDim2.fromOffset(w, HEADER_H) or UDim2.fromOffset(w, h)
 end
 do
     local cam = Workspace.CurrentCamera
     if cam then track(cam:GetPropertyChangedSignal("ViewportSize"):Connect(layoutFrame)) end
 end
+
 minBtn.Activated:Connect(function()
     minimized = not minimized
     body.Visible = not minimized
@@ -486,9 +896,11 @@ end)
 -- INICIO
 ----------------------------------------------------------------
 layoutFrame()
+selectTab(1)
 refreshMain()
 task.spawn(function()
     scanPens()
+    rebuildFloors()
     statusText = #pens > 0 and ("Listo. Encontré " .. #pens .. " corrales.")
         or "No encontré corrales. Pulsa «Volver a buscar»."
 end)
