@@ -1,15 +1,17 @@
 --[[
-    AUTO-RECOLECTOR v3 para "Fusiona cualquier cosa en Brainrot"
+    AUTO-RECOLECTOR v3.1 para "Fusiona cualquier cosa en Brainrot"
     Delta (Mobile/PC)
 
-    NUEVO v3:
-    - Pestaña 🛒 Brainrot: comprar salvajes (WildService.BuyPet) y fusionar (WildService.FuseWildPet)
-      automático o manual, con filtro de monedas/s mínimas y límite por ronda.
-    - Copiar última respuesta de compra/fusión para depurar.
-    - Diagnóstico ampliado.
-
-    Incluye todo lo de v2: 3 modos de posición, pisos a elegir, salto de corrales vacíos,
-    totales, Anti-AFK, extras, botón flotante 💰, tecla F8, ajustes guardados.
+    ARREGLOS v3.1:
+    - COBRAR: busca el Collector aunque esté anidado (parte o modelo), prefiere el corral
+      que realmente lo tiene, detecta colectores que desaparecen y vuelve a escanear, y llama
+      al remote con ":InvokeServer" dentro de pcall (compatible con más ejecutores).
+    - COMPRAR / FUSIONAR: los salvajes se leen del Workspace (modelos Pet_<uuid>) y se cruzan
+      con GetAllWildPets; el personaje se teletransporta junto al salvaje antes de comprar o
+      fusionar (como cuando caminas hacia él); para fusionar se exige tener un brainrot en la
+      mano (HeldPet_<tú>_left/right).
+    - Cobro y tienda ya no se pisan: nunca te teletransportan a la vez.
+    - Botón "Estado de la tienda" para copiar qué ve el script (en mano, salvajes, respuestas).
 ]]
 
 ----------------------------------------------------------------
@@ -71,10 +73,11 @@ local S = {
     -- Tienda / fusión
     AutoBuy = false,
     AutoFuse = false,
+    ShopTeleport = true, -- ir hasta el salvaje antes de comprar/fusionar
     BuyMinExp = 0,     -- mínimo de monedas/s = 10^N (0 = sin filtro)
-    BuyMax = 3,        -- compras máximas por ronda
-    FuseMax = 3,       -- fusiones máximas por ronda
-    ShopInterval = 5,  -- segundos entre rondas de tienda
+    BuyMax = 3,
+    FuseMax = 3,
+    ShopInterval = 5,
 }
 
 pcall(function()
@@ -190,6 +193,16 @@ local function pushDiag(line)
     if #diag > 12 then table.remove(diag, 1) end
 end
 
+-- Candado: cobro y tienda nunca mueven tu personaje a la vez
+local lock = false
+local function withLock(fn)
+    while lock and running do task.wait(0.1) end
+    lock = true
+    local ok, err = pcall(fn)
+    lock = false
+    return ok, err
+end
+
 ----------------------------------------------------------------
 -- REMOTES (Knit: ReplicatedStorage...Services.<Servicio>.RF.<Nombre>)
 ----------------------------------------------------------------
@@ -214,6 +227,14 @@ local function getRemote(service, name)
     return index[key]
 end
 
+-- Invoca un RemoteFunction de forma segura: devuelve ok, respuesta
+local function invoke(remote, ...)
+    local args = table.pack(...)
+    return pcall(function()
+        return remote:InvokeServer(table.unpack(args, 1, args.n))
+    end)
+end
+
 ----------------------------------------------------------------
 -- CORRALES
 ----------------------------------------------------------------
@@ -232,15 +253,24 @@ local function isMine(inst)
     return false
 end
 
+-- El Collector puede ser una parte, un modelo o estar anidado
+local function findCollector(pen)
+    local c = pen:FindFirstChild("Collector", true)
+    if not c then return nil end
+    if c:IsA("BasePart") then return c end
+    if c:IsA("Model") and c.PrimaryPart then return c.PrimaryPart end
+    return c:FindFirstChildWhichIsA("BasePart", true)
+end
+
 local function scanPens()
     local found, seen, n = {}, {}, 0
     for _, d in ipairs(Workspace:GetDescendants()) do
         n += 1
         if n % 500 == 0 then task.wait() end
         local f, s = d.Name:match("^Pen_(%d+)_(%d+)$")
-        if f and not seen[f .. "_" .. s] then
-            local col = d:FindFirstChild("Collector")
-            if col and col:IsA("BasePart") and isMine(d) then
+        if f and (d:IsA("Model") or d:IsA("Folder")) and not seen[f .. "_" .. s] then
+            local col = findCollector(d)
+            if col and isMine(d) then
                 seen[f .. "_" .. s] = true
                 found[#found + 1] = { id = f .. "_" .. s, floor = tonumber(f), slot = tonumber(s), collector = col }
             end
@@ -279,13 +309,20 @@ local function cycle(keepGoing)
             continue
         end
 
+        -- el colector desapareció (el corral se recargó): reescanear en la próxima ronda
+        if not p.collector or not p.collector.Parent then
+            lastScan = 0
+            lastError = "Colector perdido, reescaneando…"
+            continue
+        end
+
         local hrp = getHRP()
         local pos
         if S.Mode == 1 then
             if not hrp then lastError = "No hay personaje" break end
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.CFrame = p.collector.CFrame + Vector3.new(0, 3, 0)
-            task.wait(0.12)
+            task.wait(0.15)
             pos = hrp.Position
         elseif S.Mode == 2 then
             pos = hrp and hrp.Position or p.collector.Position
@@ -293,7 +330,7 @@ local function cycle(keepGoing)
             pos = p.collector.Position
         end
 
-        local ok, res = pcall(remote.InvokeServer, remote, p.id, pos)
+        local ok, res = invoke(remote, p.id, pos)
         if not ok then
             stats.err += 1
             lastError = tostring(res):sub(1, 60)
@@ -310,7 +347,7 @@ local function cycle(keepGoing)
                 if parseNum(res.coinsPerSecond) == 0 then p.emptyUntil = os.clock() + 300 end
             else
                 stats.err += 1
-                lastError = tostring(res.error)
+                lastError = tostring(res.error or res.message or "sin detalle"):sub(1, 60)
                 pushDiag(p.id .. " => " .. ser(res, 0, 3, 12))
             end
         else
@@ -335,7 +372,7 @@ end
 local function runCycle(keepGoing)
     if busy then return end
     busy = true
-    local ok, err = pcall(cycle, keepGoing)
+    local ok, err = withLock(function() cycle(keepGoing) end)
     busy = false
     if not ok then
         lastError = tostring(err):sub(1, 60)
@@ -349,56 +386,135 @@ end
 local shop = { bought = 0, fused = 0, fail = 0, rounds = 0, last = "—", lastBuyRaw = "", lastFuseRaw = "" }
 local shopBusy = false
 
--- Busca recursivamente los salvajes dentro de la respuesta (estructura desconocida)
-local function findPets(res)
-    local out, seen = {}, {}
-    local function walk(t, depth)
-        if depth > 6 or type(t) ~= "table" or seen[t] then return end
-        seen[t] = true
-        if type(t.id) == "string" and (t.coinsPerSecond ~= nil or t.type ~= nil) then
-            out[#out + 1] = t
-            return
+local UUID_PAT = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
+
+-- Brainrots que llevas en la mano: modelos HeldPet_<tú>_left / _right en Workspace
+local function heldPets()
+    local out = {}
+    for _, c in ipairs(Workspace:GetChildren()) do
+        if c.Name:match("^HeldPet_.+_%a+$")
+            and (c.Name:find(player.Name, 1, true) or c.Name:find(player.DisplayName, 1, true)) then
+            out[#out + 1] = c
         end
-        for _, v in pairs(t) do walk(v, depth + 1) end
     end
-    walk(res, 0)
     return out
 end
 
-local function getWild()
-    local r = getRemote("WildService", "GetAllWildPets")
-    if not r then shop.last = "No encontré GetAllWildPets" return nil end
-    local ok, res = pcall(r.InvokeServer, r)
-    if not ok then
-        shop.last = "Error: " .. tostring(res):sub(1, 40)
-        pushDiag("WILD => " .. tostring(res))
-        return nil
-    end
-    local minCps = S.BuyMinExp == 0 and 0 or 10 ^ S.BuyMinExp
-    local out = {}
-    for _, p in ipairs(findPets(res)) do
-        local cps = parseNum(p.coinsPerSecond)
-        if cps >= minCps then
-            out[#out + 1] = { id = p.id, cps = cps, kind = tostring(p.type or "?") }
+-- Saca de la respuesta de GetAllWildPets todos los ids (uuid) con sus datos si los hay
+local function idMap(res)
+    local map, seen = {}, {}
+    local function walk(t, depth)
+        if depth > 6 or type(t) ~= "table" or seen[t] then return end
+        seen[t] = true
+        if type(t.id) == "string" and t.id:match(UUID_PAT) then map[t.id] = t end
+        for k, v in pairs(t) do
+            if type(k) == "string" and k:match(UUID_PAT) and map[k] == nil then
+                map[k] = type(v) == "table" and v or true
+            end
+            if type(v) == "table" then walk(v, depth + 1) end
         end
     end
-    table.sort(out, function(a, b) return a.cps > b.cps end)
-    return out
+    walk(res, 0)
+    return map
+end
+
+local function petPos(model)
+    if not model or not model.Parent then return nil end
+    local ok, pos = pcall(function() return model:GetPivot().Position end)
+    return ok and pos or nil
+end
+
+-- Lista de salvajes: modelos Pet_<uuid> hijos directos de Workspace, cruzados con el servidor
+local function getWild()
+    local info = {}
+    local r = getRemote("WildService", "GetAllWildPets")
+    if r then
+        local ok, res = invoke(r)
+        if ok then
+            info = idMap(res)
+        else
+            pushDiag("WILD => " .. tostring(res))
+        end
+    end
+    local hasInfo = next(info) ~= nil
+
+    local hrp = getHRP()
+    local list = {}
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m:IsA("Model") then
+            local id = m.Name:match("^Pet_(.+)$")
+            if id and id:match(UUID_PAT) and (not hasInfo or info[id]) then
+                local inf = type(info[id]) == "table" and info[id] or nil
+                local pos = petPos(m)
+                list[#list + 1] = {
+                    id = id, model = m,
+                    cps = inf and parseNum(inf.coinsPerSecond) or 0,
+                    kind = tostring(inf and inf.type or "?"),
+                    dist = (hrp and pos) and (pos - hrp.Position).Magnitude or math.huge,
+                }
+            end
+        end
+    end
+    -- Si el Workspace no los muestra pero el servidor sí, usar solo los datos del servidor
+    if #list == 0 and hasInfo then
+        for id, inf in pairs(info) do
+            local t = type(inf) == "table" and inf or nil
+            list[#list + 1] = {
+                id = id, cps = t and parseNum(t.coinsPerSecond) or 0,
+                kind = tostring(t and t.type or "?"), dist = math.huge,
+            }
+        end
+    end
+
+    local minCps = S.BuyMinExp == 0 and 0 or 10 ^ S.BuyMinExp
+    local out = {}
+    for _, p in ipairs(list) do
+        if p.cps >= minCps then out[#out + 1] = p end
+    end
+    table.sort(out, function(a, b)
+        if a.cps ~= b.cps then return a.cps > b.cps end
+        return a.dist < b.dist
+    end)
+    return out, #list
+end
+
+-- Ir junto al salvaje (el servidor comprueba que estés cerca, como al caminar)
+local function goNear(p)
+    if not S.ShopTeleport then return true end
+    local hrp = getHRP()
+    local pos = petPos(p.model)
+    if not hrp or not pos then
+        shop.last = "No encuentro el salvaje en el mapa"
+        return false
+    end
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 6), pos)
+    task.wait(0.3)
+    return true
+end
+
+local function whyFailed(ok, res)
+    if not ok then return tostring(res) end
+    if type(res) == "table" then
+        return tostring(res.error or res.message or res.reason or ser(res, 0, 2, 8))
+    end
+    return ser(res)
 end
 
 local function buyOne(p)
     local r = getRemote("WildService", "BuyPet")
     if not r then shop.last = "No encontré BuyPet" return false end
-    local ok, res = pcall(r.InvokeServer, r, p.id, false)
+    if not goNear(p) then shop.fail += 1 return false end
+    local ok, res = invoke(r, p.id, false)
     shop.lastBuyRaw = scrub(ok and ser(res, 0, 4, 20) or tostring(res))
-    if ok and type(res) == "table" and res.pet and not res.error then
+    if ok and type(res) == "table" and (res.pet ~= nil or res.success == true) and not res.error then
         shop.bought += 1
         shop.last = "Compré " .. p.kind .. " (" .. fmt(p.cps) .. "/s)"
+        task.wait(0.4) -- deja que el brainrot aparezca en tu mano
         return true
     end
     shop.fail += 1
-    local why = ok and (type(res) == "table" and tostring(res.error) or ser(res)) or tostring(res)
-    shop.last = "No compré: " .. why:sub(1, 40)
+    shop.last = "No compré: " .. whyFailed(ok, res):sub(1, 40)
     pushDiag("BUY " .. p.id .. " => " .. shop.lastBuyRaw)
     return false
 end
@@ -406,25 +522,31 @@ end
 local function fuseOne(p)
     local r = getRemote("WildService", "FuseWildPet")
     if not r then shop.last = "No encontré FuseWildPet" return false end
-    local ok, res = pcall(r.InvokeServer, r, p.id, false)
+    if #heldPets() == 0 then
+        shop.fail += 1
+        shop.last = "Para fusionar necesitas un brainrot en la mano"
+        return false
+    end
+    if not goNear(p) then shop.fail += 1 return false end
+    local ok, res = invoke(r, p.id, false)
     shop.lastFuseRaw = scrub(ok and ser(res, 0, 4, 20) or tostring(res))
-    if ok and type(res) == "table" and res.success then
+    if ok and type(res) == "table" and res.success and not res.error then
         shop.fused += 1
-        shop.last = "Fusioné " .. p.kind .. " (" .. fmt(p.cps) .. "/s)"
+        shop.last = "Fusioné con " .. p.kind .. " (" .. fmt(p.cps) .. "/s)"
+        task.wait(0.5)
         return true
     end
     shop.fail += 1
-    local why = ok and (type(res) == "table" and tostring(res.error) or ser(res)) or tostring(res)
-    shop.last = "No fusioné: " .. why:sub(1, 40)
+    shop.last = "No fusioné: " .. whyFailed(ok, res):sub(1, 40)
     pushDiag("FUSE " .. p.id .. " => " .. shop.lastFuseRaw)
     return false
 end
 
--- Una pasada: recorre los salvajes (mejores primero) hasta el límite o 3 fallos seguidos
+-- Una pasada: recorre los salvajes hasta el límite o 3 fallos seguidos
 local function shopPass(action, limit)
     local list = getWild()
     if not list or #list == 0 then
-        if list then shop.last = "Sin salvajes que cumplan el filtro" end
+        shop.last = "No veo salvajes que cumplan el filtro"
         return
     end
     local n, fails = 0, 0
@@ -438,16 +560,45 @@ end
 local function runShop(doBuy, doFuse, buyLimit, fuseLimit)
     if shopBusy then return end
     shopBusy = true
-    local ok, err = pcall(function()
+    local ok, err = withLock(function()
+        local hrp = getHRP()
+        local origin = hrp and hrp.CFrame
         if doBuy then shopPass(buyOne, buyLimit) end
         if doFuse then shopPass(fuseOne, fuseLimit) end
         shop.rounds += 1
+        if S.ShopTeleport and S.ReturnBack and origin then
+            local h = getHRP()
+            if h then
+                h.AssemblyLinearVelocity = Vector3.zero
+                h.CFrame = origin
+            end
+        end
     end)
     shopBusy = false
     if not ok then
         shop.last = "Error: " .. tostring(err):sub(1, 40)
         pushDiag("TIENDA => " .. tostring(err))
     end
+end
+
+local function shopStateText()
+    local lines = { "ESTADO TIENDA" }
+    local held = heldPets()
+    local names = {}
+    for _, h in ipairs(held) do names[#names + 1] = h.Name end
+    lines[#lines + 1] = "En mano: " .. #held .. (#held > 0 and (" (" .. table.concat(names, ", ") .. ")") or "")
+    local list, total = getWild()
+    lines[#lines + 1] = "Salvajes detectados: " .. total .. " | tras filtro: " .. #list
+    for i = 1, math.min(10, #list) do
+        local p = list[i]
+        lines[#lines + 1] = string.format("%d) %s  tipo=%s  cps=%s  dist=%s", i, p.id:sub(1, 8), p.kind, fmt(p.cps),
+            p.dist == math.huge and "?" or string.format("%.0f", p.dist))
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Último: " .. shop.last
+    lines[#lines + 1] = "BuyPet => " .. (shop.lastBuyRaw ~= "" and shop.lastBuyRaw or "(nada)")
+    lines[#lines + 1] = "FuseWildPet => " .. (shop.lastFuseRaw ~= "" and shop.lastFuseRaw or "(nada)")
+    return scrub(table.concat(lines, "\n"))
 end
 
 ----------------------------------------------------------------
@@ -574,7 +725,7 @@ local grad = Instance.new("UIGradient")
 grad.Color = ColorSequence.new(Color3.fromRGB(60, 80, 160), C.Card)
 grad.Parent = header
 
-makeLabel(header, "💰 Auto-Recolector v3", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
+makeLabel(header, "💰 Auto-Recolector v3.1", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
 makeLabel(header, "Fusiona cualquier cosa en Brainrot", UDim2.new(1, -90, 0, 16), UDim2.new(0, 14, 0, 26), 11, C.Sub)
 local minBtn   = makeButton(header, "–", UDim2.fromOffset(32, 32), UDim2.new(1, -78, 0.5, -16))
 local closeBtn = makeButton(header, "✕", UDim2.fromOffset(32, 32), UDim2.new(1, -40, 0.5, -16), C.Red)
@@ -835,6 +986,7 @@ local shopLabel = makeLabel(shopCard, "", UDim2.new(1, -20, 1, -12), UDim2.new(0
 
 addToggle(pageShop, "🛒 Comprar salvajes automático", function() return S.AutoBuy end, function(v) S.AutoBuy = v end)
 addToggle(pageShop, "🧬 Fusionar salvajes automático", function() return S.AutoFuse end, function(v) S.AutoFuse = v end)
+addToggle(pageShop, "🚶 Ir hasta el salvaje (teletransporte)", function() return S.ShopTeleport end, function(v) S.ShopTeleport = v end)
 
 addStepper(pageShop, "Mín. monedas/s", function() return S.BuyMinExp end, function(v) S.BuyMinExp = v end, 0, 40, 1, "",
     function(v) return v == 0 and "todos" or ("1e" .. v) end)
@@ -849,24 +1001,26 @@ buyNowBtn.Activated:Connect(function()
     task.spawn(function() runShop(true, false, 1, 0) toast(shop.last) end)
 end)
 
-local fuseNowBtn = bigButton(pageShop, "🧬  Fusionar el mejor salvaje (1 vez)", C.Accent, 42)
+local fuseNowBtn = bigButton(pageShop, "🧬  Fusionar con el mejor salvaje (1 vez)", C.Accent, 42)
 fuseNowBtn.TextSize = 12
 fuseNowBtn.Activated:Connect(function()
     if shopBusy then toast("Espera, hay una ronda en curso") return end
     task.spawn(function() runShop(false, true, 0, 1) toast(shop.last) end)
 end)
 
-local rawBtn = bigButton(pageShop, "📋  Copiar última respuesta de compra/fusión", C.Amber, 42)
-rawBtn.TextSize = 12
-rawBtn.Activated:Connect(function()
-    local text = scrub("BuyPet:\n" .. (shop.lastBuyRaw ~= "" and shop.lastBuyRaw or "(nada)")
-        .. "\n\nFuseWildPet:\n" .. (shop.lastFuseRaw ~= "" and shop.lastFuseRaw or "(nada)"))
-    toast(copyText(text) and "📋 Respuestas copiadas" or "⚠ No se pudo copiar")
+local stateBtn = bigButton(pageShop, "📋  Copiar estado de la tienda (si algo falla)", C.Amber, 42)
+stateBtn.TextSize = 12
+stateBtn.Activated:Connect(function()
+    task.spawn(function()
+        local ok, text = pcall(shopStateText)
+        if not ok then toast("⚠ Error: " .. tostring(text):sub(1, 40)) return end
+        toast(copyText(text) and ("📋 Estado copiado (" .. #text .. " car.)") or "⚠ No se pudo copiar")
+    end)
 end)
 
 local shopInfo = makeLabel(pageShop,
-    "Los salvajes se ordenan por monedas/s (el mejor primero). Si 3 intentos seguidos fallan (sin dinero, lejos, etc.) la ronda se corta. Si algo no funciona, copia la última respuesta.",
-    UDim2.new(1, 0, 0, 70), nil, 11, C.Sub)
+    "Fusionar necesita un brainrot en la mano: compra uno primero (o actívalo en automático junto a «Comprar»). El script va junto al salvaje, actúa y vuelve a tu sitio. Con filtro de monedas/s mayor que «todos», los salvajes sin dato de monedas/s se descartan.",
+    UDim2.new(1, 0, 0, 96), nil, 11, C.Sub)
 shopInfo.LayoutOrder = nextOrder()
 
 ----------------------------------------------------------------
@@ -882,7 +1036,7 @@ local function explore(service, name, label)
     task.spawn(function()
         local r = getRemote(service, name)
         if not r then toast("No encontré " .. service .. "." .. name) return end
-        local ok, res = pcall(r.InvokeServer, r)
+        local ok, res = invoke(r)
         local text = ok and ser(res, 0, 5, 60) or ("error: " .. tostring(res))
         text = scrub(label .. " (" .. service .. "." .. name .. "):\n" .. text)
         if #text > 20000 then text = text:sub(1, 20000) .. "\n… (recortado)" end
@@ -913,7 +1067,7 @@ confirmable(sellBtn, "💸  Vender el brainrot que llevo en la mano", function()
     task.spawn(function()
         local r = getRemote("NPCService", "ExecuteNPCAction")
         if not r then toast("No encontré NPCService.ExecuteNPCAction") return end
-        local ok, res = pcall(r.InvokeServer, r, "petSeller", "sellHeldPet", nil)
+        local ok, res = invoke(r, "petSeller", "sellHeldPet", nil)
         if ok and type(res) == "table" and res.success then
             toast("💸 Vendido: " .. fmt(parseNum(res.totalAmount)))
         else
@@ -927,7 +1081,7 @@ local diagBtn = bigButton(pageExtra, "📋  Copiar diagnóstico (si algo falla)"
 diagBtn.TextSize = 12
 diagBtn.Activated:Connect(function()
     local lines = {
-        "DIAGNÓSTICO Auto-Recolector v3",
+        "DIAGNÓSTICO Auto-Recolector v3.1",
         "Modo: " .. S.Mode .. " | Corrales: " .. #pens .. " | Rondas: " .. stats.rounds,
         "Cobradas: " .. stats.ok .. " | Vacías: " .. stats.empty .. " | Errores: " .. stats.err,
         "Último error: " .. (lastError ~= "" and lastError or "ninguno"),
@@ -960,7 +1114,7 @@ local function refreshMode() modeBtn.Text = modeNames[S.Mode] .. "\nToca para ca
 modeBtn.Activated:Connect(function() S.Mode = S.Mode % 3 + 1 refreshMode() saveSoon() end)
 refreshMode()
 
-addToggle(pageSet, "Volver a mi posición al terminar (modo 1)", function() return S.ReturnBack end, function(v) S.ReturnBack = v end)
+addToggle(pageSet, "Volver a mi posición al terminar", function() return S.ReturnBack end, function(v) S.ReturnBack = v end)
 addToggle(pageSet, "Saltar corrales vacíos 5 min", function() return S.SkipEmpty end, function(v) S.SkipEmpty = v end)
 
 local info = makeLabel(pageSet,
