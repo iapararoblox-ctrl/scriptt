@@ -1,46 +1,39 @@
---[[  AUTO BURBUJAS — versión con mitigación anti-detección
-  Cambios clave:
-    - RADIO realista (no 500000)
-    - Delays con jitter humano
-    - Límite de burbujas por ciclo
-    - Pausas largas periódicas
-    - No anula AssemblyLinearVelocity
-    - Pausa si te mueves a mano o si el estado del Humanoid no es "Running"
-    - Chequeo de distancia mínima entre TPsd
+--[[  AUTO BURBUJAS
+  Corrección de TP: ahora el personaje aterriza SIEMPRE encima de la plataforma.
+    - TP exacto (antes solo viajaba el 60% del camino y con +3 de altura)
+    - La plataforma solo se mueve si el TP se realiza (antes se movía aunque fallara el TP)
+    - Estados bloqueados en lista negra (antes Swimming/Freefall bloqueaban todo)
+    - Se anula solo la velocidad vertical al aterrizar para no atravesar la plataforma
 --]]
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 ---------------------------------------------------------------------
--- Configuración (anti-detección)
+-- Configuración
 ---------------------------------------------------------------------
-local RADIO = 250                    -- antes 500000. Radio realista de recolección
+local RADIO = 250                    -- radio de recolección
 local INTERVALO = 1.5                -- segundos base entre ciclos
 local INTERVALO_JITTER = 0.6         -- ±variación aleatoria
 local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
 local DESTINO = Vector3.new(11, 49, -553)
-local ALTURA_PLATAFORMA = 3.5
+local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1, 4        -- antes 1..20. Ahora máximo 4 burb/s
+local VEL_MIN, VEL_MAX = 1, 4        -- burbujas por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
-local RADIO_TP = 120                 -- antes 150. Radio de TP aleatorio
-local SEPARACION = 60                -- antes 45
+local RADIO_TP = 120                 -- radio de TP aleatorio
+local SEPARACION = 60
 local CANDIDATOS = 60
 
--- Anti-detección
 local PAUSA_CADA = 15                -- cada N burbujas, pausa larga
 local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
-local BURBUJAS_POR_CICLO = 3          -- no arrasar todas en un tick
-local DIST_MIN_TP = 1                 -- distancia mínima a la burbuja (no te pegues)
-local OFFSET_TP = Vector3.new(0, 3, 0) -- TP a la altura de la cabeza, no al pivote
+local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano
 
 -- Estado
@@ -59,7 +52,6 @@ local conexiones = {}
 local actualizarInfo
 local pausaHasta = 0
 local lastInputTime = tick()
-local lastTPTime = 0
 
 -- Paleta
 local COL_FONDO   = Color3.fromRGB(24, 26, 36)
@@ -82,7 +74,7 @@ local function humanDelay(base, jitter)
 end
 
 ---------------------------------------------------------------------
--- Detección de input humano (para pausar si te mueves)
+-- Detección de input (pausar si te mueves a mano)
 ---------------------------------------------------------------------
 if DETECTAR_INPUT then
     conectar(UserInputService.InputBegan, function(input, gpe)
@@ -144,27 +136,27 @@ local function getPosition(obj)
     end
 end
 
--- Estados del Humanoid que indican que NO debes teleportar
-local ESTADOS_SEGUROS = {
-    [Enum.HumanoidStateType.Running] = true,
-    [Enum.HumanoidStateType.RunningNoPhysics] = true,
-    [Enum.HumanoidStateType.Landed] = true,
-    [Enum.HumanoidStateType.Seated] = true,
+-- Lista NEGRA: solo se bloquea cuando el personaje no está en condiciones.
+-- (Antes era una lista blanca sin Swimming/Freefall/Jumping, y en un juego de
+-- agua o tras caerse de la plataforma el script quedaba bloqueado para siempre.)
+local ESTADOS_BLOQUEADOS = {
+    [Enum.HumanoidStateType.Dead] = true,
+    [Enum.HumanoidStateType.Ragdoll] = true,
+    [Enum.HumanoidStateType.FallingDown] = true,
 }
 
 local function estadoSeguro()
     local hum = getHumanoid()
     if not hum then return false end
     if hum.Health <= 0 then return false end
-    local st = hum:GetState()
-    return ESTADOS_SEGUROS[st] == true
+    return not ESTADOS_BLOQUEADOS[hum:GetState()]
 end
 
 local function crearPlataforma(posicion)
     if not plataforma or not plataforma.Parent then
         plataforma = Instance.new("Part")
         plataforma.Name = "FloatPlatform"
-        plataforma.Size = Vector3.new(10, 1, 10)
+        plataforma.Size = Vector3.new(12, 1, 12)
         plataforma.Anchored = true
         plataforma.CanCollide = true
         plataforma.Transparency = 0.6
@@ -182,29 +174,36 @@ local function quitarPlataforma()
     end
 end
 
--- TP suave: usa PivotTo y NO toca AssemblyLinearVelocity (eso canta)
-local function teleportarSuave(root, destino)
+-- TP exacto a una posición (se usa para ir a las burbujas).
+-- Conserva la rotación y solo anula la velocidad vertical.
+local function teleportarA(root, destino)
     if not root or not root.Parent then return false end
     if not estadoSeguro() then return false end
 
-    -- Tween corto en vez de salto instantáneo (más humano, pero ojo:
-    -- el tween sobre CFrame se puede detectar en el servidor. Mejor teletransporte
-    -- a un punto cercano, y el desplazamiento final lo hace el personaje normal.)
-    local actual = root.Position
-    local dist = (actual - destino).Magnitude
+    local rot = root.CFrame - root.CFrame.Position
+    root.CFrame = CFrame.new(destino) * rot
 
-    if dist < DIST_MIN_TP then
-        return false -- ya estás lo bastante cerca, no hace falta TP
-    end
-
-    -- Solo teletransporta la mitad del camino, para que el resto sea caminar.
-    -- Esto rompe la firma de "TP exacto a la burbuja".
-    local salto = actual:Lerp(destino, 0.6) + OFFSET_TP
-    root.CFrame = CFrame.new(salto, salto + (destino - salto))
-    lastTPTime = tick()
+    local v = root.AssemblyLinearVelocity
+    root.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
     return true
 end
 
+-- Coloca la plataforma Y el personaje encima, en el mismo instante (sin yield),
+-- para que no haya ni un frame en el aire. La plataforma solo se mueve si el
+-- TP se realiza, así nunca queda separada del personaje.
+local function irAPlataforma(root, destino)
+    if not root or not root.Parent then return false end
+    if not estadoSeguro() then return false end
+
+    crearPlataforma(destino)
+
+    local rot = root.CFrame - root.CFrame.Position
+    root.CFrame = CFrame.new(destino) * rot
+    root.AssemblyLinearVelocity = Vector3.zero -- evita atravesar la plataforma al caer
+    return true
+end
+
+-- Elige el candidato más lejano a todos los puntos ya usados
 local function posicionAleatoria(origen)
     if #visitados == 0 and origen then
         table.insert(visitados, Vector3.new(origen.X, DESTINO.Y, origen.Z))
@@ -234,7 +233,7 @@ local function posicionAleatoria(origen)
 end
 
 ---------------------------------------------------------------------
--- Helpers de UI (idénticos)
+-- Helpers de UI
 ---------------------------------------------------------------------
 local function redondear(obj, radio)
     local c = Instance.new("UICorner")
@@ -446,7 +445,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "🫧  Auto Burbujas (safe) V1", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "MAYKEL CREADOR", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -80, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -555,7 +554,7 @@ actualizarInfo = function()
         lblOxigeno.Text = string.format("Oxígeno: %.0f / %.0f  ·  %s", ox, mx, estado)
     end
     if tick() < pausaHasta then
-        lblEstado.Text = string.format("Estado: pausa humana (%.1fs)", pausaHasta - tick())
+        lblEstado.Text = string.format("Estado: pausa (%.1fs)", pausaHasta - tick())
     else
         lblEstado.Text = "Estado: " .. (activo and "activo" or "inactivo")
     end
@@ -603,7 +602,6 @@ local function recogerBurbujas()
     if not root or not root.Parent then return end
     if not estadoSeguro() then return end
 
-    -- Si el jugador se ha movido a mano recientemente, pausa un poco
     if DETECTAR_INPUT and (tick() - lastInputTime) < 0.8 then
         return
     end
@@ -614,7 +612,6 @@ local function recogerBurbujas()
         return
     end
 
-    -- Recolectar solo unas pocas por ciclo
     local hechas = 0
     for _, bubble in ipairs(folder:GetChildren()) do
         if not activo then break end
@@ -625,19 +622,17 @@ local function recogerBurbujas()
 
         local pos = getPosition(bubble)
         if not pos then continue end
-        local dist = (root.Position - pos).Magnitude
-        if dist <= RADIO then
-            local ok = teleportarSuave(root, pos)
-            if ok then
+
+        if (root.Position - pos).Magnitude <= RADIO then
+            -- TP exacto a la burbuja para que se recoja
+            if teleportarA(root, pos) then
                 recogidas = recogidas + 1
                 hechas = hechas + 1
                 lblContador.Text = "Recogidas: " .. recogidas
 
-                -- Pausa humana entre burbujas: 1/vel ± 40%
                 local base = 1 / velocidad
                 task.wait(humanDelay(base, base * 0.4))
 
-                -- Pausa larga cada N burbujas
                 if recogidas % PAUSA_CADA == 0 then
                     local p = math.random() * (PAUSA_MAX - PAUSA_MIN) + PAUSA_MIN
                     pausaHasta = tick() + p
@@ -645,17 +640,16 @@ local function recogerBurbujas()
                     task.wait(p)
                 end
             else
-                -- No se pudo TP (estado inseguro o ya estamos cerca): saltar esta
                 task.wait(0.1)
             end
         end
     end
 
+    -- Sin TP aleatorio: vuelve al destino y se queda encima de la plataforma.
+    -- Con TP aleatorio activo, el otro bucle se encarga de moverlo.
     root = getRoot()
     if activo and hechas > 0 and not tpAleatorio and root and root.Parent then
-        crearPlataforma(DESTINO)
-        root.CFrame = CFrame.new(DESTINO)
-        -- OJO: ya no ponemos AssemblyLinearVelocity = zero
+        irAPlataforma(root, DESTINO)
     end
 end
 
@@ -672,20 +666,18 @@ task.spawn(function()
     end
 end)
 
--- Bucle 2: TP aleatorio
+-- Bucle 2: TP aleatorio (independiente del interruptor principal)
 task.spawn(function()
     while not cerrado do
         task.wait(humanDelay(INTERVALO_TP, 0.4))
         if not cerrado and tpAleatorio and not ocupado
         and tick() >= pausaHasta
-        and (not DETECTAR_INPUT or (tick() - lastInputTime) > 1.2)
-        and estadoSeguro() then
+        and (not DETECTAR_INPUT or (tick() - lastInputTime) > 1.2) then
             local ok, err = pcall(function()
                 local root = getRoot()
                 if not root or not root.Parent then return end
                 local destino = posicionAleatoria(root.Position)
-                crearPlataforma(destino)
-                teleportarSuave(root, destino)
+                irAPlataforma(root, destino)
             end)
             if not ok then warn("[ERROR tp aleatorio]", err) end
         end
