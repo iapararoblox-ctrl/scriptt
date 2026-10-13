@@ -16,11 +16,14 @@ local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5
 
 local VEL_MIN, VEL_MAX = 1, 20      -- burbujas por segundo
-local GIRO_MIN, GIRO_MAX = 30, 720  -- grados por segundo
+local GIRO_MIN, GIRO_MAX = 10, 360  -- grados por segundo (velocidad del recorrido)
+local ORB_MIN, ORB_MAX = 2, 40      -- radio del círculo en studs
 
 -- Estado
 local velocidad = 7
-local velGiro = 180
+local velGiro = 90
+local radioOrbita = 10
+local angulo = 0
 local girar = false
 local activo = false
 local enDestino = false
@@ -287,8 +290,8 @@ gui.Parent = PlayerGui
 
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
-panel.Size = UDim2.fromOffset(250, 290)
-panel.Position = UDim2.new(0, 20, 0.5, -145)
+panel.Size = UDim2.fromOffset(250, 356)
+panel.Position = UDim2.new(0, 20, 0.5, -178)
 panel.BackgroundColor3 = COL_FONDO
 panel.BorderSizePixel = 0
 panel.Parent = gui
@@ -382,29 +385,39 @@ sep.BorderSizePixel = 0
 sep.Parent = panel
 
 -- Fila 3: girar en el aire
-local lblGirar = crearTexto(panel, "Girar en el aire", 14, COL_TEXTO)
+local lblGirar = crearTexto(panel, "Dar vueltas en el aire", 14, COL_TEXTO)
 lblGirar.Size = UDim2.new(1, -90, 0, 26)
 lblGirar.Position = UDim2.fromOffset(14, 162)
 
-local sliderGiro
+local sliderGiro, sliderRadio
 crearSwitch(panel, UDim2.new(1, -64, 0, 162), function(valor)
 	girar = valor
 	sliderGiro.GroupTransparency = girar and 0 or 0.55
+	sliderRadio.GroupTransparency = girar and 0 or 0.55
 end)
 
 -- Fila 4: velocidad de giro
 sliderGiro = crearSlider(panel, 200, {
 	min = GIRO_MIN, max = GIRO_MAX, paso = 10, inicial = velGiro,
 	textoMin = "Suave", textoMax = "Turbo",
-	formato = function(v) return string.format("Giro: %d°/s  (%.1f vueltas/s)", v, v / 360) end,
+	formato = function(v) return string.format("Vel. recorrido: %d°/s (%.2f v/s)", v, v / 360) end,
 	alCambiar = function(v) velGiro = v end,
 })
 sliderGiro.GroupTransparency = 0.55
 
+-- Fila 5: tamaño del círculo
+sliderRadio = crearSlider(panel, 262, {
+	min = ORB_MIN, max = ORB_MAX, paso = 1, inicial = radioOrbita,
+	textoMin = "Pequeño", textoMax = "Grande",
+	formato = function(v) return string.format("Radio del círculo: %d studs", v) end,
+	alCambiar = function(v) radioOrbita = v end,
+})
+sliderRadio.GroupTransparency = 0.55
+
 -- Contador
 local lblContador = crearTexto(panel, "Recogidas: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 262)
+lblContador.Position = UDim2.fromOffset(14, 328)
 
 ---------------------------------------------------------------------
 -- Minimizar / cerrar
@@ -439,15 +452,26 @@ hacerArrastrable(barra, panel)
 hacerArrastrable(burbuja, burbuja, restaurar)
 
 ---------------------------------------------------------------------
--- Giro en el aire (solo mientras está en el destino)
+-- Recorrido circular en el aire (solo mientras está en el destino)
 ---------------------------------------------------------------------
 conectar(RunService.Heartbeat, function(dt)
 	if not (activo and girar and enDestino) then return end
 	local char = LocalPlayer.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if root then
-		root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(velGiro) * dt, 0)
-		root.AssemblyAngularVelocity = Vector3.zero
+	if not root then return end
+
+	angulo = (angulo + math.rad(velGiro) * dt) % (math.pi * 2)
+	local c, sn = math.cos(angulo), math.sin(angulo)
+	local pos = DESTINO + Vector3.new(c * radioOrbita, 0, sn * radioOrbita)
+	local tangente = Vector3.new(-sn, 0, c) -- mira hacia donde avanza
+
+	root.CFrame = CFrame.lookAt(pos, pos + tangente)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+
+	-- la plataforma acompaña al personaje para que no caiga
+	if plataforma and plataforma.Parent then
+		plataforma.Position = pos - Vector3.new(0, ALTURA_PLATAFORMA, 0)
 	end
 end)
 
