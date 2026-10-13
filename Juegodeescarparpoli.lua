@@ -426,26 +426,34 @@ hacerArrastrable(burbuja, burbuja, restaurar)
 -- Lógica principal
 ---------------------------------------------------------------------
 local function recogerBurbujas()
-	local folder = Workspace:FindFirstChild("EnvironmentOxygenBubbles", true)
-	if not folder then return end
-
 	local root = getRoot()
 	if not root then return end
 
 	local recogio = false
+	local folder = Workspace:FindFirstChild("EnvironmentOxygenBubbles", true)
 
-	for _, bubble in ipairs(folder:GetChildren()) do
-		if not activo then break end
-		if not bubble.Parent then continue end
+	if folder then
+		for _, bubble in ipairs(folder:GetChildren()) do
+			if not activo then break end
+			if not bubble.Parent then continue end
 
-		local pos = getPosition(bubble)
-		if pos and (root.Position - pos).Magnitude <= RADIO then
-			root.CFrame = CFrame.new(pos)
-			recogio = true
-			recogidas += 1
-			lblContador.Text = "Recogidas: " .. recogidas
-			task.wait(1 / velocidad) -- se lee en cada burbuja: el slider aplica al instante
+			local pos = getPosition(bubble)
+			if pos and (root.Position - pos).Magnitude <= RADIO then
+				root.CFrame = CFrame.new(pos)
+				recogio = true
+				recogidas += 1
+				lblContador.Text = "Recogidas: " .. recogidas
+				task.wait(1 / velocidad) -- se lee en cada burbuja: el slider aplica al instante
+			end
 		end
+	else
+		lblContador.Text = "Recogidas: " .. recogidas .. "  (sin burbujas)"
+	end
+
+	-- el personaje pudo reaparecer mientras recogía
+	if not root.Parent then
+		root = getRoot()
+		if not root then return end
 	end
 
 	if activo and root.Parent then
