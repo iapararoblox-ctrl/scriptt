@@ -22,7 +22,7 @@ local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1, 15       -- burbujas por segundo
+local VEL_MIN, VEL_MAX = 1, 5      -- burbujas por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
 local RADIO_TP = 120                 -- radio de TP aleatorio
@@ -40,6 +40,8 @@ local MIN_PERMANENCIA = 0.25         -- segundos mínimos sobre la burbuja (para
 local MOVIMIENTO_SUAVE = true        -- true = desliza con Tween; false = TP instantáneo
 local VELOCIDAD_TWEEN = 300          -- studs por segundo del deslizamiento
 local TWEEN_MAX = 0.5                -- duración máxima de cada desplazamiento (segundos)
+local VELOCIDAD_EVASION = 500        -- studs/s al huir de un mob (más rápido que el normal)
+local EVASION_TWEEN_MAX = 0.35       -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
@@ -67,6 +69,7 @@ local lastInputTime = tick()
 local evadirMobs = false
 local evasiones = 0
 local ultimaEvasion = 0
+local evadiendo = false
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
 local dbg = { total = 0, rango = 0, tpOk = 0, tpFail = 0, motivo = "—" }
 
@@ -217,14 +220,16 @@ local function deslizar(root, meta, dur, platDestino, continuar)
     end
 end
 
-local function duracionPara(dist)
-    return math.clamp(dist / VELOCIDAD_TWEEN, 0.08, TWEEN_MAX)
+local function duracionPara(dist, rapido)
+    local vel = rapido and VELOCIDAD_EVASION or VELOCIDAD_TWEEN
+    local tope = rapido and EVASION_TWEEN_MAX or TWEEN_MAX
+    return math.clamp(dist / vel, 0.08, tope)
 end
 
 -- Ir a una burbuja (suave o instantáneo según MOVIMIENTO_SUAVE).
 local function teleportarA(root, destino)
     if not root or not root.Parent then return false end
-    if not estadoSeguro() then return false end
+    if evadiendo or not estadoSeguro() then return false end
 
     local rot = root.CFrame - root.CFrame.Position
     local meta = CFrame.new(destino) * rot
@@ -237,7 +242,7 @@ local function teleportarA(root, destino)
         return true
     end
 
-    local llego = deslizar(root, meta, duracionPara(dist), nil, function() return activo end)
+    local llego = deslizar(root, meta, duracionPara(dist), nil, function() return activo and not evadiendo end)
     if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
     return llego
 end
@@ -257,23 +262,28 @@ local function irAPlataforma(root, destino, forzar)
     return true
 end
 
--- Igual que irAPlataforma pero deslizando personaje y plataforma juntos (TP aleatorio).
-local function irAPlataformaSuave(root, destino)
+-- Igual que irAPlataforma pero deslizando personaje y plataforma juntos.
+-- opc.continuar: función que decide si el deslizamiento sigue
+-- opc.rapido: usa la velocidad de huida   opc.forzar: ignora el estado del personaje
+local function irAPlataformaSuave(root, destino, opc)
+    opc = opc or {}
     if not root or not root.Parent then return false end
-    if not estadoSeguro() then return false end
+    if not opc.forzar and not estadoSeguro() then return false end
 
     local dist = (root.Position - destino).Magnitude
     if not MOVIMIENTO_SUAVE or dist < 4 then
-        return irAPlataforma(root, destino)
+        return irAPlataforma(root, destino, opc.forzar)
     end
 
     crearPlataforma(root.Position) -- plataforma bajo los pies antes de empezar
     local rot = root.CFrame - root.CFrame.Position
     local meta = CFrame.new(destino) * rot
     local platDestino = destino - Vector3.new(0, ALTURA_PLATAFORMA, 0)
+    local continuar = opc.continuar or function()
+        return tpAleatorio and not ocupado and not evadiendo
+    end
 
-    local llego = deslizar(root, meta, duracionPara(dist), platDestino,
-        function() return tpAleatorio and not ocupado end)
+    local llego = deslizar(root, meta, duracionPara(dist, opc.rapido), platDestino, continuar)
     if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
     return llego
 end
@@ -856,7 +866,9 @@ local function recogerBurbujas()
     -- Sin TP aleatorio: vuelve al destino y se queda encima de la plataforma.
     root = getRoot()
     if activo and hechas > 0 and not tpAleatorio and root and root.Parent then
-        irAPlataforma(root, DESTINO)
+        irAPlataformaSuave(root, DESTINO, {
+            continuar = function() return activo and not tpAleatorio and not evadiendo end,
+        })
     end
 end
 
@@ -922,13 +934,24 @@ task.spawn(function()
 
                 -- TP a la zona más lejana de todos los mobs
                 local destino, dist = posicionSegura(enemigos, root.Position)
-                if destino and irAPlataforma(root, destino, true) then
+                if destino then
+                    evadiendo = true            -- frena cualquier otro desplazamiento
                     ultimaEvasion = tick()
-                    evasiones = evasiones + 1
-                    dbg.motivo = string.format("evadió mob (nuevo punto a %.0f)", dist == math.huge and 999 or dist)
-                    actualizarContador()
+                    local llego = irAPlataformaSuave(root, destino, {
+                        rapido = true,
+                        forzar = true,
+                        continuar = function() return evadirMobs end,
+                    })
+                    evadiendo = false
+                    ultimaEvasion = tick()
+                    if llego then
+                        evasiones = evasiones + 1
+                        dbg.motivo = string.format("evadió mob (nuevo punto a %.0f)", dist == math.huge and 999 or dist)
+                        actualizarContador()
+                    end
                 end
             end)
+            evadiendo = false
             if not ok then warn("[ERROR evadir mobs]", err) end
         end
     end
