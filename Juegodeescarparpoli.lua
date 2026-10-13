@@ -1,426 +1,499 @@
---[[
-  RIFT CORE — solo grieta y portal
-  - Hookea RiftService.RemoteEvent / RemoteFunction
-  - Hookea GameService.RemoteEvent (para ver EnterPortal y compañía
-  - Botones: EnterPortal, AutoPortal, RiftProbe, Guardar
-  - Guarda en /storage/emulated/0/Delta/Informaciónrecopilada/
---]]
-
-local RS      = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
-local LP      = Players.LocalPlayer
-local UIS     = game:GetService("UserInputService")
-local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 
--- ============ CONFIG ============
-local SAVE_FOLDERS = {
-    "/storage/emulated/0/Delta/Informaciónrecopilada",
-    "../Informaciónrecopilada",
-    "Informaciónrecopilada",
-}
-local FILE_NAME = "rift_%s.txt"
-local MAX_LINES = 400
--- ================================
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- ============ REMOTES ============
-local net = RS.Packages._Index["leifstout_networker@0.3.0"].networker
-local R   = net._remotes
+---------------------------------------------------------------------
+-- Configuración
+---------------------------------------------------------------------
+local RADIO = 500000
+local INTERVALO = 1
+local DESTINO = Vector3.new(11, 49, -553)
+local ALTURA_PLATAFORMA = 3.5
 
-local RiftEvent  = R.RiftService.RemoteEvent
-local RiftFunc   = R.RiftService.RemoteFunction
-local GameEvent  = R.GameService.RemoteEvent
--- =================================
+local VEL_MIN, VEL_MAX = 1, 20      -- burbujas por segundo
+local GIRO_MIN, GIRO_MAX = 30, 720  -- grados por segundo
 
-local State = {
-    capturing  = true,
-    log        = {},
-    hooks      = {},
-    startedAt  = os.time(),
-    autoPortal = false,
-}
+-- Estado
+local velocidad = 7
+local velGiro = 180
+local girar = false
+local activo = false
+local enDestino = false
+local vivo = true
+local recogidas = 0
+local plataforma = nil
+local conexiones = {}
 
--- ============ UTIL ============
-local function ts()
-    local t = os.date("*t")
-    return string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+-- Paleta
+local COL_FONDO = Color3.fromRGB(24, 26, 36)
+local COL_BARRA = Color3.fromRGB(34, 37, 52)
+local COL_ACENTO = Color3.fromRGB(80, 170, 255)
+local COL_ON = Color3.fromRGB(60, 200, 120)
+local COL_OFF = Color3.fromRGB(90, 94, 115)
+local COL_ROJO = Color3.fromRGB(220, 75, 80)
+local COL_TEXTO = Color3.fromRGB(235, 238, 250)
+local COL_SUB = Color3.fromRGB(150, 156, 180)
+
+local function conectar(senal, fn)
+	local c = senal:Connect(fn)
+	table.insert(conexiones, c)
+	return c
 end
 
-local function fmtVal(v)
-    if typeof(v) == "Instance" then return v:GetFullName() end
-    if type(v) == "table" then
-        local ok, s = pcall(function()
-            return game:GetService("HttpService"):JSONEncode(v)
-        end)
-        return ok and s or tostring(v)
-    end
-    if typeof(v) == "Vector3" then
-        return string.format("V3(%.1f,%.1f,%.1f)", v.X, v.Y, v.Z)
-    end
-    return tostring(v)
+---------------------------------------------------------------------
+-- Utilidades de juego
+---------------------------------------------------------------------
+local function getRoot()
+	local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	return char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
 end
 
--- ============ UI ============
+local function getPosition(obj)
+	if obj:IsA("Model") then
+		return obj:GetPivot().Position
+	elseif obj:IsA("BasePart") then
+		return obj.Position
+	end
+end
+
+local function crearPlataforma()
+	if not plataforma or not plataforma.Parent then
+		plataforma = Instance.new("Part")
+		plataforma.Name = "FloatPlatform"
+		plataforma.Size = Vector3.new(10, 1, 10)
+		plataforma.Anchored = true
+		plataforma.CanCollide = true
+		plataforma.Transparency = 0.6
+		plataforma.Material = Enum.Material.Glass
+		plataforma.Color = COL_ACENTO
+		plataforma.Parent = Workspace
+	end
+	plataforma.Position = DESTINO - Vector3.new(0, ALTURA_PLATAFORMA, 0)
+end
+
+local function quitarPlataforma()
+	if plataforma then
+		plataforma:Destroy()
+		plataforma = nil
+	end
+end
+
+---------------------------------------------------------------------
+-- Helpers de UI
+---------------------------------------------------------------------
+local function redondear(obj, radio)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radio)
+	c.Parent = obj
+	return c
+end
+
+local function borde(obj, color, grosor, transp)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = grosor or 1
+	s.Transparency = transp or 0
+	s.Parent = obj
+	return s
+end
+
+local function crearTexto(parent, texto, tam, color, fuente)
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Text = texto
+	t.TextSize = tam
+	t.TextColor3 = color or COL_TEXTO
+	t.Font = fuente or Enum.Font.GothamMedium
+	t.TextXAlignment = Enum.TextXAlignment.Left
+	t.Parent = parent
+	return t
+end
+
+local function esPuntero(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function hacerArrastrable(handle, target, alTocar)
+	local arrastrando, movido = false, false
+	local inicioInput, inicioPos
+
+	conectar(handle.InputBegan, function(input)
+		if esPuntero(input) then
+			arrastrando, movido = true, false
+			inicioInput = input.Position
+			inicioPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					arrastrando = false
+					if not movido and alTocar then
+						alTocar()
+					end
+				end
+			end)
+		end
+	end)
+
+	conectar(UserInputService.InputChanged, function(input)
+		if arrastrando and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - inicioInput
+			if d.Magnitude > 5 then
+				movido = true
+			end
+			if movido then
+				target.Position = UDim2.new(
+					inicioPos.X.Scale, inicioPos.X.Offset + d.X,
+					inicioPos.Y.Scale, inicioPos.Y.Offset + d.Y
+				)
+			end
+		end
+	end)
+end
+
+-- Interruptor reutilizable. Devuelve una función set(valor)
+local function crearSwitch(parent, posicion, alCambiar)
+	local sw = Instance.new("TextButton")
+	sw.Size = UDim2.fromOffset(50, 26)
+	sw.Position = posicion
+	sw.BackgroundColor3 = COL_OFF
+	sw.Text = ""
+	sw.AutoButtonColor = false
+	sw.Parent = parent
+	redondear(sw, 13)
+
+	local perilla = Instance.new("Frame")
+	perilla.Size = UDim2.fromOffset(20, 20)
+	perilla.Position = UDim2.fromOffset(3, 3)
+	perilla.BackgroundColor3 = Color3.new(1, 1, 1)
+	perilla.BorderSizePixel = 0
+	perilla.Parent = sw
+	redondear(perilla, 10)
+
+	local estado = false
+	local function set(valor)
+		estado = valor
+		local info = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
+		TweenService:Create(sw, info, { BackgroundColor3 = estado and COL_ON or COL_OFF }):Play()
+		TweenService:Create(perilla, info, { Position = UDim2.fromOffset(estado and 27 or 3, 3) }):Play()
+	end
+
+	sw.MouseButton1Click:Connect(function()
+		set(not estado)
+		alCambiar(estado)
+	end)
+
+	return set
+end
+
+-- Slider reutilizable. Devuelve el contenedor (CanvasGroup) para poder atenuarlo
+local function crearSlider(parent, y, cfg)
+	local cont = Instance.new("CanvasGroup")
+	cont.Size = UDim2.new(1, -28, 0, 56)
+	cont.Position = UDim2.fromOffset(14, y)
+	cont.BackgroundTransparency = 1
+	cont.Parent = parent
+
+	local lbl = crearTexto(cont, "", 14, COL_TEXTO)
+	lbl.Size = UDim2.new(1, 0, 0, 20)
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, -20, 0, 8)
+	track.Position = UDim2.fromOffset(10, 28)
+	track.BackgroundColor3 = COL_BARRA
+	track.BorderSizePixel = 0
+	track.Parent = cont
+	redondear(track, 4)
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.BackgroundColor3 = COL_ACENTO
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+	redondear(fill, 4)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(18, 18)
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.Position = UDim2.fromScale(0, 0.5)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+	redondear(knob, 9)
+	borde(knob, COL_ACENTO, 2)
+
+	local lMin = crearTexto(cont, cfg.textoMin, 11, COL_SUB)
+	lMin.Size = UDim2.fromOffset(60, 14)
+	lMin.Position = UDim2.fromOffset(10, 42)
+
+	local lMax = crearTexto(cont, cfg.textoMax, 11, COL_SUB)
+	lMax.Size = UDim2.fromOffset(60, 14)
+	lMax.Position = UDim2.new(1, -70, 0, 42)
+	lMax.TextXAlignment = Enum.TextXAlignment.Right
+
+	local function setValor(valor)
+		valor = math.clamp(valor, cfg.min, cfg.max)
+		local a = (valor - cfg.min) / (cfg.max - cfg.min)
+		fill.Size = UDim2.fromScale(a, 1)
+		knob.Position = UDim2.fromScale(a, 0.5)
+		lbl.Text = cfg.formato(valor)
+		cfg.alCambiar(valor)
+	end
+
+	local function desdeX(x)
+		local a = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		local v = cfg.min + a * (cfg.max - cfg.min)
+		v = math.floor(v / cfg.paso + 0.5) * cfg.paso
+		setValor(v)
+	end
+
+	local deslizando = false
+	for _, obj in ipairs({ track, knob }) do
+		conectar(obj.InputBegan, function(input)
+			if esPuntero(input) then
+				deslizando = true
+				desdeX(input.Position.X)
+			end
+		end)
+	end
+	conectar(UserInputService.InputChanged, function(input)
+		if deslizando and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			desdeX(input.Position.X)
+		end
+	end)
+	conectar(UserInputService.InputEnded, function(input)
+		if esPuntero(input) then
+			deslizando = false
+		end
+	end)
+
+	setValor(cfg.inicial)
+	return cont
+end
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
 local gui = Instance.new("ScreenGui")
-gui.Name = "RiftCoreUI"
+gui.Name = "BurbujasUI"
 gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-pcall(function() gui.Parent = CoreGui end)
-if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+gui.Parent = PlayerGui
 
-local W, H = 0.94, 0.7
 local panel = Instance.new("Frame")
-panel.AnchorPoint = Vector2.new(0.5, 0.5)
-panel.Size = UDim2.new(W, 0, H, 0)
-panel.Position = UDim2.new(0.5, 0, 0.45, 0)
-panel.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+panel.Name = "Panel"
+panel.Size = UDim2.fromOffset(250, 290)
+panel.Position = UDim2.new(0, 20, 0.5, -145)
+panel.BackgroundColor3 = COL_FONDO
 panel.BorderSizePixel = 0
-panel.Active = true
 panel.Parent = gui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
-Instance.new("UIStroke", panel).Color = Color3.fromRGB(90, 200, 255)
+redondear(panel, 14)
+borde(panel, COL_ACENTO, 1.5, 0.5)
 
--- HEADER
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 40)
-header.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
-header.BorderSizePixel = 0
-header.Parent = panel
-Instance.new("UICorner", header).CornerRadius = UDim.new(0, 12)
+-- Barra de título
+local barra = Instance.new("Frame")
+barra.Size = UDim2.new(1, 0, 0, 38)
+barra.BackgroundColor3 = COL_BARRA
+barra.BorderSizePixel = 0
+barra.Parent = panel
+redondear(barra, 14)
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -100, 1, 0)
-title.Position = UDim2.new(0, 14, 0, 0)
-title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
-title.TextSize = 15
-title.TextColor3 = Color3.fromRGB(90, 200, 255)
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "RIFT CORE"
-title.Parent = header
+local tapa = Instance.new("Frame")
+tapa.Size = UDim2.new(1, 0, 0, 14)
+tapa.Position = UDim2.new(0, 0, 1, -14)
+tapa.BackgroundColor3 = COL_BARRA
+tapa.BorderSizePixel = 0
+tapa.Parent = barra
 
-local minBtn = Instance.new("TextButton")
-minBtn.Size = UDim2.new(0, 40, 0, 30)
-minBtn.Position = UDim2.new(1, -90, 0, 5)
-minBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
-minBtn.Text = "▁"
-minBtn.TextColor3 = Color3.fromRGB(230, 230, 230)
-minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 18
-minBtn.BorderSizePixel = 0
-minBtn.Parent = header
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
+local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
+titulo.Size = UDim2.new(1, -80, 1, 0)
+titulo.Position = UDim2.fromOffset(14, 0)
 
-local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 40, 0, 30)
-closeBtn.Position = UDim2.new(1, -46, 0, 5)
-closeBtn.BackgroundColor3 = Color3.fromRGB(70, 34, 34)
-closeBtn.Text = "✕"
-closeBtn.TextColor3 = Color3.fromRGB(255, 200, 200)
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 16
-closeBtn.BorderSizePixel = 0
-closeBtn.Parent = header
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
-
--- DRAG táctil
-do
-    local dragging, dragStart, startPos
-    header.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-        or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging, dragStart, startPos = true, input.Position, panel.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-    UIS.InputChanged:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType == Enum.UserInputType.Touch
-        or input.UserInputType == Enum.UserInputType.MouseMovement then
-            local d = input.Position - dragStart
-            panel.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end
-    end)
+local function crearBotonBarra(texto, posX)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(26, 26)
+	b.Position = UDim2.new(1, posX, 0.5, -13)
+	b.BackgroundColor3 = COL_FONDO
+	b.Text = texto
+	b.TextColor3 = COL_TEXTO
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 16
+	b.Parent = barra
+	redondear(b, 8)
+	return b
 end
 
--- LOG
-local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, -16, 1, -40 - 96)
-scroll.Position = UDim2.new(0, 8, 0, 44)
-scroll.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 4
-scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-scroll.Parent = panel
-Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 8)
+local btnCerrar = crearBotonBarra("✕", -34)
+local btnMin = crearBotonBarra("–", -66)
+btnCerrar.MouseEnter:Connect(function() btnCerrar.BackgroundColor3 = COL_ROJO end)
+btnCerrar.MouseLeave:Connect(function() btnCerrar.BackgroundColor3 = COL_FONDO end)
 
-local list = Instance.new("UIListLayout")
-list.Padding = UDim.new(0, 2)
-list.Parent = scroll
+-- Burbujita (UI minimizada)
+local burbuja = Instance.new("TextButton")
+burbuja.Name = "Burbuja"
+burbuja.Size = UDim2.fromOffset(52, 52)
+burbuja.Position = panel.Position
+burbuja.BackgroundColor3 = COL_ACENTO
+burbuja.BackgroundTransparency = 0.15
+burbuja.Text = "🫧"
+burbuja.TextSize = 26
+burbuja.AutoButtonColor = false
+burbuja.Visible = false
+burbuja.Parent = gui
+redondear(burbuja, 26)
+borde(burbuja, Color3.new(1, 1, 1), 2, 0.4)
 
-local pad = Instance.new("UIPadding")
-pad.PaddingTop = UDim.new(0, 6)
-pad.PaddingLeft = UDim.new(0, 8)
-pad.PaddingRight = UDim.new(0, 8)
-pad.PaddingBottom = UDim.new(0, 6)
-pad.Parent = scroll
+-- Fila 1: interruptor principal
+local lblEstado = crearTexto(panel, "Estado: apagado", 14, COL_SUB)
+lblEstado.Size = UDim2.new(1, -90, 0, 26)
+lblEstado.Position = UDim2.fromOffset(14, 50)
 
-local function makeLine(text, color)
-    local l = Instance.new("TextLabel")
-    l.BackgroundTransparency = 1
-    l.Size = UDim2.new(1, 0, 0, 0)
-    l.AutomaticSize = Enum.AutomaticSize.Y
-    l.Font = Enum.Font.Code
-    l.TextSize = 12
-    l.TextColor3 = color or Color3.fromRGB(200, 220, 255)
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.TextYAlignment = Enum.TextYAlignment.Top
-    l.TextWrapped = true
-    l.Text = text
-    l.Parent = scroll
-    return l
-end
-
--- BARRA DE BOTONES (2 filas x 2 columnas + fila simple)
-local bar = Instance.new("Frame")
-bar.Size = UDim2.new(1, 0, 0, 96)
-bar.Position = UDim2.new(0, 0, 1, -100)
-bar.BackgroundTransparency = 1
-bar.Parent = panel
-
-local grid = Instance.new("UIGridLayout")
-grid.CellSize = UDim2.new(0.5, -8, 0, 40)
-grid.CellPadding = UDim2.new(0, 6, 0, 6)
-grid.Parent = bar
-
-local padBar = Instance.new("UIPadding")
-padBar.PaddingLeft = UDim.new(0, 8)
-padBar.PaddingRight = UDim.new(0, 8)
-padBar.PaddingTop = UDim.new(0, 4)
-padBar.PaddingBottom = UDim.new(0, 4)
-padBar.Parent = bar
-
-local function makeBtn(text, color)
-    local b = Instance.new("TextButton")
-    b.BackgroundColor3 = color or Color3.fromRGB(40, 40, 50)
-    b.Text = text
-    b.TextColor3 = Color3.fromRGB(235, 235, 245)
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 13
-    b.BorderSizePixel = 0
-    b.Parent = bar
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
-    return b
-end
-
-local btnEnter    = makeBtn("🚪 Enter Portal", Color3.fromRGB(60, 45, 80))
-local btnAutoPort = makeBtn("⚡ AutoPortal OFF", Color3.fromRGB(45, 45, 55))
-local btnProbe    = makeBtn("📡 Rift Probe",  Color3.fromRGB(50, 40, 70))
-local btnInfo     = makeBtn("ℹ Estado Rift",  Color3.fromRGB(40, 55, 70))
-local btnSave     = makeBtn("💾 Guardar",     Color3.fromRGB(30, 70, 45))
-local btnClear    = makeBtn("🧹 Limpiar")
-
--- ============ LOG ============
-local function pushLog(text, color)
-    if not State.capturing and color ~= Color3.fromRGB(255, 180, 60) then return end
-    local line = string.format("[%s] %s", ts(), text)
-    table.insert(State.log, { t = line })
-    if #State.log > MAX_LINES then
-        table.remove(State.log, 1)
-        local f = scroll:FindFirstChildOfClass("TextLabel")
-        if f then f:Destroy() end
-    end
-    makeLine(line, color)
-    task.defer(function()
-        scroll.CanvasPosition = Vector2.new(0, scroll.AbsoluteCanvasSize.Y)
-    end)
-end
-
--- ============ HOOKS ============
-local function hookRemote(remote, label, isFunc)
-    if not remote or State.hooks[remote] then return false end
-    State.hooks[remote] = true
-    if isFunc then
-        local old = remote.InvokeServer
-        remote.InvokeServer = function(self, ...)
-            local args = {...}
-            local p = {}
-            for i = 1, #args do p[i] = fmtVal(args[i]) end
-            pushLog(("[%s] INVOKE -> %s"):format(label, table.concat(p, " | ")),
-                Color3.fromRGB(120, 200, 255))
-            local ok, res = pcall(old, self, ...)
-            if ok then
-                if type(res) == "table" then
-                    local parts, n = {}, 0
-                    for k, v in pairs(res) do
-                        n = n + 1
-                        parts[#parts+1] = tostring(k).."="..fmtVal(v)
-                        if n > 8 then parts[#parts+1] = "..."; break end
-                    end
-                    pushLog(("[%s] <- {%s}"):format(label, table.concat(parts, ", ")),
-                        Color3.fromRGB(120, 255, 180))
-                else
-                    pushLog(("[%s] <- %s"):format(label, fmtVal(res)),
-                        Color3.fromRGB(120, 255, 180))
-                end
-                return res
-            end
-            pushLog(("[%s] ERR %s"):format(label, tostring(res)), Color3.fromRGB(255, 120, 120))
-        end
-    else
-        local old = remote.FireServer
-        remote.FireServer = function(self, ...)
-            local args = {...}
-            local p = {}
-            for i = 1, #args do p[i] = fmtVal(args[i]) end
-            pushLog(("[%s] FIRE -> %s"):format(label, table.concat(p, " | ")),
-                Color3.fromRGB(255, 220, 120))
-            return old(self, ...)
-        end
-    end
-    return true
-end
-
--- ============ ACCIONES ============
-local function actEnter()
-    GameEvent:FireServer("EnterPortal")
-    pushLog("🚪 EnterPortal enviado", Color3.fromRGB(180, 255, 180))
-end
-
-local function actAutoPortal()
-    State.autoPortal = not State.autoPortal
-    if State.autoPortal then
-        btnAutoPort.Text = "⚡ AutoPortal ON"
-        btnAutoPort.BackgroundColor3 = Color3.fromRGB(70, 60, 90)
-        pushLog("AutoPortal ON (esperando PortalOpen)", Color3.fromRGB(180, 200, 255))
-        task.spawn(function()
-            while State.autoPortal and gui.Parent do
-                task.wait(0.5)
-                local map = workspace:FindFirstChild("Map")
-                local portal = map and map:FindFirstChild("BossPortal")
-                if portal and portal:GetAttribute("PortalOpen") == true then
-                    pcall(function() GameEvent:FireServer("EnterPortal") end)
-                    pushLog("⚡ Portal abierto -> EnterPortal", Color3.fromRGB(180, 255, 180))
-                    State.autoPortal = false
-                    btnAutoPort.Text = "⚡ AutoPortal OFF"
-                    btnAutoPort.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-                    break
-                end
-            end
-        end)
-    else
-        btnAutoPort.Text = "⚡ AutoPortal OFF"
-        btnAutoPort.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-        pushLog("AutoPortal OFF", Color3.fromRGB(180, 200, 255))
-    end
-end
-
-local function actProbe()
-    pushLog("📡 Probing RiftFunc...", Color3.fromRGB(180, 200, 255))
-    local names = {
-        "GetState","GetData","GetRiftData","GetInfo","Get",
-        "FetchData","RequestState","QueryState","Sync","Status",
-    }
-    task.spawn(function()
-        for _, name in ipairs(names) do
-            local ok, res = pcall(function() return RiftFunc:InvokeServer(name) end)
-            if ok then
-                pushLog(("  ✓ %s -> %s %s"):format(name, typeof(res), tostring(res):sub(1, 80)),
-                    Color3.fromRGB(120, 255, 180))
-            else
-                pushLog(("  ✗ %s -> %s"):format(name, tostring(res):sub(1, 60)),
-                    Color3.fromRGB(255, 150, 150))
-            end
-            task.wait(0.2)
-        end
-        pushLog("📡 Probe terminado", Color3.fromRGB(180, 200, 255))
-    end)
-end
-
-local function actInfo()
-    pushLog("ℹ Estado actual", Color3.fromRGB(180, 200, 255))
-    local map = workspace:FindFirstChild("Map")
-    local portal = map and map:FindFirstChild("BossPortal")
-    if portal then
-        for k, v in pairs(portal:GetAttributes()) do
-            pushLog(("  BossPortal.%s = %s"):format(k, tostring(v)),
-                Color3.fromRGB(200, 230, 255))
-        end
-    else
-        pushLog("  BossPortal no visible (streaming)", Color3.fromRGB(255, 200, 150))
-    end
-end
-
--- ============ GUARDAR ============
-local function buildText()
-    local o = {}
-    o[#o+1] = "=== RIFT CORE CAPTURE ==="
-    o[#o+1] = "PlaceId: "..tostring(game.PlaceId)
-    o[#o+1] = "JobId:   "..tostring(game.JobId)
-    o[#o+1] = "Inicio:  "..os.date("%Y-%m-%d %H:%M:%S", State.startedAt)
-    o[#o+1] = "Fin:     "..os.date("%Y-%m-%d %H:%M:%S")
-    o[#o+1] = "Lineas:  "..tostring(#State.log)
-    o[#o+1] = ""
-    for _, l in ipairs(State.log) do o[#o+1] = l.t end
-    return table.concat(o, "\n")
-end
-
-local function saveToDisk()
-    local content = buildText()
-    local fname = string.format(FILE_NAME, os.date("%Y%m%d_%H%M%S"))
-    local saved, errors = nil, {}
-    for _, folder in ipairs(SAVE_FOLDERS) do
-        local path = folder.."/"..fname
-        local ok, err = pcall(function()
-            if makefolder then pcall(makefolder, folder) end
-            writefile(path, content)
-        end)
-        if ok then saved = path break
-        else errors[#errors+1] = folder.." -> "..tostring(err) end
-    end
-    if saved then
-        pushLog("💾 "..saved, Color3.fromRGB(120, 255, 180))
-    else
-        pushLog("❌ No se pudo guardar", Color3.fromRGB(255, 120, 120))
-        for _, e in ipairs(errors) do pushLog("   "..e, Color3.fromRGB(255, 150, 150)) end
-    end
-end
-
--- ============ EVENTOS UI ============
-btnEnter.MouseButton1Click:Connect(actEnter)
-btnAutoPort.MouseButton1Click:Connect(actAutoPortal)
-btnProbe.MouseButton1Click:Connect(actProbe)
-btnInfo.MouseButton1Click:Connect(actInfo)
-btnSave.MouseButton1Click:Connect(saveToDisk)
-btnClear.MouseButton1Click:Connect(function()
-    State.log = {}
-    for _, c in ipairs(scroll:GetChildren()) do
-        if c:IsA("TextLabel") then c:Destroy() end
-    end
-    pushLog("🧹 limpio", Color3.fromRGB(255, 220, 120))
+local setPrincipal
+setPrincipal = crearSwitch(panel, UDim2.new(1, -64, 0, 50), function(valor)
+	activo = valor
+	if not activo then
+		enDestino = false
+		quitarPlataforma()
+	end
+	lblEstado.Text = activo and "Estado: activo" or "Estado: apagado"
+	lblEstado.TextColor3 = activo and COL_ON or COL_SUB
+	burbuja.BackgroundColor3 = activo and COL_ON or COL_ACENTO
 end)
 
-local minimized = false
-minBtn.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    panel.Size = minimized and UDim2.new(W, 0, 0, 40) or UDim2.new(W, 0, H, 0)
-    scroll.Visible = not minimized
-    bar.Visible = not minimized
+-- Fila 2: velocidad de recolección
+crearSlider(panel, 88, {
+	min = VEL_MIN, max = VEL_MAX, paso = 1, inicial = velocidad,
+	textoMin = "Lento", textoMax = "Rápido",
+	formato = function(v) return string.format("Velocidad: %d burb/s  (%.2fs)", v, 1 / v) end,
+	alCambiar = function(v) velocidad = v end,
+})
+
+-- Separador
+local sep = Instance.new("Frame")
+sep.Size = UDim2.new(1, -28, 0, 1)
+sep.Position = UDim2.fromOffset(14, 152)
+sep.BackgroundColor3 = COL_BARRA
+sep.BorderSizePixel = 0
+sep.Parent = panel
+
+-- Fila 3: girar en el aire
+local lblGirar = crearTexto(panel, "Girar en el aire", 14, COL_TEXTO)
+lblGirar.Size = UDim2.new(1, -90, 0, 26)
+lblGirar.Position = UDim2.fromOffset(14, 162)
+
+local sliderGiro
+crearSwitch(panel, UDim2.new(1, -64, 0, 162), function(valor)
+	girar = valor
+	sliderGiro.GroupTransparency = girar and 0 or 0.55
 end)
-closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
 
--- ============ ARRANQUE ============
-pushLog("=== RIFT CORE ===", Color3.fromRGB(120, 200, 255))
-pushLog("PlaceId "..tostring(game.PlaceId), Color3.fromRGB(150, 200, 255))
+-- Fila 4: velocidad de giro
+sliderGiro = crearSlider(panel, 200, {
+	min = GIRO_MIN, max = GIRO_MAX, paso = 10, inicial = velGiro,
+	textoMin = "Suave", textoMax = "Turbo",
+	formato = function(v) return string.format("Giro: %d°/s  (%.1f vueltas/s)", v, v / 360) end,
+	alCambiar = function(v) velGiro = v end,
+})
+sliderGiro.GroupTransparency = 0.55
 
-hookRemote(RiftEvent, "RiftEvent", false)
-hookRemote(RiftFunc,  "RiftFunc",  true)
-hookRemote(GameEvent, "GameEvent", false)
-pushLog("Hooks: RiftEvent / RiftFunc / GameEvent", Color3.fromRGB(120, 255, 180))
-pushLog("Listo. 🚪 para entrar, ⚡ para automático.", Color3.fromRGB(120, 255, 180))
+-- Contador
+local lblContador = crearTexto(panel, "Recogidas: 0", 13, COL_SUB)
+lblContador.Size = UDim2.new(1, -28, 0, 20)
+lblContador.Position = UDim2.fromOffset(14, 262)
+
+---------------------------------------------------------------------
+-- Minimizar / cerrar
+---------------------------------------------------------------------
+local function minimizar()
+	burbuja.Position = panel.Position
+	panel.Visible = false
+	burbuja.Visible = true
+end
+
+local function restaurar()
+	panel.Position = burbuja.Position
+	burbuja.Visible = false
+	panel.Visible = true
+end
+
+local function cerrar()
+	vivo = false
+	activo = false
+	enDestino = false
+	quitarPlataforma()
+	for _, c in ipairs(conexiones) do
+		c:Disconnect()
+	end
+	table.clear(conexiones)
+	gui:Destroy()
+end
+
+btnMin.MouseButton1Click:Connect(minimizar)
+btnCerrar.MouseButton1Click:Connect(cerrar)
+hacerArrastrable(barra, panel)
+hacerArrastrable(burbuja, burbuja, restaurar)
+
+---------------------------------------------------------------------
+-- Giro en el aire (solo mientras está en el destino)
+---------------------------------------------------------------------
+conectar(RunService.Heartbeat, function(dt)
+	if not (activo and girar and enDestino) then return end
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root then
+		root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(velGiro) * dt, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+end)
+
+---------------------------------------------------------------------
+-- Lógica principal
+---------------------------------------------------------------------
+local function recogerBurbujas()
+	local folder = Workspace:FindFirstChild("EnvironmentOxygenBubbles", true)
+	if not folder then return end
+
+	local root = getRoot()
+	if not root then return end
+
+	local recogio = false
+
+	for _, bubble in ipairs(folder:GetChildren()) do
+		if not activo then break end
+		if not bubble.Parent then continue end
+
+		local pos = getPosition(bubble)
+		if pos and (root.Position - pos).Magnitude <= RADIO then
+			enDestino = false -- deja de girar mientras recoge
+			root.CFrame = CFrame.new(pos)
+			recogio = true
+			recogidas += 1
+			lblContador.Text = "Recogidas: " .. recogidas
+			task.wait(1 / velocidad)
+		end
+	end
+
+	if activo and recogio and root.Parent then
+		crearPlataforma()
+		root.CFrame = CFrame.new(DESTINO)
+		root.AssemblyLinearVelocity = Vector3.zero
+		enDestino = true
+	end
+end
+
+task.spawn(function()
+	while vivo do
+		task.wait(INTERVALO)
+		if vivo and activo then
+			local ok, err = pcall(recogerBurbujas)
+			if not ok then
+				warn("[ERROR]", err)
+			end
+		end
+	end
+end)
