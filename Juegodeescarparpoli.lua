@@ -10,7 +10,8 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- Configuración
 ---------------------------------------------------------------------
 local RADIO = 500000
-local INTERVALO = 1
+local INTERVALO = 1     -- segundos entre ciclos de recolección
+local INTERVALO_TP = 1  -- segundos entre cada TP aleatorio
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5
 
@@ -25,6 +26,7 @@ local velocidad = 7
 local activo = false
 local tpAleatorio = false
 local cerrado = false
+local ocupado = false   -- true mientras la recolección está en curso
 local recogidas = 0
 local plataforma = nil
 local visitados = {}   -- ubicaciones a las que ya se teletransportó
@@ -246,7 +248,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "🫧  Auto Burbujas V1", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -80, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -291,7 +293,7 @@ lblEstado.Position = UDim2.fromOffset(14, 50)
 
 crearSwitch(panel, UDim2.new(1, -64, 0, 50), COL_ON, function(valor)
 	activo = valor
-	if not activo then
+	if not activo and not tpAleatorio then
 		quitarPlataforma()
 	end
 	lblEstado.Text = activo and "Estado: activo" or "Estado: apagado"
@@ -307,6 +309,9 @@ lblRandom.Position = UDim2.fromOffset(14, 88)
 crearSwitch(panel, UDim2.new(1, -64, 0, 88), COL_ACENTO, function(valor)
 	tpAleatorio = valor
 	visitados = {} -- historial limpio al activar o desactivar
+	if not valor and not activo then
+		quitarPlataforma()
+	end
 	lblRandom.Text = valor and "TP aleatorio: ON" or "TP aleatorio: OFF"
 	lblRandom.TextColor3 = valor and COL_ACENTO or COL_SUB
 end)
@@ -409,6 +414,7 @@ end
 local function cerrar()
 	cerrado = true
 	activo = false
+	tpAleatorio = false
 	quitarPlataforma()
 	for _, c in ipairs(conexiones) do
 		c:Disconnect()
@@ -456,28 +462,45 @@ local function recogerBurbujas()
 		if not root then return end
 	end
 
-	if activo and root.Parent then
-		if tpAleatorio then
-			-- en vez de quedarse quieto, salta a una ubicación nueva cada ciclo
-			local destino = posicionAleatoria()
-			crearPlataforma(destino)
-			root.CFrame = CFrame.new(destino)
-			root.AssemblyLinearVelocity = Vector3.zero
-		elseif recogio then
-			crearPlataforma(DESTINO)
-			root.CFrame = CFrame.new(DESTINO)
-			root.AssemblyLinearVelocity = Vector3.zero
-		end
+	-- Sin TP aleatorio: se queda quieto en el destino.
+	-- Con TP aleatorio activo, el otro bucle se encarga de moverlo.
+	if activo and recogio and not tpAleatorio and root.Parent then
+		crearPlataforma(DESTINO)
+		root.CFrame = CFrame.new(DESTINO)
+		root.AssemblyLinearVelocity = Vector3.zero
 	end
 end
 
+-- Bucle 1: auto burbujas (independiente)
 task.spawn(function()
 	while not cerrado do
 		task.wait(INTERVALO)
 		if not cerrado and activo then
+			ocupado = true
 			local ok, err = pcall(recogerBurbujas)
+			ocupado = false
 			if not ok then
-				warn("[ERROR]", err)
+				warn("[ERROR burbujas]", err)
+			end
+		end
+	end
+end)
+
+-- Bucle 2: TP aleatorio (independiente, funciona aunque el principal esté apagado)
+task.spawn(function()
+	while not cerrado do
+		task.wait(INTERVALO_TP)
+		if not cerrado and tpAleatorio and not ocupado then
+			local ok, err = pcall(function()
+				local root = getRoot()
+				if not root or not root.Parent then return end
+				local destino = posicionAleatoria()
+				crearPlataforma(destino)
+				root.CFrame = CFrame.new(destino)
+				root.AssemblyLinearVelocity = Vector3.zero
+			end)
+			if not ok then
+				warn("[ERROR tp aleatorio]", err)
 			end
 		end
 	end
