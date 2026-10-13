@@ -39,7 +39,7 @@ local CANDIDATOS = 60
 local PAUSA_CADA = 15                -- cada N burbujas, pausa larga
 local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
 local BURBUJAS_POR_CICLO = 3          -- no arrasar todas en un tick
-local DIST_MIN_TP = 8                -- distancia mínima a la burbuja (no te pegues)
+local DIST_MIN_TP = 1                 -- distancia mínima a la burbuja (no te pegues)
 local OFFSET_TP = Vector3.new(0, 3, 0) -- TP a la altura de la cabeza, no al pivote
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano
 
