@@ -10,6 +10,7 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -24,7 +25,7 @@ local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1, 4        -- burbujas por segundo
+local VEL_MIN, VEL_MAX = 1, 15       -- burbujas por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
 local RADIO_TP = 120                 -- radio de TP aleatorio
@@ -34,10 +35,12 @@ local CANDIDATOS = 60
 local PAUSA_CADA = 15                -- cada N burbujas, pausa larga
 local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
 local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
-local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano
+local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano (no aplica en modo rápido)
+local BURBUJA_ENFRIAMIENTO = 2       -- segundos antes de volver a visitar la misma burbuja
+local FANTASMA_TRANSP = 0.6          -- transparencia del cuerpo fantasma
 
 -- Estado
-local velocidad = 3
+local velocidad = 6
 local umbralOxigeno = 50
 local controlOxigeno = true
 local recolectando = false
@@ -52,6 +55,9 @@ local conexiones = {}
 local actualizarInfo
 local pausaHasta = 0
 local lastInputTime = tick()
+local fantasma = false
+local origenPartes = {}   -- [parte] = { col = CanCollide, tr = Transparency }
+local visitaBurbuja = setmetatable({}, { __mode = "k" })
 
 -- Paleta
 local COL_FONDO   = Color3.fromRGB(24, 26, 36)
@@ -151,6 +157,42 @@ local function estadoSeguro()
     if hum.Health <= 0 then return false end
     return not ESTADOS_BLOQUEADOS[hum:GetState()]
 end
+
+-- Cuerpo fantasma: semitransparente y sin colisiones (atraviesa paredes).
+-- Se reaplica cada frame porque el juego puede restablecer CanCollide.
+local function aplicarFantasma(char)
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") then
+            if not origenPartes[d] then
+                origenPartes[d] = { col = d.CanCollide, tr = d.Transparency }
+                if d.Name ~= "HumanoidRootPart" then
+                    d.Transparency = FANTASMA_TRANSP
+                end
+            end
+            if d.CanCollide then d.CanCollide = false end
+        end
+    end
+end
+
+local function quitarFantasma()
+    for parte, o in pairs(origenPartes) do
+        if parte.Parent then
+            parte.CanCollide = o.col
+            parte.Transparency = o.tr
+        end
+    end
+    table.clear(origenPartes)
+end
+
+conectar(RunService.Stepped, function()
+    if not fantasma then return end
+    local char = LocalPlayer.Character
+    if char then aplicarFantasma(char) end
+end)
+
+conectar(LocalPlayer.CharacterAdded, function()
+    table.clear(origenPartes)
+end)
 
 local function crearPlataforma(posicion)
     if not plataforma or not plataforma.Parent then
@@ -423,8 +465,8 @@ gui.Parent = PlayerGui
 
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
-panel.Size = UDim2.fromOffset(260, 340)
-panel.Position = UDim2.new(0, 20, 0.5, -170)
+panel.Size = UDim2.fromOffset(260, 374)
+panel.Position = UDim2.new(0, 20, 0.5, -187)
 panel.BackgroundColor3 = COL_FONDO
 panel.BorderSizePixel = 0
 panel.Parent = gui
@@ -445,7 +487,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "MAYKEL CREADOR", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -80, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -511,11 +553,17 @@ crearFilaSwitch(panel, 116, "Según oxígeno: ON", COL_ON, true, function(valor,
     if actualizarInfo then actualizarInfo() end
 end)
 
+crearFilaSwitch(panel, 150, "Cuerpo fantasma: OFF", COL_ACENTO, false, function(valor, lbl)
+    fantasma = valor
+    if not valor then quitarFantasma() end
+    lbl.Text = valor and "Cuerpo fantasma: ON" or "Cuerpo fantasma: OFF"
+end)
+
 local lblOxigeno = crearTexto(panel, "Oxígeno: …", 13, COL_SUB)
 lblOxigeno.Size = UDim2.new(1, -28, 0, 18)
-lblOxigeno.Position = UDim2.fromOffset(14, 148)
+lblOxigeno.Position = UDim2.fromOffset(14, 182)
 
-sliderUmbral = crearSlider(panel, 172, {
+sliderUmbral = crearSlider(panel, 206, {
     min = UMBRAL_MIN, max = UMBRAL_MAX, paso = 5, inicial = umbralOxigeno,
     textoMin = "5%", textoMax = "95%",
     formato = function(v) return string.format("Recolectar si oxígeno ≤ %d%%", v) end,
@@ -526,7 +574,7 @@ sliderUmbral = crearSlider(panel, 172, {
     end,
 })
 
-crearSlider(panel, 228, {
+crearSlider(panel, 262, {
     min = VEL_MIN, max = VEL_MAX, paso = 1, inicial = velocidad,
     textoMin = "Lento", textoMax = "Rápido",
     formato = function(v) return string.format("Velocidad: %d burb/s  (%.2fs)", v, 1 / v) end,
@@ -535,11 +583,11 @@ crearSlider(panel, 228, {
 
 local lblContador = crearTexto(panel, "Recogidas: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 290)
+lblContador.Position = UDim2.fromOffset(14, 324)
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 11, COL_SUB)
 lblEstado.Size = UDim2.new(1, -28, 0, 16)
-lblEstado.Position = UDim2.fromOffset(14, 312)
+lblEstado.Position = UDim2.fromOffset(14, 346)
 
 actualizarInfo = function()
     local ox, mx = leerOxigeno()
@@ -580,6 +628,8 @@ local function cerrar()
     cerrado = true
     activo = false
     tpAleatorio = false
+    fantasma = false
+    quitarFantasma()
     quitarPlataforma()
     for _, c in ipairs(conexiones) do c:Disconnect() end
     table.clear(conexiones)
@@ -594,6 +644,12 @@ hacerArrastrable(burbuja, burbuja, restaurar)
 ---------------------------------------------------------------------
 -- Lógica principal
 ---------------------------------------------------------------------
+-- Modo rápido: el oxígeno está bajo el umbral y hay que llenar cuanto antes.
+-- Sin tope por ciclo, sin pausas largas y sin esperar entre ciclos.
+local function esRapido()
+    return controlOxigeno and recolectando
+end
+
 local function recogerBurbujas()
     if not debeRecolectar() then return end
     if tick() < pausaHasta then return end
@@ -602,7 +658,8 @@ local function recogerBurbujas()
     if not root or not root.Parent then return end
     if not estadoSeguro() then return end
 
-    if DETECTAR_INPUT and (tick() - lastInputTime) < 0.8 then
+    -- fuera del modo rápido, pausa si el jugador se mueve a mano
+    if not esRapido() and DETECTAR_INPUT and (tick() - lastInputTime) < 0.8 then
         return
     end
 
@@ -613,37 +670,58 @@ local function recogerBurbujas()
     end
 
     local hechas = 0
-    for _, bubble in ipairs(folder:GetChildren()) do
-        if not activo then break end
-        if not debeRecolectar() then break end
-        if tick() < pausaHasta then break end
-        if hechas >= BURBUJAS_POR_CICLO then break end
-        if not bubble.Parent then continue end
+    local pasadas = 0
 
-        local pos = getPosition(bubble)
-        if not pos then continue end
+    repeat
+        pasadas = pasadas + 1
+        local enPasada = 0
+        local rapido = esRapido()
+        local limite = rapido and math.huge or BURBUJAS_POR_CICLO
 
-        if (root.Position - pos).Magnitude <= RADIO then
-            -- TP exacto a la burbuja para que se recoja
-            if teleportarA(root, pos) then
-                recogidas = recogidas + 1
-                hechas = hechas + 1
-                lblContador.Text = "Recogidas: " .. recogidas
+        for _, bubble in ipairs(folder:GetChildren()) do
+            if not activo then break end
+            if not debeRecolectar() then break end
+            if tick() < pausaHasta then break end
+            if hechas >= limite then break end
+            if not bubble.Parent then continue end
 
-                local base = 1 / velocidad
-                task.wait(humanDelay(base, base * 0.4))
+            -- evita volver a la misma burbuja mientras reaparece
+            local ultima = visitaBurbuja[bubble]
+            if ultima and (tick() - ultima) < BURBUJA_ENFRIAMIENTO then continue end
 
-                if recogidas % PAUSA_CADA == 0 then
-                    local p = math.random() * (PAUSA_MAX - PAUSA_MIN) + PAUSA_MIN
-                    pausaHasta = tick() + p
-                    if actualizarInfo then actualizarInfo() end
-                    task.wait(p)
+            local pos = getPosition(bubble)
+            if not pos then continue end
+
+            root = getRoot()
+            if not root or not root.Parent then break end
+
+            if (root.Position - pos).Magnitude <= RADIO then
+                if teleportarA(root, pos) then
+                    visitaBurbuja[bubble] = tick()
+                    recogidas = recogidas + 1
+                    hechas = hechas + 1
+                    enPasada = enPasada + 1
+                    lblContador.Text = "Recogidas: " .. recogidas
+
+                    local base = 1 / velocidad
+                    if rapido then
+                        task.wait(humanDelay(base, base * 0.15))
+                    else
+                        task.wait(humanDelay(base, base * 0.4))
+                        if recogidas % PAUSA_CADA == 0 then
+                            local p = math.random() * (PAUSA_MAX - PAUSA_MIN) + PAUSA_MIN
+                            pausaHasta = tick() + p
+                            if actualizarInfo then actualizarInfo() end
+                            task.wait(p)
+                        end
+                    end
+                else
+                    task.wait(0.1)
                 end
-            else
-                task.wait(0.1)
             end
         end
-    end
+    -- en modo rápido repite pasadas mientras siga habiendo burbujas y falte oxígeno
+    until not (esRapido() and activo and enPasada > 0 and pasadas < 30)
 
     -- Sin TP aleatorio: vuelve al destino y se queda encima de la plataforma.
     -- Con TP aleatorio activo, el otro bucle se encarga de moverlo.
@@ -656,7 +734,12 @@ end
 -- Bucle 1: auto burbujas
 task.spawn(function()
     while not cerrado do
-        task.wait(humanDelay(INTERVALO, INTERVALO_JITTER))
+        if controlOxigeno then
+            -- revisa el oxígeno seguido para reaccionar casi al instante
+            task.wait(0.3 + math.random() * 0.2)
+        else
+            task.wait(humanDelay(INTERVALO, INTERVALO_JITTER))
+        end
         if not cerrado and activo and tick() >= pausaHasta then
             ocupado = true
             local ok, err = pcall(recogerBurbujas)
