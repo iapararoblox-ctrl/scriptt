@@ -8,7 +8,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 ---------------------------------------------------------------------
--- Configuración
+-- Configuraciónn
 ---------------------------------------------------------------------
 local RADIO = 500000
 local INTERVALO = 1
