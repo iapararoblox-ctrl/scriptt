@@ -1,16 +1,13 @@
 --[[  AUTO BURBUJAS
-  Corrección de TP: ahora el personaje aterriza SIEMPRE encima de la plataforma.
-    - TP exacto (antes solo viajaba el 60% del camino y con +3 de altura)
-    - La plataforma solo se mueve si el TP se realiza (antes se movía aunque fallara el TP)
-    - Estados bloqueados en lista negra (antes Swimming/Freefall bloqueaban todo)
-    - Se anula solo la velocidad vertical al aterrizar para no atravesar la plataforma
+    - Auto recolección de burbujas según el nivel de oxígeno
+    - TP aleatorio sin repetir ubicaciones
+    - Evadir mobs: si un enemigo se acerca, hace TP a una zona lejos de él
 --]]
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -18,7 +15,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 ---------------------------------------------------------------------
 -- Configuración
 ---------------------------------------------------------------------
-local RADIO = 100000                 -- radio de recolección (250 dejaba fuera las burbujas lejanas)
+local RADIO = 100000                 -- radio de recolección
 local INTERVALO = 1.5                -- segundos base entre ciclos
 local INTERVALO_JITTER = 0.6         -- ±variación aleatoria
 local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
@@ -38,7 +35,13 @@ local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano (no aplica en modo rápido)
 local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
 local MIN_PERMANENCIA = 0.25         -- segundos mínimos sobre la burbuja (para que registre el toque)
-local FANTASMA_TRANSP = 0.6          -- transparencia del cuerpo fantasma
+
+-- Evadir mobs
+local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
+local DISTANCIA_SEGURA = 25          -- si un mob está más cerca que esto, hace TP lejos
+local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
+local INTERVALO_EVASION = 0.1        -- cada cuánto revisa los mobs
+local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
 
 -- Estado
 local velocidad = 6
@@ -56,8 +59,9 @@ local conexiones = {}
 local actualizarInfo
 local pausaHasta = 0
 local lastInputTime = tick()
-local fantasma = false
-local origenPartes = {}   -- [parte] = { col = CanCollide, tr = Transparency }
+local evadirMobs = false
+local evasiones = 0
+local ultimaEvasion = 0
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
 local dbg = { total = 0, rango = 0, tpOk = 0, tpFail = 0, motivo = "—" }
 
@@ -136,14 +140,6 @@ local function getHumanoid()
     return char and char:FindFirstChildOfClass("Humanoid")
 end
 
-local function getPosition(obj)
-    if obj:IsA("Model") then
-        return obj:GetPivot().Position
-    elseif obj:IsA("BasePart") then
-        return obj.Position
-    end
-end
-
 -- Posición de la burbuja: usa su parte física (PrimaryPart o la primera BasePart);
 -- el pivote del modelo puede quedar desplazado respecto a donde se detecta el toque.
 local function posBurbuja(obj)
@@ -157,8 +153,6 @@ local function posBurbuja(obj)
 end
 
 -- Lista NEGRA: solo se bloquea cuando el personaje no está en condiciones.
--- (Antes era una lista blanca sin Swimming/Freefall/Jumping, y en un juego de
--- agua o tras caerse de la plataforma el script quedaba bloqueado para siempre.)
 local ESTADOS_BLOQUEADOS = {
     [Enum.HumanoidStateType.Dead] = true,
     [Enum.HumanoidStateType.Ragdoll] = true,
@@ -172,42 +166,7 @@ local function estadoSeguro()
     return not ESTADOS_BLOQUEADOS[hum:GetState()]
 end
 
--- Cuerpo fantasma: semitransparente y sin colisiones (atraviesa paredes).
--- Se reaplica cada frame porque el juego puede restablecer CanCollide.
-local function aplicarFantasma(char)
-    for _, d in ipairs(char:GetDescendants()) do
-        if d:IsA("BasePart") then
-            if not origenPartes[d] then
-                origenPartes[d] = { col = d.CanCollide, tr = d.Transparency }
-                if d.Name ~= "HumanoidRootPart" then
-                    d.Transparency = FANTASMA_TRANSP
-                end
-            end
-            if d.CanCollide then d.CanCollide = false end
-        end
-    end
-end
-
-local function quitarFantasma()
-    for parte, o in pairs(origenPartes) do
-        if parte.Parent then
-            parte.CanCollide = o.col
-            parte.Transparency = o.tr
-        end
-    end
-    table.clear(origenPartes)
-end
-
-conectar(RunService.Stepped, function()
-    if not fantasma then return end
-    local char = LocalPlayer.Character
-    if char then aplicarFantasma(char) end
-end)
-
-conectar(LocalPlayer.CharacterAdded, function()
-    table.clear(origenPartes)
-end)
-
+-- Plataforma invisible: sostiene al personaje (ya no se ve el "cuerpo fantasma")
 local function crearPlataforma(posicion)
     if not plataforma or not plataforma.Parent then
         plataforma = Instance.new("Part")
@@ -215,9 +174,9 @@ local function crearPlataforma(posicion)
         plataforma.Size = Vector3.new(12, 1, 12)
         plataforma.Anchored = true
         plataforma.CanCollide = true
-        plataforma.Transparency = 0.6
-        plataforma.Material = Enum.Material.Glass
-        plataforma.Color = COL_ACENTO
+        plataforma.CanQuery = false
+        plataforma.CanTouch = false
+        plataforma.Transparency = 1
         plataforma.Parent = Workspace
     end
     plataforma.Position = (posicion or DESTINO) - Vector3.new(0, ALTURA_PLATAFORMA, 0)
@@ -231,7 +190,6 @@ local function quitarPlataforma()
 end
 
 -- TP exacto a una posición (se usa para ir a las burbujas).
--- Conserva la rotación y solo anula la velocidad vertical.
 local function teleportarA(root, destino)
     if not root or not root.Parent then return false end
     if not estadoSeguro() then return false end
@@ -244,18 +202,18 @@ local function teleportarA(root, destino)
     return true
 end
 
--- Coloca la plataforma Y el personaje encima, en el mismo instante (sin yield),
--- para que no haya ni un frame en el aire. La plataforma solo se mueve si el
--- TP se realiza, así nunca queda separada del personaje.
-local function irAPlataforma(root, destino)
+-- Coloca la plataforma Y el personaje encima en el mismo instante (sin yield).
+-- forzar = true ignora el estado del personaje (se usa para huir de mobs).
+local function irAPlataforma(root, destino, forzar)
     if not root or not root.Parent then return false end
-    if not estadoSeguro() then return false end
+    if not forzar and not estadoSeguro() then return false end
 
     crearPlataforma(destino)
 
     local rot = root.CFrame - root.CFrame.Position
     root.CFrame = CFrame.new(destino) * rot
-    root.AssemblyLinearVelocity = Vector3.zero -- evita atravesar la plataforma al caer
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
     return true
 end
 
@@ -286,6 +244,52 @@ local function posicionAleatoria(origen)
     end
     table.insert(visitados, mejor)
     return mejor
+end
+
+---------------------------------------------------------------------
+-- Mobs
+---------------------------------------------------------------------
+-- Posiciones de los enemigos (Workspace.Enemies)
+local function posicionesEnemigos()
+    local lista = {}
+    local carpeta = Workspace:FindFirstChild(CARPETA_ENEMIGOS)
+    if not carpeta then return lista end
+    for _, enemigo in ipairs(carpeta:GetChildren()) do
+        local r = enemigo:FindFirstChild("HumanoidRootPart")
+        if r then
+            local hum = enemigo:FindFirstChildOfClass("Humanoid")
+            if not hum or hum.Health > 0 then
+                table.insert(lista, r.Position)
+            end
+        end
+    end
+    return lista
+end
+
+local function distanciaMinima(punto, enemigos)
+    local minD = math.huge
+    for _, e in ipairs(enemigos) do
+        local d = (e - punto).Magnitude
+        if d < minD then minD = d end
+    end
+    return minD
+end
+
+-- Punto de escape: el más lejano a TODOS los mobs, alrededor del DESTINO.
+-- Si ninguno cumple la distancia mínima, se queda con el mejor encontrado.
+local function posicionSegura(enemigos, origen)
+    local mejor, mejorDist = nil, -1
+    for _ = 1, CANDIDATOS do
+        local ang = math.random() * math.pi * 2
+        local dist = math.sqrt(math.random()) * RADIO_TP
+        local cand = DESTINO + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
+        local minD = distanciaMinima(cand, enemigos)
+        -- desempate: a igual distancia a los mobs, prefiere el punto más cercano al jugador
+        if minD > mejorDist then
+            mejor, mejorDist = cand, minD
+        end
+    end
+    return mejor, mejorDist
 end
 
 ---------------------------------------------------------------------
@@ -501,7 +505,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "MAYKE V1", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -80, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -542,7 +546,7 @@ crearFilaSwitch(panel, 48, "Auto burbujas: OFF", COL_ON, false, function(valor, 
     activo = valor
     if not activo then
         recolectando = false
-        if not tpAleatorio then quitarPlataforma() end
+        if not tpAleatorio and not evadirMobs then quitarPlataforma() end
     end
     lbl.Text = valor and "Auto burbujas: ON" or "Auto burbujas: OFF"
     burbuja.BackgroundColor3 = valor and COL_ON or COL_ACENTO
@@ -552,7 +556,7 @@ end)
 crearFilaSwitch(panel, 82, "TP aleatorio: OFF", COL_ACENTO, false, function(valor, lbl)
     tpAleatorio = valor
     visitados = {}
-    if not valor and not activo then quitarPlataforma() end
+    if not valor and not activo and not evadirMobs then quitarPlataforma() end
     lbl.Text = valor and "TP aleatorio: ON" or "TP aleatorio: OFF"
 end)
 
@@ -567,10 +571,10 @@ crearFilaSwitch(panel, 116, "Según oxígeno: ON", COL_ON, true, function(valor,
     if actualizarInfo then actualizarInfo() end
 end)
 
-crearFilaSwitch(panel, 150, "Cuerpo fantasma: OFF", COL_ACENTO, false, function(valor, lbl)
-    fantasma = valor
-    if not valor then quitarFantasma() end
-    lbl.Text = valor and "Cuerpo fantasma: ON" or "Cuerpo fantasma: OFF"
+crearFilaSwitch(panel, 150, "Evadir mobs: OFF", COL_ROJO, false, function(valor, lbl)
+    evadirMobs = valor
+    if not valor and not activo and not tpAleatorio then quitarPlataforma() end
+    lbl.Text = valor and "Evadir mobs: ON" or "Evadir mobs: OFF"
 end)
 
 local lblOxigeno = crearTexto(panel, "Oxígeno: …", 13, COL_SUB)
@@ -595,9 +599,13 @@ crearSlider(panel, 262, {
     alCambiar = function(v) velocidad = v end,
 })
 
-local lblContador = crearTexto(panel, "Recogidas: 0", 13, COL_SUB)
+local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
 lblContador.Position = UDim2.fromOffset(14, 324)
+
+local function actualizarContador()
+    lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d", recogidas, evasiones)
+end
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 11, COL_SUB)
 lblEstado.Size = UDim2.new(1, -28, 0, 28)
@@ -647,8 +655,7 @@ local function cerrar()
     cerrado = true
     activo = false
     tpAleatorio = false
-    fantasma = false
-    quitarFantasma()
+    evadirMobs = false
     quitarPlataforma()
     for _, c in ipairs(conexiones) do c:Disconnect() end
     table.clear(conexiones)
@@ -664,7 +671,6 @@ hacerArrastrable(burbuja, burbuja, restaurar)
 -- Lógica principal
 ---------------------------------------------------------------------
 -- Modo rápido: el oxígeno está bajo el umbral y hay que llenar cuanto antes.
--- Sin tope por ciclo, sin pausas largas y sin esperar entre ciclos.
 local function esRapido()
     return controlOxigeno and recolectando
 end
@@ -686,7 +692,7 @@ local function recogerBurbujas()
     local folder = Workspace:FindFirstChild("EnvironmentOxygenBubbles", true)
     if not folder then
         dbg.motivo = "no existe la carpeta de burbujas"
-        lblContador.Text = "Recogidas: " .. recogidas .. "  (sin burbujas)"
+        actualizarContador()
         return
     end
 
@@ -703,6 +709,9 @@ local function recogerBurbujas()
         if not root or not root.Parent then break end
         local origen = root.Position
 
+        -- con "Evadir mobs" activo, no va a burbujas que tengan un mob encima
+        local enemigos = evadirMobs and posicionesEnemigos() or {}
+
         -- lista de burbujas disponibles, la más cercana primero
         local lista = {}
         local total, enRango = 0, 0
@@ -714,7 +723,9 @@ local function recogerBurbujas()
                 if d <= RADIO then
                     enRango = enRango + 1
                     local ultima = visitaBurbuja[bubble]
-                    if not ultima or (tick() - ultima) >= BURBUJA_ENFRIAMIENTO then
+                    local libre = not ultima or (tick() - ultima) >= BURBUJA_ENFRIAMIENTO
+                    local segura = #enemigos == 0 or distanciaMinima(pos, enemigos) > DISTANCIA_SEGURA
+                    if libre and segura then
                         table.insert(lista, { obj = bubble, pos = pos, d = d })
                     end
                 end
@@ -729,7 +740,7 @@ local function recogerBurbujas()
             elseif enRango == 0 then
                 dbg.motivo = "burbujas fuera de rango"
             else
-                dbg.motivo = "burbujas reapareciendo"
+                dbg.motivo = "burbujas reapareciendo / mobs cerca"
             end
         end
 
@@ -746,6 +757,14 @@ local function recogerBurbujas()
             -- la burbuja flota: toma su posición actual justo antes del TP
             local pos = posBurbuja(item.obj) or item.pos
 
+            -- revisa otra vez que no haya un mob encima justo antes del TP
+            if evadirMobs then
+                local en = posicionesEnemigos()
+                if #en > 0 and distanciaMinima(pos, en) <= DISTANCIA_SEGURA then
+                    continue
+                end
+            end
+
             if teleportarA(root, pos) then
                 visitaBurbuja[item.obj] = tick()
                 recogidas = recogidas + 1
@@ -753,7 +772,7 @@ local function recogerBurbujas()
                 enPasada = enPasada + 1
                 dbg.tpOk = dbg.tpOk + 1
                 dbg.motivo = "recolectando"
-                lblContador.Text = "Recogidas: " .. recogidas
+                actualizarContador()
 
                 -- permanece un mínimo sobre la burbuja para que se registre el toque
                 local espera = math.max(1 / velocidad, MIN_PERMANENCIA)
@@ -771,11 +790,9 @@ local function recogerBurbujas()
                 task.wait(0.1)
             end
         end
-    -- en modo rápido repite pasadas mientras siga habiendo burbujas y falte oxígeno
     until not (esRapido() and activo and enPasada > 0 and pasadas < 30)
 
     -- Sin TP aleatorio: vuelve al destino y se queda encima de la plataforma.
-    -- Con TP aleatorio activo, el otro bucle se encarga de moverlo.
     root = getRoot()
     if activo and hechas > 0 and not tpAleatorio and root and root.Parent then
         irAPlataforma(root, DESTINO)
@@ -786,7 +803,6 @@ end
 task.spawn(function()
     while not cerrado do
         if controlOxigeno then
-            -- revisa el oxígeno seguido para reaccionar casi al instante
             task.wait(0.3 + math.random() * 0.2)
         else
             task.wait(humanDelay(INTERVALO, INTERVALO_JITTER))
@@ -810,10 +826,49 @@ task.spawn(function()
             local ok, err = pcall(function()
                 local root = getRoot()
                 if not root or not root.Parent then return end
+
+                -- si hay mobs y "Evadir mobs" está activo, no cae cerca de ellos
                 local destino = posicionAleatoria(root.Position)
+                if evadirMobs then
+                    local en = posicionesEnemigos()
+                    if #en > 0 and distanciaMinima(destino, en) <= DISTANCIA_SEGURA then
+                        destino = posicionSegura(en, root.Position)
+                    end
+                end
                 irAPlataforma(root, destino)
             end)
             if not ok then warn("[ERROR tp aleatorio]", err) end
+        end
+    end
+end)
+
+-- Bucle 3: evadir mobs por TELETRANSPORTE (independiente del resto)
+task.spawn(function()
+    while not cerrado do
+        task.wait(INTERVALO_EVASION)
+        if not cerrado and evadirMobs and (tick() - ultimaEvasion) >= EVASION_COOLDOWN then
+            local ok, err = pcall(function()
+                local root = getRoot()
+                local hum = getHumanoid()
+                if not root or not root.Parent then return end
+                if hum and hum.Health <= 0 then return end
+
+                local enemigos = posicionesEnemigos()
+                if #enemigos == 0 then return end
+
+                -- ¿algún mob demasiado cerca?
+                if distanciaMinima(root.Position, enemigos) >= DISTANCIA_SEGURA then return end
+
+                -- TP a la zona más lejana de todos los mobs
+                local destino, dist = posicionSegura(enemigos, root.Position)
+                if destino and irAPlataforma(root, destino, true) then
+                    ultimaEvasion = tick()
+                    evasiones = evasiones + 1
+                    dbg.motivo = string.format("evadió mob (nuevo punto a %.0f)", dist == math.huge and 999 or dist)
+                    actualizarContador()
+                end
+            end)
+            if not ok then warn("[ERROR evadir mobs]", err) end
         end
     end
 end)
