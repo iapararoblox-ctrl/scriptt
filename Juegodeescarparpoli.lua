@@ -18,7 +18,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 ---------------------------------------------------------------------
 -- Configuración
 ---------------------------------------------------------------------
-local RADIO = 10000                    -- radio de recolección
+local RADIO = 100000                 -- radio de recolección (250 dejaba fuera las burbujas lejanas)
 local INTERVALO = 1.5                -- segundos base entre ciclos
 local INTERVALO_JITTER = 0.6         -- ±variación aleatoria
 local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
@@ -36,7 +36,8 @@ local PAUSA_CADA = 15                -- cada N burbujas, pausa larga
 local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
 local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano (no aplica en modo rápido)
-local BURBUJA_ENFRIAMIENTO = 2       -- segundos antes de volver a visitar la misma burbuja
+local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
+local MIN_PERMANENCIA = 0.25         -- segundos mínimos sobre la burbuja (para que registre el toque)
 local FANTASMA_TRANSP = 0.6          -- transparencia del cuerpo fantasma
 
 -- Estado
@@ -58,6 +59,7 @@ local lastInputTime = tick()
 local fantasma = false
 local origenPartes = {}   -- [parte] = { col = CanCollide, tr = Transparency }
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
+local dbg = { total = 0, rango = 0, tpOk = 0, tpFail = 0, motivo = "—" }
 
 -- Paleta
 local COL_FONDO   = Color3.fromRGB(24, 26, 36)
@@ -136,6 +138,18 @@ end
 
 local function getPosition(obj)
     if obj:IsA("Model") then
+        return obj:GetPivot().Position
+    elseif obj:IsA("BasePart") then
+        return obj.Position
+    end
+end
+
+-- Posición de la burbuja: usa su parte física (PrimaryPart o la primera BasePart);
+-- el pivote del modelo puede quedar desplazado respecto a donde se detecta el toque.
+local function posBurbuja(obj)
+    if obj:IsA("Model") then
+        local parte = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+        if parte then return parte.Position end
         return obj:GetPivot().Position
     elseif obj:IsA("BasePart") then
         return obj.Position
@@ -465,8 +479,8 @@ gui.Parent = PlayerGui
 
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
-panel.Size = UDim2.fromOffset(260, 374)
-panel.Position = UDim2.new(0, 20, 0.5, -187)
+panel.Size = UDim2.fromOffset(260, 384)
+panel.Position = UDim2.new(0, 20, 0.5, -192)
 panel.BackgroundColor3 = COL_FONDO
 panel.BorderSizePixel = 0
 panel.Parent = gui
@@ -487,7 +501,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "MAYKE V1", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -80, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -586,8 +600,10 @@ lblContador.Size = UDim2.new(1, -28, 0, 20)
 lblContador.Position = UDim2.fromOffset(14, 324)
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 11, COL_SUB)
-lblEstado.Size = UDim2.new(1, -28, 0, 16)
+lblEstado.Size = UDim2.new(1, -28, 0, 28)
 lblEstado.Position = UDim2.fromOffset(14, 346)
+lblEstado.TextWrapped = true
+lblEstado.TextYAlignment = Enum.TextYAlignment.Top
 
 actualizarInfo = function()
     local ox, mx = leerOxigeno()
@@ -601,11 +617,14 @@ actualizarInfo = function()
         else estado = "en espera" end
         lblOxigeno.Text = string.format("Oxígeno: %.0f / %.0f  ·  %s", ox, mx, estado)
     end
+    local base
     if tick() < pausaHasta then
-        lblEstado.Text = string.format("Estado: pausa (%.1fs)", pausaHasta - tick())
+        base = string.format("pausa %.1fs", pausaHasta - tick())
     else
-        lblEstado.Text = "Estado: " .. (activo and "activo" or "inactivo")
+        base = activo and "activo" or "inactivo"
     end
+    lblEstado.Text = string.format("%s · %s\nBurb %d · en rango %d · TP %d ok / %d fallo",
+        base, dbg.motivo, dbg.total, dbg.rango, dbg.tpOk, dbg.tpFail)
 end
 
 conectar(LocalPlayer:GetAttributeChangedSignal("Oxygen"), actualizarInfo)
@@ -651,20 +670,22 @@ local function esRapido()
 end
 
 local function recogerBurbujas()
-    if not debeRecolectar() then return end
-    if tick() < pausaHasta then return end
+    if not debeRecolectar() then dbg.motivo = "oxígeno alto: en espera"; return end
+    if tick() < pausaHasta then dbg.motivo = "pausa"; return end
 
     local root = getRoot()
-    if not root or not root.Parent then return end
-    if not estadoSeguro() then return end
+    if not root or not root.Parent then dbg.motivo = "sin personaje"; return end
+    if not estadoSeguro() then dbg.motivo = "estado no válido"; return end
 
     -- fuera del modo rápido, pausa si el jugador se mueve a mano
     if not esRapido() and DETECTAR_INPUT and (tick() - lastInputTime) < 0.8 then
+        dbg.motivo = "pausa por input"
         return
     end
 
     local folder = Workspace:FindFirstChild("EnvironmentOxygenBubbles", true)
     if not folder then
+        dbg.motivo = "no existe la carpeta de burbujas"
         lblContador.Text = "Recogidas: " .. recogidas .. "  (sin burbujas)"
         return
     end
@@ -678,46 +699,76 @@ local function recogerBurbujas()
         local rapido = esRapido()
         local limite = rapido and math.huge or BURBUJAS_POR_CICLO
 
+        root = getRoot()
+        if not root or not root.Parent then break end
+        local origen = root.Position
+
+        -- lista de burbujas disponibles, la más cercana primero
+        local lista = {}
+        local total, enRango = 0, 0
         for _, bubble in ipairs(folder:GetChildren()) do
+            total = total + 1
+            local pos = posBurbuja(bubble)
+            if pos then
+                local d = (origen - pos).Magnitude
+                if d <= RADIO then
+                    enRango = enRango + 1
+                    local ultima = visitaBurbuja[bubble]
+                    if not ultima or (tick() - ultima) >= BURBUJA_ENFRIAMIENTO then
+                        table.insert(lista, { obj = bubble, pos = pos, d = d })
+                    end
+                end
+            end
+        end
+        table.sort(lista, function(x, y) return x.d < y.d end)
+
+        dbg.total, dbg.rango = total, enRango
+        if #lista == 0 then
+            if total == 0 then
+                dbg.motivo = "carpeta vacía (sin burbujas)"
+            elseif enRango == 0 then
+                dbg.motivo = "burbujas fuera de rango"
+            else
+                dbg.motivo = "burbujas reapareciendo"
+            end
+        end
+
+        for _, item in ipairs(lista) do
             if not activo then break end
             if not debeRecolectar() then break end
             if tick() < pausaHasta then break end
             if hechas >= limite then break end
-            if not bubble.Parent then continue end
-
-            -- evita volver a la misma burbuja mientras reaparece
-            local ultima = visitaBurbuja[bubble]
-            if ultima and (tick() - ultima) < BURBUJA_ENFRIAMIENTO then continue end
-
-            local pos = getPosition(bubble)
-            if not pos then continue end
+            if not item.obj.Parent then continue end
 
             root = getRoot()
             if not root or not root.Parent then break end
 
-            if (root.Position - pos).Magnitude <= RADIO then
-                if teleportarA(root, pos) then
-                    visitaBurbuja[bubble] = tick()
-                    recogidas = recogidas + 1
-                    hechas = hechas + 1
-                    enPasada = enPasada + 1
-                    lblContador.Text = "Recogidas: " .. recogidas
+            -- la burbuja flota: toma su posición actual justo antes del TP
+            local pos = posBurbuja(item.obj) or item.pos
 
-                    local base = 1 / velocidad
-                    if rapido then
-                        task.wait(humanDelay(base, base * 0.15))
-                    else
-                        task.wait(humanDelay(base, base * 0.4))
-                        if recogidas % PAUSA_CADA == 0 then
-                            local p = math.random() * (PAUSA_MAX - PAUSA_MIN) + PAUSA_MIN
-                            pausaHasta = tick() + p
-                            if actualizarInfo then actualizarInfo() end
-                            task.wait(p)
-                        end
-                    end
-                else
-                    task.wait(0.1)
+            if teleportarA(root, pos) then
+                visitaBurbuja[item.obj] = tick()
+                recogidas = recogidas + 1
+                hechas = hechas + 1
+                enPasada = enPasada + 1
+                dbg.tpOk = dbg.tpOk + 1
+                dbg.motivo = "recolectando"
+                lblContador.Text = "Recogidas: " .. recogidas
+
+                -- permanece un mínimo sobre la burbuja para que se registre el toque
+                local espera = math.max(1 / velocidad, MIN_PERMANENCIA)
+                task.wait(humanDelay(espera, espera * (rapido and 0.1 or 0.3)))
+
+                if not rapido and recogidas % PAUSA_CADA == 0 then
+                    local p = math.random() * (PAUSA_MAX - PAUSA_MIN) + PAUSA_MIN
+                    pausaHasta = tick() + p
+                    if actualizarInfo then actualizarInfo() end
+                    task.wait(p)
                 end
+            else
+                dbg.tpFail = dbg.tpFail + 1
+                dbg.motivo = "TP bloqueado (estado del personaje)"
+                task.wait(0.1)
             end
         end
     -- en modo rápido repite pasadas mientras siga habiendo burbujas y falte oxígeno
