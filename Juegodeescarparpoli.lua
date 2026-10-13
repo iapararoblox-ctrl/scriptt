@@ -2,7 +2,6 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -15,22 +14,21 @@ local INTERVALO = 1
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5
 
-local VEL_MIN, VEL_MAX = 1, 20      -- burbujas por segundo
-local GIRO_MIN, GIRO_MAX = 10, 360  -- grados por segundo (velocidad del recorrido)
-local ORB_MIN, ORB_MAX = 2, 40      -- radio del círculo en studs
+local VEL_MIN, VEL_MAX = 1, 20 -- burbujas por segundo
+
+-- TP aleatorio
+local RADIO_TP = 60    -- radio alrededor del DESTINO donde se generan los puntos
+local SEPARACION = 12  -- distancia mínima para que dos puntos cuenten como "distintos"
 
 -- Estado
 local velocidad = 7
-local velGiro = 90
-local radioOrbita = 10
-local angulo = 0
-local girar = false
 local activo = false
-local enDestino = false
-local vivo = true
+local tpAleatorio = false
+local cerrado = false
 local recogidas = 0
 local plataforma = nil
-local conexiones = {}
+local visitados = {}   -- ubicaciones a las que ya se teletransportó
+local conexiones = {}  -- conexiones globales (se desconectan al cerrar)
 
 -- Paleta
 local COL_FONDO = Color3.fromRGB(24, 26, 36)
@@ -64,7 +62,7 @@ local function getPosition(obj)
 	end
 end
 
-local function crearPlataforma()
+local function crearPlataforma(posicion)
 	if not plataforma or not plataforma.Parent then
 		plataforma = Instance.new("Part")
 		plataforma.Name = "FloatPlatform"
@@ -76,7 +74,7 @@ local function crearPlataforma()
 		plataforma.Color = COL_ACENTO
 		plataforma.Parent = Workspace
 	end
-	plataforma.Position = DESTINO - Vector3.new(0, ALTURA_PLATAFORMA, 0)
+	plataforma.Position = (posicion or DESTINO) - Vector3.new(0, ALTURA_PLATAFORMA, 0)
 end
 
 local function quitarPlataforma()
@@ -84,6 +82,33 @@ local function quitarPlataforma()
 		plataforma:Destroy()
 		plataforma = nil
 	end
+end
+
+-- Devuelve una ubicación que no se parezca a ninguna ya visitada.
+-- Si ya no quedan ubicaciones libres, reinicia el historial.
+local function posicionAleatoria()
+	for _ = 1, 2 do
+		for _ = 1, 40 do
+			local ang = math.random() * math.pi * 2
+			local dist = math.sqrt(math.random()) * RADIO_TP
+			local cand = DESTINO + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
+
+			local libre = true
+			for _, v in ipairs(visitados) do
+				if (v - cand).Magnitude < SEPARACION then
+					libre = false
+					break
+				end
+			end
+
+			if libre then
+				table.insert(visitados, cand)
+				return cand
+			end
+		end
+		visitados = {} -- se agotaron los puntos libres: empezar de nuevo
+	end
+	return DESTINO
 end
 
 ---------------------------------------------------------------------
@@ -159,8 +184,8 @@ local function hacerArrastrable(handle, target, alTocar)
 	end)
 end
 
--- Interruptor reutilizable. Devuelve una función set(valor)
-local function crearSwitch(parent, posicion, alCambiar)
+-- Interruptor reutilizable
+local function crearSwitch(parent, posicion, colorOn, alCambiar)
 	local sw = Instance.new("TextButton")
 	sw.Size = UDim2.fromOffset(50, 26)
 	sw.Position = posicion
@@ -179,105 +204,13 @@ local function crearSwitch(parent, posicion, alCambiar)
 	redondear(perilla, 10)
 
 	local estado = false
-	local function set(valor)
-		estado = valor
-		local info = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
-		TweenService:Create(sw, info, { BackgroundColor3 = estado and COL_ON or COL_OFF }):Play()
-		TweenService:Create(perilla, info, { Position = UDim2.fromOffset(estado and 27 or 3, 3) }):Play()
-	end
-
 	sw.MouseButton1Click:Connect(function()
-		set(not estado)
+		estado = not estado
+		local info = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
+		TweenService:Create(sw, info, { BackgroundColor3 = estado and colorOn or COL_OFF }):Play()
+		TweenService:Create(perilla, info, { Position = UDim2.fromOffset(estado and 27 or 3, 3) }):Play()
 		alCambiar(estado)
 	end)
-
-	return set
-end
-
--- Slider reutilizable. Devuelve el contenedor (CanvasGroup) para poder atenuarlo
-local function crearSlider(parent, y, cfg)
-	local cont = Instance.new("CanvasGroup")
-	cont.Size = UDim2.new(1, -28, 0, 56)
-	cont.Position = UDim2.fromOffset(14, y)
-	cont.BackgroundTransparency = 1
-	cont.Parent = parent
-
-	local lbl = crearTexto(cont, "", 14, COL_TEXTO)
-	lbl.Size = UDim2.new(1, 0, 0, 20)
-
-	local track = Instance.new("Frame")
-	track.Size = UDim2.new(1, -20, 0, 8)
-	track.Position = UDim2.fromOffset(10, 28)
-	track.BackgroundColor3 = COL_BARRA
-	track.BorderSizePixel = 0
-	track.Parent = cont
-	redondear(track, 4)
-
-	local fill = Instance.new("Frame")
-	fill.Size = UDim2.fromScale(0, 1)
-	fill.BackgroundColor3 = COL_ACENTO
-	fill.BorderSizePixel = 0
-	fill.Parent = track
-	redondear(fill, 4)
-
-	local knob = Instance.new("Frame")
-	knob.Size = UDim2.fromOffset(18, 18)
-	knob.AnchorPoint = Vector2.new(0.5, 0.5)
-	knob.Position = UDim2.fromScale(0, 0.5)
-	knob.BackgroundColor3 = Color3.new(1, 1, 1)
-	knob.BorderSizePixel = 0
-	knob.Parent = track
-	redondear(knob, 9)
-	borde(knob, COL_ACENTO, 2)
-
-	local lMin = crearTexto(cont, cfg.textoMin, 11, COL_SUB)
-	lMin.Size = UDim2.fromOffset(60, 14)
-	lMin.Position = UDim2.fromOffset(10, 42)
-
-	local lMax = crearTexto(cont, cfg.textoMax, 11, COL_SUB)
-	lMax.Size = UDim2.fromOffset(60, 14)
-	lMax.Position = UDim2.new(1, -70, 0, 42)
-	lMax.TextXAlignment = Enum.TextXAlignment.Right
-
-	local function setValor(valor)
-		valor = math.clamp(valor, cfg.min, cfg.max)
-		local a = (valor - cfg.min) / (cfg.max - cfg.min)
-		fill.Size = UDim2.fromScale(a, 1)
-		knob.Position = UDim2.fromScale(a, 0.5)
-		lbl.Text = cfg.formato(valor)
-		cfg.alCambiar(valor)
-	end
-
-	local function desdeX(x)
-		local a = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-		local v = cfg.min + a * (cfg.max - cfg.min)
-		v = math.floor(v / cfg.paso + 0.5) * cfg.paso
-		setValor(v)
-	end
-
-	local deslizando = false
-	for _, obj in ipairs({ track, knob }) do
-		conectar(obj.InputBegan, function(input)
-			if esPuntero(input) then
-				deslizando = true
-				desdeX(input.Position.X)
-			end
-		end)
-	end
-	conectar(UserInputService.InputChanged, function(input)
-		if deslizando and (input.UserInputType == Enum.UserInputType.MouseMovement
-			or input.UserInputType == Enum.UserInputType.Touch) then
-			desdeX(input.Position.X)
-		end
-	end)
-	conectar(UserInputService.InputEnded, function(input)
-		if esPuntero(input) then
-			deslizando = false
-		end
-	end)
-
-	setValor(cfg.inicial)
-	return cont
 end
 
 ---------------------------------------------------------------------
@@ -290,8 +223,8 @@ gui.Parent = PlayerGui
 
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
-panel.Size = UDim2.fromOffset(250, 356)
-panel.Position = UDim2.new(0, 20, 0.5, -178)
+panel.Size = UDim2.fromOffset(250, 222)
+panel.Position = UDim2.new(0, 20, 0.5, -111)
 panel.BackgroundColor3 = COL_FONDO
 panel.BorderSizePixel = 0
 panel.Parent = gui
@@ -356,11 +289,9 @@ local lblEstado = crearTexto(panel, "Estado: apagado", 14, COL_SUB)
 lblEstado.Size = UDim2.new(1, -90, 0, 26)
 lblEstado.Position = UDim2.fromOffset(14, 50)
 
-local setPrincipal
-setPrincipal = crearSwitch(panel, UDim2.new(1, -64, 0, 50), function(valor)
+crearSwitch(panel, UDim2.new(1, -64, 0, 50), COL_ON, function(valor)
 	activo = valor
 	if not activo then
-		enDestino = false
 		quitarPlataforma()
 	end
 	lblEstado.Text = activo and "Estado: activo" or "Estado: apagado"
@@ -368,56 +299,97 @@ setPrincipal = crearSwitch(panel, UDim2.new(1, -64, 0, 50), function(valor)
 	burbuja.BackgroundColor3 = activo and COL_ON or COL_ACENTO
 end)
 
--- Fila 2: velocidad de recolección
-crearSlider(panel, 88, {
-	min = VEL_MIN, max = VEL_MAX, paso = 1, inicial = velocidad,
-	textoMin = "Lento", textoMax = "Rápido",
-	formato = function(v) return string.format("Velocidad: %d burb/s  (%.2fs)", v, 1 / v) end,
-	alCambiar = function(v) velocidad = v end,
-})
+-- Fila 2: TP aleatorio
+local lblRandom = crearTexto(panel, "TP aleatorio: OFF", 14, COL_SUB)
+lblRandom.Size = UDim2.new(1, -90, 0, 26)
+lblRandom.Position = UDim2.fromOffset(14, 88)
 
--- Separador
-local sep = Instance.new("Frame")
-sep.Size = UDim2.new(1, -28, 0, 1)
-sep.Position = UDim2.fromOffset(14, 152)
-sep.BackgroundColor3 = COL_BARRA
-sep.BorderSizePixel = 0
-sep.Parent = panel
-
--- Fila 3: girar en el aire
-local lblGirar = crearTexto(panel, "Dar vueltas en el aire", 14, COL_TEXTO)
-lblGirar.Size = UDim2.new(1, -90, 0, 26)
-lblGirar.Position = UDim2.fromOffset(14, 162)
-
-local sliderGiro, sliderRadio
-crearSwitch(panel, UDim2.new(1, -64, 0, 162), function(valor)
-	girar = valor
-	sliderGiro.GroupTransparency = girar and 0 or 0.55
-	sliderRadio.GroupTransparency = girar and 0 or 0.55
+crearSwitch(panel, UDim2.new(1, -64, 0, 88), COL_ACENTO, function(valor)
+	tpAleatorio = valor
+	visitados = {} -- historial limpio al activar o desactivar
+	lblRandom.Text = valor and "TP aleatorio: ON" or "TP aleatorio: OFF"
+	lblRandom.TextColor3 = valor and COL_ACENTO or COL_SUB
 end)
 
--- Fila 4: velocidad de giro
-sliderGiro = crearSlider(panel, 200, {
-	min = GIRO_MIN, max = GIRO_MAX, paso = 10, inicial = velGiro,
-	textoMin = "Suave", textoMax = "Turbo",
-	formato = function(v) return string.format("Vel. recorrido: %d°/s (%.2f v/s)", v, v / 360) end,
-	alCambiar = function(v) velGiro = v end,
-})
-sliderGiro.GroupTransparency = 0.55
+-- Fila 3: velocidad (slider)
+local lblVel = crearTexto(panel, "", 14, COL_TEXTO)
+lblVel.Size = UDim2.new(1, -28, 0, 20)
+lblVel.Position = UDim2.fromOffset(14, 130)
 
--- Fila 5: tamaño del círculo
-sliderRadio = crearSlider(panel, 262, {
-	min = ORB_MIN, max = ORB_MAX, paso = 1, inicial = radioOrbita,
-	textoMin = "Pequeño", textoMax = "Grande",
-	formato = function(v) return string.format("Radio del círculo: %d studs", v) end,
-	alCambiar = function(v) radioOrbita = v end,
-})
-sliderRadio.GroupTransparency = 0.55
+local track = Instance.new("Frame")
+track.Size = UDim2.new(1, -28, 0, 8)
+track.Position = UDim2.fromOffset(14, 160)
+track.BackgroundColor3 = COL_BARRA
+track.BorderSizePixel = 0
+track.Parent = panel
+redondear(track, 4)
 
--- Contador
+local fill = Instance.new("Frame")
+fill.Size = UDim2.fromScale(0, 1)
+fill.BackgroundColor3 = COL_ACENTO
+fill.BorderSizePixel = 0
+fill.Parent = track
+redondear(fill, 4)
+
+local knob = Instance.new("Frame")
+knob.Size = UDim2.fromOffset(18, 18)
+knob.AnchorPoint = Vector2.new(0.5, 0.5)
+knob.Position = UDim2.fromScale(0, 0.5)
+knob.BackgroundColor3 = Color3.new(1, 1, 1)
+knob.BorderSizePixel = 0
+knob.Parent = track
+redondear(knob, 9)
+borde(knob, COL_ACENTO, 2)
+
+local lblMin = crearTexto(panel, "Lento", 11, COL_SUB)
+lblMin.Size = UDim2.fromOffset(60, 14)
+lblMin.Position = UDim2.fromOffset(14, 174)
+
+local lblMax = crearTexto(panel, "Rápido", 11, COL_SUB)
+lblMax.Size = UDim2.fromOffset(60, 14)
+lblMax.Position = UDim2.new(1, -74, 0, 174)
+lblMax.TextXAlignment = Enum.TextXAlignment.Right
+
 local lblContador = crearTexto(panel, "Recogidas: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 328)
+lblContador.Position = UDim2.fromOffset(14, 196)
+
+local function setVelocidad(alpha)
+	alpha = math.clamp(alpha, 0, 1)
+	velocidad = math.floor(VEL_MIN + alpha * (VEL_MAX - VEL_MIN) + 0.5)
+	local a = (velocidad - VEL_MIN) / (VEL_MAX - VEL_MIN)
+	fill.Size = UDim2.fromScale(a, 1)
+	knob.Position = UDim2.fromScale(a, 0.5)
+	lblVel.Text = string.format("Velocidad: %d burb/s  (%.2fs)", velocidad, 1 / velocidad)
+end
+setVelocidad((velocidad - VEL_MIN) / (VEL_MAX - VEL_MIN))
+
+local deslizando = false
+local function desdeX(x)
+	setVelocidad((x - track.AbsolutePosition.X) / track.AbsoluteSize.X)
+end
+
+for _, obj in ipairs({ track, knob }) do
+	conectar(obj.InputBegan, function(input)
+		if esPuntero(input) then
+			deslizando = true
+			desdeX(input.Position.X)
+		end
+	end)
+end
+
+conectar(UserInputService.InputChanged, function(input)
+	if deslizando and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		desdeX(input.Position.X)
+	end
+end)
+
+conectar(UserInputService.InputEnded, function(input)
+	if esPuntero(input) then
+		deslizando = false
+	end
+end)
 
 ---------------------------------------------------------------------
 -- Minimizar / cerrar
@@ -435,9 +407,8 @@ local function restaurar()
 end
 
 local function cerrar()
-	vivo = false
+	cerrado = true
 	activo = false
-	enDestino = false
 	quitarPlataforma()
 	for _, c in ipairs(conexiones) do
 		c:Disconnect()
@@ -450,30 +421,6 @@ btnMin.MouseButton1Click:Connect(minimizar)
 btnCerrar.MouseButton1Click:Connect(cerrar)
 hacerArrastrable(barra, panel)
 hacerArrastrable(burbuja, burbuja, restaurar)
-
----------------------------------------------------------------------
--- Recorrido circular en el aire (solo mientras está en el destino)
----------------------------------------------------------------------
-conectar(RunService.Heartbeat, function(dt)
-	if not (activo and girar and enDestino) then return end
-	local char = LocalPlayer.Character
-	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if not root then return end
-
-	angulo = (angulo + math.rad(velGiro) * dt) % (math.pi * 2)
-	local c, sn = math.cos(angulo), math.sin(angulo)
-	local pos = DESTINO + Vector3.new(c * radioOrbita, 0, sn * radioOrbita)
-	local tangente = Vector3.new(-sn, 0, c) -- mira hacia donde avanza
-
-	root.CFrame = CFrame.lookAt(pos, pos + tangente)
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
-
-	-- la plataforma acompaña al personaje para que no caiga
-	if plataforma and plataforma.Parent then
-		plataforma.Position = pos - Vector3.new(0, ALTURA_PLATAFORMA, 0)
-	end
-end)
 
 ---------------------------------------------------------------------
 -- Lógica principal
@@ -493,27 +440,33 @@ local function recogerBurbujas()
 
 		local pos = getPosition(bubble)
 		if pos and (root.Position - pos).Magnitude <= RADIO then
-			enDestino = false -- deja de girar mientras recoge
 			root.CFrame = CFrame.new(pos)
 			recogio = true
 			recogidas += 1
 			lblContador.Text = "Recogidas: " .. recogidas
-			task.wait(1 / velocidad)
+			task.wait(1 / velocidad) -- se lee en cada burbuja: el slider aplica al instante
 		end
 	end
 
-	if activo and recogio and root.Parent then
-		crearPlataforma()
-		root.CFrame = CFrame.new(DESTINO)
-		root.AssemblyLinearVelocity = Vector3.zero
-		enDestino = true
+	if activo and root.Parent then
+		if tpAleatorio then
+			-- en vez de quedarse quieto, salta a una ubicación nueva cada ciclo
+			local destino = posicionAleatoria()
+			crearPlataforma(destino)
+			root.CFrame = CFrame.new(destino)
+			root.AssemblyLinearVelocity = Vector3.zero
+		elseif recogio then
+			crearPlataforma(DESTINO)
+			root.CFrame = CFrame.new(DESTINO)
+			root.AssemblyLinearVelocity = Vector3.zero
+		end
 	end
 end
 
 task.spawn(function()
-	while vivo do
+	while not cerrado do
 		task.wait(INTERVALO)
-		if vivo and activo then
+		if not cerrado and activo then
 			local ok, err = pcall(recogerBurbujas)
 			if not ok then
 				warn("[ERROR]", err)
