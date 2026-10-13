@@ -18,7 +18,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 ---------------------------------------------------------------------
 -- Configuración
 ---------------------------------------------------------------------
-local RADIO = 250                    -- radio de recolección
+local RADIO = 10000                    -- radio de recolección
 local INTERVALO = 1.5                -- segundos base entre ciclos
 local INTERVALO_JITTER = 0.6         -- ±variación aleatoria
 local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
