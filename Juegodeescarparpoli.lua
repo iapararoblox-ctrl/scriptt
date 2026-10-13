@@ -1,7 +1,7 @@
 --[[
   RIFT CORE — solo grieta y portal
   - Hookea RiftService.RemoteEvent / RemoteFunction
-  - Hookea GameService.RemoteEvent (para ver EnterPortal y compañía)
+  - Hookea GameService.RemoteEvent (para ver EnterPortal y compañía
   - Botones: EnterPortal, AutoPortal, RiftProbe, Guardar
   - Guarda en /storage/emulated/0/Delta/Informaciónrecopilada/
 --]]
