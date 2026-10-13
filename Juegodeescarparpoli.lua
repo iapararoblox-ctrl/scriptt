@@ -194,9 +194,34 @@ local function quitarPlataforma()
     end
 end
 
--- Ir a una burbuja. Con MOVIMIENTO_SUAVE se desliza con un Tween; si algo lo
--- interrumpe (evadir mob, apagar el script) se cancela al instante.
--- Con MOVIMIENTO_SUAVE = false vuelve al TP instantáneo de antes.
+-- Desliza al personaje (y opcionalmente la plataforma) hasta "meta".
+-- Interpolación manual: si una evasión de mob ocurre a mitad de camino, se
+-- detecta antes de cada paso y el deslizamiento se corta sin pisar el TP de escape.
+local function deslizar(root, meta, dur, platDestino, continuar)
+    local inicio = root.CFrame
+    local platInicio = plataforma and plataforma.Parent and plataforma.Position
+    local evasionInicial = ultimaEvasion
+    local t0 = tick()
+    while true do
+        if cerrado or not root.Parent or ultimaEvasion ~= evasionInicial or not continuar() then
+            return false
+        end
+        local a = math.min((tick() - t0) / dur, 1)
+        root.CFrame = inicio:Lerp(meta, a)
+        root.AssemblyLinearVelocity = Vector3.zero
+        if platInicio and platDestino and plataforma and plataforma.Parent then
+            plataforma.Position = platInicio:Lerp(platDestino, a)
+        end
+        if a >= 1 then return true end
+        task.wait()
+    end
+end
+
+local function duracionPara(dist)
+    return math.clamp(dist / VELOCIDAD_TWEEN, 0.08, TWEEN_MAX)
+end
+
+-- Ir a una burbuja (suave o instantáneo según MOVIMIENTO_SUAVE).
 local function teleportarA(root, destino)
     if not root or not root.Parent then return false end
     if not estadoSeguro() then return false end
@@ -212,23 +237,7 @@ local function teleportarA(root, destino)
         return true
     end
 
-    local dur = math.clamp(dist / VELOCIDAD_TWEEN, 0.08, TWEEN_MAX)
-    local tween = TweenService:Create(root, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = meta })
-    local evasionInicial = ultimaEvasion
-    local llego = false
-    local c = tween.Completed:Connect(function() llego = true end)
-
-    tween:Play()
-    local t0 = tick()
-    while not llego and (tick() - t0) < dur + 0.3 do
-        if cerrado or not activo or ultimaEvasion ~= evasionInicial or not root.Parent then
-            tween:Cancel()
-            break
-        end
-        root.AssemblyLinearVelocity = Vector3.zero -- evita que la física pelee con el Tween
-        task.wait()
-    end
-    c:Disconnect()
+    local llego = deslizar(root, meta, duracionPara(dist), nil, function() return activo end)
     if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
     return llego
 end
@@ -246,6 +255,27 @@ local function irAPlataforma(root, destino, forzar)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
     return true
+end
+
+-- Igual que irAPlataforma pero deslizando personaje y plataforma juntos (TP aleatorio).
+local function irAPlataformaSuave(root, destino)
+    if not root or not root.Parent then return false end
+    if not estadoSeguro() then return false end
+
+    local dist = (root.Position - destino).Magnitude
+    if not MOVIMIENTO_SUAVE or dist < 4 then
+        return irAPlataforma(root, destino)
+    end
+
+    crearPlataforma(root.Position) -- plataforma bajo los pies antes de empezar
+    local rot = root.CFrame - root.CFrame.Position
+    local meta = CFrame.new(destino) * rot
+    local platDestino = destino - Vector3.new(0, ALTURA_PLATAFORMA, 0)
+
+    local llego = deslizar(root, meta, duracionPara(dist), platDestino,
+        function() return tpAleatorio and not ocupado end)
+    if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
+    return llego
 end
 
 -- Elige el candidato más lejano a todos los puntos ya usados
@@ -536,7 +566,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "MAYK V1", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -80, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -866,7 +896,7 @@ task.spawn(function()
                         destino = posicionSegura(en, root.Position)
                     end
                 end
-                irAPlataforma(root, destino)
+                irAPlataformaSuave(root, destino)
             end)
             if not ok then warn("[ERROR tp aleatorio]", err) end
         end
