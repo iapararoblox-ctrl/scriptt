@@ -36,6 +36,11 @@ local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano (no
 local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
 local MIN_PERMANENCIA = 0.25         -- segundos mínimos sobre la burbuja (para que registre el toque)
 
+-- Movimiento hacia las burbujas
+local MOVIMIENTO_SUAVE = true        -- true = desliza con Tween; false = TP instantáneo
+local VELOCIDAD_TWEEN = 300          -- studs por segundo del deslizamiento
+local TWEEN_MAX = 0.5                -- duración máxima de cada desplazamiento (segundos)
+
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
 local DISTANCIA_SEGURA = 25          -- si un mob está más cerca que esto, hace TP lejos
@@ -189,17 +194,43 @@ local function quitarPlataforma()
     end
 end
 
--- TP exacto a una posición (se usa para ir a las burbujas).
+-- Ir a una burbuja. Con MOVIMIENTO_SUAVE se desliza con un Tween; si algo lo
+-- interrumpe (evadir mob, apagar el script) se cancela al instante.
+-- Con MOVIMIENTO_SUAVE = false vuelve al TP instantáneo de antes.
 local function teleportarA(root, destino)
     if not root or not root.Parent then return false end
     if not estadoSeguro() then return false end
 
     local rot = root.CFrame - root.CFrame.Position
-    root.CFrame = CFrame.new(destino) * rot
+    local meta = CFrame.new(destino) * rot
+    local dist = (root.Position - destino).Magnitude
 
-    local v = root.AssemblyLinearVelocity
-    root.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
-    return true
+    if not MOVIMIENTO_SUAVE or dist < 4 then
+        root.CFrame = meta
+        local v = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+        return true
+    end
+
+    local dur = math.clamp(dist / VELOCIDAD_TWEEN, 0.08, TWEEN_MAX)
+    local tween = TweenService:Create(root, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = meta })
+    local evasionInicial = ultimaEvasion
+    local llego = false
+    local c = tween.Completed:Connect(function() llego = true end)
+
+    tween:Play()
+    local t0 = tick()
+    while not llego and (tick() - t0) < dur + 0.3 do
+        if cerrado or not activo or ultimaEvasion ~= evasionInicial or not root.Parent then
+            tween:Cancel()
+            break
+        end
+        root.AssemblyLinearVelocity = Vector3.zero -- evita que la física pelee con el Tween
+        task.wait()
+    end
+    c:Disconnect()
+    if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
+    return llego
 end
 
 -- Coloca la plataforma Y el personaje encima en el mismo instante (sin yield).
