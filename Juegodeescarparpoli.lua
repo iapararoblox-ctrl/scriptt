@@ -6,7 +6,7 @@
     - Pausas largas periódicas
     - No anula AssemblyLinearVelocity
     - Pausa si te mueves a mano o si el estado del Humanoid no es "Running"
-    - Chequeo de distancia mínima entre TPs
+    - Chequeo de distancia mínima entre TPsd
 --]]
 
 local Players = game:GetService("Players")
