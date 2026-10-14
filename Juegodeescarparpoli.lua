@@ -38,9 +38,9 @@ local MIN_PERMANENCIA = 0.35         -- segundos mínimos sobre la burbuja (para
 
 -- Movimiento hacia las burbujas
 local MOVIMIENTO_SUAVE = true        -- true = desliza con Tween; false = TP instantáneo
-local VELOCIDAD_TWEEN = 100          -- studs por segundo del deslizamiento
+local VELOCIDAD_TWEEN = 60          -- studs por segundo del deslizamiento
 local TWEEN_MAX = 1.2                -- duración máxima de cada desplazamiento (segundos)
-local VELOCIDAD_EVASION = 100       -- studs/s al huir de un mob (más rápido que el normal)
+local VELOCIDAD_EVASION = 70       -- studs/s al huir de un mob (más rápido que el normal)
 local EVASION_TWEEN_MAX = 0.6       -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
