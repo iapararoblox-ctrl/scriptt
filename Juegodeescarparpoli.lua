@@ -75,11 +75,6 @@ for _, nombre in ipairs({"AdminLagClient","AdminCrashClient","AdminKillBrickClie
     end
 end
 
-
-
-
-
-
 --[[  AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
 
     Ya no hay ningún TP: TODO el movimiento (ir a burbujas, moverse al azar,
@@ -90,8 +85,6 @@ end
     Pestañas:
       • BURBUJAS   → auto burbujas, "según oxígeno" y umbral
       • MOVIMIENTO → movimiento aleatorio y evadir mobs
-      • COFRES     → interruptor general, intervalo, botón "Abrir ahora"
-                     y una fila POR CADA cofre (ON/OFF propio + cantidad propia)
 
     Velocidades y demás se ajustan en las secciones "AJUSTES" de abajo.
 --]]
@@ -100,7 +93,6 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
@@ -131,38 +123,6 @@ local VELOCIDAD_HUIDA_DANO = 100
 local DANO_MINIMO = 1
 ---------------------------------------------------------------------
 -- FIN DE LOS AJUSTES DE VELOCIDAD
----------------------------------------------------------------------
-
----------------------------------------------------------------------
--- ╔═══════════════════════════════════════════════════════════════╗
--- ║                AJUSTES DE COFRES (EDITA AQUÍ)                 ║
--- ╚═══════════════════════════════════════════════════════════════╝
--- COFRES_CANTIDAD   = cantidad inicial por cofre (luego se cambia en la UI)
--- COFRES_INTERVALO  = segundos iniciales entre rondas (luego se cambia en la UI)
--- COFRES_PAUSA      = segundos de pausa entre un cofre y el siguiente
--- COFRES_LISTA      = { nombre, activo_al_inicio }
----------------------------------------------------------------------
-local COFRES_CANTIDAD = 100
-local COFRES_INTERVALO = 10
-local COFRES_PAUSA = 0.1
-local COFRES_LISTA = {
-    { "WoodenChest",   true },
-    { "RareChest",     true },
-    { "EpicChest",     true },
-    { "GoldenChest",   true },
-    { "WhiteChest",    true },
-    { "VoidChest",     true },
-    { "RaidChest",     true },
-    { "InfernoChest",  true },
-    { "MythicalChest", true },
-    { "MythicChest",   true },
-    { "PremiumChest",  true },
-    { "DeluxeChest",   true },
-}
-local COFRES_OPCIONES_CANTIDAD = { 1, 10, 50, 100 }
-local COFRES_OPCIONES_INTERVALO = { 5, 10, 30, 60 }
----------------------------------------------------------------------
--- FIN DE LOS AJUSTES DE COFRES
 ---------------------------------------------------------------------
 
 ---------------------------------------------------------------------
@@ -218,19 +178,8 @@ local evadirMobs = false
 local evasiones = 0
 local ultimaEvasion = 0
 local evadiendo = false
-local abrirCofres = false
-local cofresEnvios = 0
-local cofresIntervalo = COFRES_INTERVALO
-local remotoCofres = nil
-local forzarRonda = false            -- "Abrir ahora"
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
 local dbg = { total = 0, rango = 0, movOk = 0, movFail = 0, motivo = "—" }
-
--- Estado por cofre: { nombre, activo, cantidad }
-local cofres = {}
-for _, c in ipairs(COFRES_LISTA) do
-    table.insert(cofres, { nombre = c[1], activo = c[2] ~= false, cantidad = COFRES_CANTIDAD })
-end
 
 -- Paleta
 local COL_FONDO   = Color3.fromRGB(24, 26, 36)
@@ -239,7 +188,6 @@ local COL_ACENTO  = Color3.fromRGB(80, 170, 255)
 local COL_ON      = Color3.fromRGB(60, 200, 120)
 local COL_OFF     = Color3.fromRGB(90, 94, 115)
 local COL_ROJO    = Color3.fromRGB(220, 75, 80)
-local COL_DORADO  = Color3.fromRGB(240, 180, 60)
 local COL_TEXTO   = Color3.fromRGB(235, 238, 250)
 local COL_SUB     = Color3.fromRGB(150, 156, 180)
 
@@ -500,59 +448,6 @@ local function posicionSegura(enemigos, origen)
         end
     end
     return mejor, mejorDist
-end
-
----------------------------------------------------------------------
--- Cofres
----------------------------------------------------------------------
-local function obtenerRemotoCofres()
-    if remotoCofres and remotoCofres.Parent then return remotoCofres end
-    local ok, r = pcall(function()
-        return ReplicatedStorage.Packages._Index["leifstout_networker@0.3.1"]
-            .networker._remotes.ChestService.RemoteEvent
-    end)
-    if ok and r then
-        remotoCofres = r
-        return r
-    end
-    local ok2, r2 = pcall(function()
-        for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-            if d:IsA("RemoteEvent") and d.Parent and d.Parent.Name == "ChestService" then
-                return d
-            end
-        end
-    end)
-    if ok2 and r2 then
-        remotoCofres = r2
-        return r2
-    end
-    return nil
-end
-
-local function abrirTodosLosCofres()
-    local remoto = obtenerRemotoCofres()
-    if not remoto then
-        dbg.motivo = "cofres: no se encontró el remoto"
-        return false
-    end
-    local enviados = 0
-    for _, c in ipairs(cofres) do
-        if cerrado then break end
-        if c.activo and c.cantidad > 0 then
-            pcall(function()
-                remoto:FireServer("OpenMultipleChests", c.nombre, c.cantidad)
-            end)
-            enviados = enviados + 1
-            if COFRES_PAUSA > 0 then task.wait(COFRES_PAUSA) end
-        end
-    end
-    if enviados == 0 then
-        dbg.motivo = "cofres: ninguno seleccionado"
-        return false
-    end
-    cofresEnvios = cofresEnvios + 1
-    dbg.motivo = string.format("cofres: ronda #%d (%d tipos)", cofresEnvios, enviados)
-    return true
 end
 
 ---------------------------------------------------------------------
@@ -839,7 +734,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "MAYKEL DEV2", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "MAYKEL DEV1", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -90, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
@@ -921,9 +816,8 @@ local function crearPagina(nombre, texto, indice, total)
     return pg
 end
 
-local pgBurbujas = crearPagina("burbujas", "Burbujas", 1, 3)
-local pgMov = crearPagina("mov", "Movimiento", 2, 3)
-local pgCofres = crearPagina("cofres", "Cofres", 3, 3)
+local pgBurbujas = crearPagina("burbujas", "Burbujas", 1, 2)
+local pgMov = crearPagina("mov", "Movimiento", 2, 2)
 
 -- ===== MÓDULO 1: BURBUJAS =====
 crearFilaSwitch(pgBurbujas, 8, "Auto burbujas: OFF", COL_ON, false, function(valor, lbl)
@@ -981,97 +875,15 @@ local lblMovInfo = crearTexto(pgMov, "Huir por daño: " .. (HUIR_AL_RECIBIR_DANO
 lblMovInfo.Size = UDim2.new(1, -28, 0, 18)
 lblMovInfo.Position = UDim2.fromOffset(14, 82)
 
--- ===== MÓDULO 3: COFRES =====
-local filasCofres = {}
-
-crearFilaSwitch(pgCofres, 4, "Abrir cofres: OFF", COL_DORADO, false, function(valor, lbl)
-    abrirCofres = valor
-    lbl.Text = valor and "Abrir cofres: ON" or "Abrir cofres: OFF"
-end)
-
-local btnIntervalo = crearBoton(pgCofres, "", COL_BARRA, UDim2.fromOffset(12, 38), 112, 26, 12)
-local function textoIntervalo() return string.format("Cada %ds", cofresIntervalo) end
-btnIntervalo.Text = textoIntervalo()
-btnIntervalo.MouseButton1Click:Connect(function()
-    local idx = 1
-    for i, v in ipairs(COFRES_OPCIONES_INTERVALO) do
-        if v == cofresIntervalo then idx = i break end
-    end
-    cofresIntervalo = COFRES_OPCIONES_INTERVALO[(idx % #COFRES_OPCIONES_INTERVALO) + 1]
-    btnIntervalo.Text = textoIntervalo()
-end)
-
-local btnAhora = crearBoton(pgCofres, "Abrir ahora", COL_DORADO, UDim2.fromOffset(130, 38), 118, 26, 12)
-btnAhora.TextColor3 = Color3.fromRGB(30, 24, 8)
-btnAhora.MouseButton1Click:Connect(function()
-    forzarRonda = true
-end)
-
-local scroll = Instance.new("ScrollingFrame")
-scroll.Position = UDim2.fromOffset(8, 70)
-scroll.Size = UDim2.new(1, -16, 1, -74)
-scroll.BackgroundColor3 = COL_BARRA
-scroll.BackgroundTransparency = 0.4
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 4
-scroll.ScrollBarImageColor3 = COL_ACENTO
-scroll.CanvasSize = UDim2.fromOffset(0, #cofres * 34 + 6)
-scroll.Parent = pgCofres
-redondear(scroll, 10)
-
-for i, c in ipairs(cofres) do
-    local y = 4 + (i - 1) * 34
-
-    local lbl = crearTexto(scroll, (c.nombre:gsub("Chest$", "")), 13, c.activo and COL_DORADO or COL_SUB)
-    lbl.Size = UDim2.fromOffset(86, 26)
-    lbl.Position = UDim2.fromOffset(8, y)
-
-    local btnCant = crearBoton(scroll, "x" .. c.cantidad, COL_FONDO, UDim2.fromOffset(94, y), 48, 26, 12)
-    btnCant.MouseButton1Click:Connect(function()
-        local idx = 0
-        for k, v in ipairs(COFRES_OPCIONES_CANTIDAD) do
-            if v == c.cantidad then idx = k break end
-        end
-        c.cantidad = COFRES_OPCIONES_CANTIDAD[(idx % #COFRES_OPCIONES_CANTIDAD) + 1]
-        btnCant.Text = "x" .. c.cantidad
-    end)
-
-    local sw = Instance.new("TextButton")
-    sw.Size = UDim2.fromOffset(44, 24)
-    sw.Position = UDim2.new(1, -56, 0, y + 1)
-    sw.BackgroundColor3 = c.activo and COL_DORADO or COL_OFF
-    sw.Text = ""
-    sw.AutoButtonColor = false
-    sw.Parent = scroll
-    redondear(sw, 12)
-
-    local perilla = Instance.new("Frame")
-    perilla.Size = UDim2.fromOffset(18, 18)
-    perilla.Position = UDim2.fromOffset(c.activo and 23 or 3, 3)
-    perilla.BackgroundColor3 = Color3.new(1, 1, 1)
-    perilla.BorderSizePixel = 0
-    perilla.Parent = sw
-    redondear(perilla, 9)
-
-    sw.MouseButton1Click:Connect(function()
-        c.activo = not c.activo
-        local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
-        TweenService:Create(sw, info, { BackgroundColor3 = c.activo and COL_DORADO or COL_OFF }):Play()
-        TweenService:Create(perilla, info, { Position = UDim2.fromOffset(c.activo and 23 or 3, 3) }):Play()
-        lbl.TextColor3 = c.activo and COL_DORADO or COL_SUB
-    end)
-    filasCofres[i] = lbl
-end
-
 ---------------------------------------------------------------------
 -- Pie (visible en todas las pestañas)
 ---------------------------------------------------------------------
-local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0  ·  Cofres: 0", 12, COL_SUB)
+local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0", 12, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 18)
 lblContador.Position = UDim2.new(0, 14, 1, -(PIE_ALTO - 2))
 
 local function actualizarContador()
-    lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d  ·  Cofres: %d", recogidas, evasiones, cofresEnvios)
+    lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d", recogidas, evasiones)
 end
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 11, COL_SUB)
@@ -1127,7 +939,6 @@ local function cerrar()
     activo = false
     moverAleatorio = false
     evadirMobs = false
-    abrirCofres = false
     quitarPlataforma()
     for _, c in ipairs(conexiones) do c:Disconnect() end
     table.clear(conexiones)
@@ -1439,25 +1250,6 @@ task.spawn(function()
             end)
             evadiendo = false
             if not ok then warn("[ERROR huir por daño]", err) end
-        end
-    end
-end)
-
--- Bucle 5: cofres (módulo independiente; no mueve al personaje)
-task.spawn(function()
-    while not cerrado do
-        if abrirCofres or forzarRonda then
-            forzarRonda = false
-            local ok, err = pcall(abrirTodosLosCofres)
-            if not ok then warn("[ERROR cofres]", err) end
-            if actualizarInfo then actualizarInfo() end
-            local t0 = tick()
-            while not cerrado and not forzarRonda and abrirCofres
-                and (tick() - t0) < math.max(1, cofresIntervalo) do
-                task.wait(0.25)
-            end
-        else
-            task.wait(0.25)
         end
     end
 end)
