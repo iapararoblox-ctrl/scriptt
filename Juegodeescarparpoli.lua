@@ -103,7 +103,7 @@ local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la mi
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
 local DISTANCIA_SEGURA = 6           -- si un mob está más cerca que esto, hace TP lejos
 local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
-local INTERVALO_EVASION = 0.1        -- cada cuánto revisa los mobs
+local INTERVALO_EVASION = 0.05        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
