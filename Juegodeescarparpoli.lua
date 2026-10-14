@@ -17,31 +17,31 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 ---------------------------------------------------------------------
 local RADIO = 100000                 -- radio de recolección
 local INTERVALO = 1.5                -- segundos base entre ciclos
-local INTERVALO_JITTER = 0.6         -- ±variación aleatoria
+local INTERVALO_JITTER = 1.2 --0.6 estaba         -- ±variación aleatoria
 local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1, 15       -- burbujas por segundo
+local VEL_MIN, VEL_MAX = 1,  5       -- burbujas por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
 local RADIO_TP = 120                 -- radio de TP aleatorio
 local SEPARACION = 60
 local CANDIDATOS = 60
 
-local PAUSA_CADA = 15                -- cada N burbujas, pausa larga
+local PAUSA_CADA = 8                -- cada N burbujas, pausa larga
 local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
 local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano (no aplica en modo rápido)
 local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
-local MIN_PERMANENCIA = 0.25         -- segundos mínimos sobre la burbuja (para que registre el toque)
+local MIN_PERMANENCIA = 0.35         -- segundos mínimos sobre la burbuja (para que registre el toque)
 
 -- Movimiento hacia las burbujas
 local MOVIMIENTO_SUAVE = true        -- true = desliza con Tween; false = TP instantáneo
-local VELOCIDAD_TWEEN = 300          -- studs por segundo del deslizamiento
+local VELOCIDAD_TWEEN = 100          -- studs por segundo del deslizamiento
 local TWEEN_MAX = 0.5                -- duración máxima de cada desplazamiento (segundos)
-local VELOCIDAD_EVASION = 500        -- studs/s al huir de un mob (más rápido que el normal)
-local EVASION_TWEEN_MAX = 0.35       -- duración máxima de la huida (segundos)
+local VELOCIDAD_EVASION = 200        -- studs/s al huir de un mob (más rápido que el normal)
+local EVASION_TWEEN_MAX = 0.6       -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
