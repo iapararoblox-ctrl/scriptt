@@ -45,7 +45,7 @@ local EVASION_TWEEN_MAX = 0.35       -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
-local DISTANCIA_SEGURA = 25          -- si un mob está más cerca que esto, hace TP lejos
+local DISTANCIA_SEGURA = 7          -- si un mob está más cerca que esto, hace TP lejos
 local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
 local INTERVALO_EVASION = 0.1        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
