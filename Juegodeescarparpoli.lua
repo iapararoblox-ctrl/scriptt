@@ -11,6 +11,11 @@
     - La pausa por movimiento manual usa el joystick (MoveDirection), no cualquier toque
     - Botones más grandes y GUI protegida con gethui() si el ejecutor la tiene
 
+    NOVEDAD 3:
+    - Huir al recibir daño: si el jugador pierde vida, se desplaza solo a otra
+      ubicación con una velocidad propia. Se configura SOLO desde el código
+      (ver "AJUSTES DE VELOCIDAD", puntos 7, 8 y 9). No tiene interruptor en el panel.
+
     NOVEDAD 2:
     - Ya NO hay teletransporte brusco: todos los desplazamientos (ir a burbujas,
       TP aleatorio y huida de mobs) se hacen con movimiento suave, a velocidad
@@ -67,13 +72,29 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 --
 -- 6) VELOCIDAD_HUIDA = lo mismo, pero cuando huye de un mob.
 --      16 = velocidad normal. Si los mobs te alcanzan, súbela (ej. 24).
+--
+-- 7) HUIR_AL_RECIBIR_DANO = true o false.
+--      true  = cuando pierdes vida, te mueves solo a otra ubicación.
+--      false = esta función queda apagada.
+--
+-- 8) VELOCIDAD_HUIDA_DANO = qué tan rápido te mueves al huir por daño
+--      (studs por segundo). Es independiente de todas las demás.
+--      16 = normal, 30 = rápido, 50 = muy rápido.
+--
+-- 9) DANO_MINIMO = cuánta vida tienes que perder de golpe para que huya.
+--      1 = huye con casi cualquier daño.
+--      Si el oxígeno bajo te quita vida poco a poco y eso te hace huir sin
+--      parar, sube este número (ej. 5 o 10) para ignorar esos daños chicos.
 ---------------------------------------------------------------------
 local VELOCIDAD_BURBUJAS = 2         -- burbujas por segundo   <<< CAMBIA ESTE
 local VELOCIDAD_TP = 0.5             -- TPs aleatorios por segundo   <<< CAMBIA ESTE
 local TIEMPO_SOBRE_BURBUJA = 0.35    -- segundos mínimos sobre la burbuja
-local VELOCIDAD_MOV_BURBUJAS = 70    -- studs/s al ir a las burbujas (16 = normal)
-local VELOCIDAD_MOV_TP = 40          -- studs/s en el TP aleatorio (16 = normal)
-local VELOCIDAD_HUIDA = 40           -- studs/s al huir de mobs (16 = normal)
+local VELOCIDAD_MOV_BURBUJAS = 80    -- studs/s al ir a las burbujas (16 = normal)
+local VELOCIDAD_MOV_TP = 50          -- studs/s en el TP aleatorio (16 = normal)
+local VELOCIDAD_HUIDA = 65           -- studs/s al huir de mobs (16 = normal)
+local HUIR_AL_RECIBIR_DANO = true    -- true = huye al perder vida; false = apagado
+local VELOCIDAD_HUIDA_DANO = 100      -- studs/s al huir por daño
+local DANO_MINIMO = 1                -- vida mínima perdida de golpe para activar la huida
 ---------------------------------------------------------------------
 -- FIN DE LOS AJUSTES DE VELOCIDAD
 ---------------------------------------------------------------------
@@ -103,7 +124,7 @@ local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la mi
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
 local DISTANCIA_SEGURA = 6           -- si un mob está más cerca que esto, hace TP lejos
 local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
-local INTERVALO_EVASION = 0.05        -- cada cuánto revisa los mobs
+local INTERVALO_EVASION = 0.02        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
@@ -1061,7 +1082,7 @@ end)
 task.spawn(function()
     while not cerrado do
         task.wait(INTERVALO_EVASION)
-        if not cerrado and evadirMobs and (tick() - ultimaEvasion) >= EVASION_COOLDOWN then
+        if not cerrado and evadirMobs and not evadiendo and (tick() - ultimaEvasion) >= EVASION_COOLDOWN then
             local ok, err = pcall(function()
                 local root = getRoot()
                 local hum = getHumanoid()
@@ -1095,6 +1116,84 @@ task.spawn(function()
             end)
             evadiendo = false
             if not ok then warn("[ERROR evadir mobs]", err) end
+        end
+    end
+end)
+
+-- Bucle 4: huir al recibir daño (se configura SOLO desde el código)
+-- Elige un punto lejos de donde estás y de los mobs, y se mueve hacia allá
+-- con la velocidad VELOCIDAD_HUIDA_DANO.
+local function posicionLejosDe(origen, enemigos)
+    local plano = Vector3.new(origen.X, DESTINO.Y, origen.Z)
+    local mejor, mejorPuntaje = nil, -1
+    for _ = 1, CANDIDATOS do
+        local ang = math.random() * math.pi * 2
+        local dist = math.sqrt(math.random()) * RADIO_TP
+        local cand = DESTINO + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
+        local puntaje = math.min((cand - plano).Magnitude, distanciaMinima(cand, enemigos))
+        if puntaje > mejorPuntaje then
+            mejor, mejorPuntaje = cand, puntaje
+        end
+    end
+    return mejor
+end
+
+task.spawn(function()
+    local humPrev, vidaPrev = nil, 0
+    while not cerrado do
+        task.wait(0.05)
+        if cerrado then break end
+        if HUIR_AL_RECIBIR_DANO then
+            local ok, err = pcall(function()
+                local hum = getHumanoid()
+                if not hum then
+                    humPrev = nil
+                    return
+                end
+                -- personaje nuevo (respawn): reinicia la referencia de vida
+                if hum ~= humPrev then
+                    humPrev, vidaPrev = hum, hum.Health
+                    return
+                end
+
+                local vida = hum.Health
+                local perdida = vidaPrev - vida
+                if vida <= 0 or perdida < DANO_MINIMO or evadiendo then
+                    vidaPrev = vida
+                    return
+                end
+
+                local root = hum.Parent and hum.Parent:FindFirstChild("HumanoidRootPart")
+                if not root then
+                    vidaPrev = vida
+                    return
+                end
+
+                local destino = posicionLejosDe(root.Position, posicionesEnemigos())
+                if not destino then
+                    vidaPrev = vida
+                    return
+                end
+
+                evadiendo = true            -- frena cualquier otro desplazamiento
+                ultimaEvasion = tick()
+                local llego = irAPlataformaSuave(root, destino, {
+                    forzar = true,
+                    velocidad = VELOCIDAD_HUIDA_DANO,
+                    continuar = function() return not cerrado end,
+                })
+                evadiendo = false
+                ultimaEvasion = tick()
+
+                -- el daño recibido durante la huida no cuenta como uno nuevo
+                local h = getHumanoid()
+                vidaPrev = h and h.Health or 0
+                if llego then
+                    dbg.motivo = string.format("huyó por daño (-%.0f vida)", perdida)
+                end
+            end)
+            evadiendo = false
+            if not ok then warn("[ERROR huir por daño]", err) end
         end
     end
 end)
