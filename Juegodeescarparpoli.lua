@@ -25,7 +25,7 @@ local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro
 local VEL_MIN, VEL_MAX = 1,  5       -- burbujas por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
-local RADIO_TP = 120                 -- radio de TP aleatorio
+local RADIO_TP = 180                 -- radio de TP aleatorio
 local SEPARACION = 60
 local CANDIDATOS = 60
 
@@ -40,7 +40,7 @@ local MIN_PERMANENCIA = 0.35         -- segundos mínimos sobre la burbuja (para
 local MOVIMIENTO_SUAVE = true        -- true = desliza con Tween; false = TP instantáneo
 local VELOCIDAD_TWEEN = 100          -- studs por segundo del deslizamiento
 local TWEEN_MAX = 0.5                -- duración máxima de cada desplazamiento (segundos)
-local VELOCIDAD_EVASION = 200        -- studs/s al huir de un mob (más rápido que el normal)
+local VELOCIDAD_EVASION = 100       -- studs/s al huir de un mob (más rápido que el normal)
 local EVASION_TWEEN_MAX = 0.6       -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
