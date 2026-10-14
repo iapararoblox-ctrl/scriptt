@@ -661,7 +661,7 @@ tapa.BackgroundColor3 = COL_BARRA
 tapa.BorderSizePixel = 0
 tapa.Parent = barra
 
-local titulo = crearTexto(barra, "🫧  Auto Burbujas", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "MAYKEL DEV1", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -90, 1, 0)
 titulo.Position = UDim2.fromOffset(14, 0)
 
