@@ -1,5 +1,4 @@
---[[  AAAAAAAH ES MUY FRUSTANTE HACER ESTO
-AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
+--[[  AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
 
     Ya no hay ningún TP: TODO el movimiento (ir a burbujas, moverse al azar,
     evadir mobs, huir por daño y volver al punto base) se hace desplazándose
@@ -11,6 +10,11 @@ AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
       • MOVIMIENTO → movimiento aleatorio y evadir mobs
 
     Velocidades y demás se ajustan en las secciones "AJUSTES" de abajo.
+
+    Secciones marcadas para localizarlas rápido:
+      [CAMBIO 1] burbuja más alejada de los enemigos (con "Evadir mobs")
+      [CAMBIO 2] movimiento aleatorio con sesgo al centro
+      [CAMBIO 3] modo EMERGENCIA cuando el oxígeno baja del 5 %
 --]]
 
 local Players = game:GetService("Players")
@@ -45,6 +49,16 @@ local VELOCIDAD_HUIDA = 65
 local HUIR_AL_RECIBIR_DANO = true
 local VELOCIDAD_HUIDA_DANO = 100
 local DANO_MINIMO = 1
+
+-- [CAMBIO 3] MODO EMERGENCIA (oxígeno crítico)
+-- EMERGENCIA_OXIGENO = % de oxígeno por debajo (o igual) del cual se recolecta
+--                      sí o sí (ignora umbral, "Según oxígeno", pausas, input
+--                      manual y enemigos cerca). Solo actúa con "Auto burbujas" ON.
+-- EMERGENCIA_SALIDA  = % al que debe subir el oxígeno para volver a lo normal
+--                      (99.5 = igual que "recolectando"; pon 6 para salir apenas
+--                      supere el 5 %).
+local EMERGENCIA_OXIGENO = 5
+local EMERGENCIA_SALIDA = 99.5
 ---------------------------------------------------------------------
 -- FIN DE LOS AJUSTES DE VELOCIDAD
 ---------------------------------------------------------------------
@@ -64,6 +78,12 @@ local RADIO_ALEATORIO = 300
 local SEPARACION = 60
 local CANDIDATOS = 60
 
+-- [CAMBIO 2] Movimiento aleatorio inteligente
+local SESGO_CENTRO = 0.8     -- si el jugador está a más de RADIO_ALEATORIO * esto del centro, vuelve hacia él
+local SESGO_ANGULO = 45      -- grados de dispersión alrededor de la dirección al centro
+local MAX_VISITADOS = 12     -- máximo de puntos recordados en "visitados"
+local CAIDA_MAXIMA = 30      -- studs: no elegir destinos más bajos que esto respecto al jugador
+
 local PAUSA_CADA = 8
 local PAUSA_MIN, PAUSA_MAX = 4, 9
 local BURBUJAS_POR_CICLO = 3
@@ -72,8 +92,8 @@ local BURBUJA_ENFRIAMIENTO = 1
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"
-local DISTANCIA_SEGURA = 15
-local INTERVALO_EVASION = 0.01
+local DISTANCIA_SEGURA = 6
+local INTERVALO_EVASION = 0.02
 local EVASION_COOLDOWN = 0.3
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
@@ -102,6 +122,7 @@ local evadirMobs = false
 local evasiones = 0
 local ultimaEvasion = 0
 local evadiendo = false
+local emergencia = false          -- [CAMBIO 3]
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
 local dbg = { total = 0, rango = 0, movOk = 0, movFail = 0, motivo = "—" }
 
@@ -160,7 +181,28 @@ local function leerOxigeno()
     return ox, mx
 end
 
+-- [CAMBIO 3] Detecta / mantiene el modo emergencia (histéresis: entra en
+-- EMERGENCIA_OXIGENO, sale en EMERGENCIA_SALIDA). Solo cuenta con auto burbujas ON.
+local function actualizarEmergencia()
+    local antes = emergencia
+    local ox, mx = leerOxigeno()
+    if not activo or not ox then
+        emergencia = false
+    else
+        local pct = ox / mx * 100
+        if emergencia then
+            if pct >= EMERGENCIA_SALIDA then emergencia = false end
+        elseif pct <= EMERGENCIA_OXIGENO then
+            emergencia = true
+        end
+    end
+    if emergencia and not antes then pausaHasta = 0 end -- cancela cualquier pausa humana
+    if antes ~= emergencia and actualizarInfo then actualizarInfo() end
+    return emergencia
+end
+
 local function debeRecolectar()
+    if actualizarEmergencia() then return true end -- [CAMBIO 3] emergencia: recolecta sí o sí
     if not controlOxigeno then return true end
     local ox, mx = leerOxigeno()
     if not ox then return true end
@@ -276,12 +318,18 @@ local function desplazar(root, destino, vel, seguirPlataforma, continuar)
     end
 end
 
+-- [CAMBIO 3] En emergencia se usa la velocidad más alta disponible
+local function velocidadEmergencia()
+    return math.max(VELOCIDAD_HUIDA, VELOCIDAD_HUIDA_DANO)
+end
+
 -- Ir hacia una burbuja
 local function desplazarA(root, destino, obj)
     if not root or not root.Parent then return false end
     if evadiendo or not estadoSeguro() then return false end
 
-    local llego = desplazar(root, destino, VELOCIDAD_MOV_BURBUJAS, false, function()
+    local vel = emergencia and velocidadEmergencia() or VELOCIDAD_MOV_BURBUJAS
+    local llego = desplazar(root, destino, vel, false, function()
         return activo and not evadiendo and (not obj or obj.Parent ~= nil)
     end)
     if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
@@ -305,6 +353,46 @@ local function irAPlataformaSuave(root, destino, opc)
     return llego
 end
 
+-- [CAMBIO 2] Candidato alrededor de DESTINO. Si el jugador está lejos del
+-- centro (> RADIO_ALEATORIO * SESGO_CENTRO) el punto se genera EN DIRECCIÓN al
+-- centro (con algo de dispersión) y más cerca de él, para que vuelva a la zona.
+local function generarCandidato(origen)
+    local plano = origen and Vector3.new(origen.X, DESTINO.Y, origen.Z) or DESTINO
+    local aCentro = DESTINO - plano
+    local distCentro = aCentro.Magnitude
+
+    if distCentro > RADIO_ALEATORIO * SESGO_CENTRO then
+        local dir = aCentro.Unit
+        local ang = (math.random() * 2 - 1) * math.rad(SESGO_ANGULO)
+        local c, sn = math.cos(ang), math.sin(ang)
+        local rotada = Vector3.new(dir.X * c - dir.Z * sn, 0, dir.X * sn + dir.Z * c)
+        local paso = distCentro * (0.4 + math.random() * 0.5)
+        local cand = plano + rotada * paso
+        local desdeCentro = cand - DESTINO
+        if desdeCentro.Magnitude > RADIO_ALEATORIO then
+            cand = DESTINO + desdeCentro.Unit * RADIO_ALEATORIO
+        end
+        return cand
+    end
+
+    local ang = math.random() * math.pi * 2
+    local dist = math.sqrt(math.random()) * RADIO_ALEATORIO
+    return DESTINO + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
+end
+
+-- [CAMBIO 2] "Picado vertical": descarta destinos muy por debajo del jugador
+local function candidatoValido(cand, origen)
+    return not origen or (origen.Y - cand.Y) <= CAIDA_MAXIMA
+end
+
+-- Si ningún candidato fue válido, se sube el destino para no quedar cayendo
+local function ajustarAltura(cand, origen)
+    if origen and (origen.Y - cand.Y) > CAIDA_MAXIMA then
+        return Vector3.new(cand.X, origen.Y - CAIDA_MAXIMA, cand.Z)
+    end
+    return cand
+end
+
 local function posicionAleatoria(origen)
     if #visitados == 0 and origen then
         table.insert(visitados, Vector3.new(origen.X, DESTINO.Y, origen.Z))
@@ -313,23 +401,29 @@ local function posicionAleatoria(origen)
     for pasada = 1, 2 do
         local mejorDist = -1
         for _ = 1, CANDIDATOS do
-            local ang = math.random() * math.pi * 2
-            local dist = math.sqrt(math.random()) * RADIO_ALEATORIO
-            local cand = DESTINO + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
-            local minD = math.huge
-            for _, v in ipairs(visitados) do
-                local d = (v - cand).Magnitude
-                if d < minD then minD = d end
-            end
-            if minD > mejorDist then
-                mejor, mejorDist = cand, minD
+            local cand = generarCandidato(origen)
+            if candidatoValido(cand, origen) then
+                local minD = math.huge
+                for _, v in ipairs(visitados) do
+                    local d = (v - cand).Magnitude
+                    if d < minD then minD = d end
+                end
+                if minD > mejorDist then
+                    mejor, mejorDist = cand, minD
+                end
             end
         end
-        if mejorDist >= SEPARACION or pasada == 2 then break end
+        if (mejor and mejorDist >= SEPARACION) or pasada == 2 then break end
         local ultimo = visitados[#visitados]
         visitados = ultimo and { ultimo } or {}
     end
+    if not mejor then
+        mejor = ajustarAltura(generarCandidato(origen), origen)
+    end
     table.insert(visitados, mejor)
+    while #visitados > MAX_VISITADOS do
+        table.remove(visitados, 1)
+    end
     return mejor
 end
 
@@ -361,16 +455,22 @@ local function distanciaMinima(punto, enemigos)
     return minD
 end
 
+-- [CAMBIO 2] Elige, entre CANDIDATOS puntos (con el mismo sesgo al centro y el
+-- filtro de caída), el de MAYOR distancia al enemigo más cercano.
 local function posicionSegura(enemigos, origen)
     local mejor, mejorDist = nil, -1
     for _ = 1, CANDIDATOS do
-        local ang = math.random() * math.pi * 2
-        local dist = math.sqrt(math.random()) * RADIO_ALEATORIO
-        local cand = DESTINO + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
-        local minD = distanciaMinima(cand, enemigos)
-        if minD > mejorDist then
-            mejor, mejorDist = cand, minD
+        local cand = generarCandidato(origen)
+        if candidatoValido(cand, origen) then
+            local minD = distanciaMinima(cand, enemigos)
+            if minD > mejorDist then
+                mejor, mejorDist = cand, minD
+            end
         end
+    end
+    if not mejor then
+        mejor = ajustarAltura(generarCandidato(origen), origen)
+        mejorDist = distanciaMinima(mejor, enemigos)
     end
     return mejor, mejorDist
 end
@@ -945,7 +1045,8 @@ actualizarInfo = function()
         barraOxFill.Size = UDim2.fromScale(0, 1)
     else
         local estado
-        if not activo then estado = "inactivo"
+        if emergencia then estado = "EMERGENCIA"
+        elseif not activo then estado = "inactivo"
         elseif not controlOxigeno then estado = "continuo"
         elseif recolectando then estado = "recolectando"
         else estado = "en espera" end
@@ -956,7 +1057,9 @@ actualizarInfo = function()
     punto.BackgroundColor3 = (activo or moverAleatorio or evadirMobs) and COL_ON or COL_OFF
 
     local base
-    if tick() < pausaHasta then
+    if emergencia then
+        base = "EMERGENCIA"
+    elseif tick() < pausaHasta then
         base = string.format("pausa %.1fs", pausaHasta - tick())
     else
         base = activo and "activo" or "inactivo"
@@ -1025,12 +1128,21 @@ end)
 -- Lógica principal
 ---------------------------------------------------------------------
 local function esRapido()
-    return controlOxigeno and recolectando
+    return emergencia or (controlOxigeno and recolectando) -- [CAMBIO 3]
+end
+
+-- [CAMBIO 3] Espera la pausa humana, pero se corta al entrar en emergencia
+local function esperarPausa(segundos)
+    local fin = tick() + segundos
+    while not cerrado and tick() < fin do
+        if actualizarEmergencia() then break end
+        task.wait(0.1)
+    end
 end
 
 local function recogerBurbujas()
     if not debeRecolectar() then dbg.motivo = "oxígeno alto: en espera"; return end
-    if tick() < pausaHasta then dbg.motivo = "pausa"; return end
+    if not emergencia and tick() < pausaHasta then dbg.motivo = "pausa"; return end
 
     local root = getRoot()
     if not root or not root.Parent then dbg.motivo = "sin personaje"; return end
@@ -1061,7 +1173,9 @@ local function recogerBurbujas()
         if not root or not root.Parent then break end
         local origen = root.Position
 
-        local enemigos = evadirMobs and posicionesEnemigos() or {}
+        -- [CAMBIO 1] / [CAMBIO 3] en emergencia se ignoran los enemigos
+        local evitar = evadirMobs and not emergencia
+        local enemigos = evitar and posicionesEnemigos() or {}
 
         local lista = {}
         local total, enRango = 0, 0
@@ -1074,14 +1188,24 @@ local function recogerBurbujas()
                     enRango = enRango + 1
                     local ultima = visitaBurbuja[bubble]
                     local libre = not ultima or (tick() - ultima) >= BURBUJA_ENFRIAMIENTO
-                    local segura = #enemigos == 0 or distanciaMinima(pos, enemigos) > DISTANCIA_SEGURA
+                    -- [CAMBIO 1] distancia al enemigo más cercano (huge si no hay)
+                    local dEnemigo = #enemigos > 0 and distanciaMinima(pos, enemigos) or math.huge
+                    local segura = dEnemigo > DISTANCIA_SEGURA
                     if libre and segura then
-                        table.insert(lista, { obj = bubble, pos = pos, d = d })
+                        table.insert(lista, { obj = bubble, pos = pos, d = d, dEnemigo = dEnemigo, segura = segura })
                     end
                 end
             end
         end
-        table.sort(lista, function(x, y) return x.d < y.d end)
+        -- [CAMBIO 1] Con evadirMobs: primero seguras, luego la más lejos de los
+        -- enemigos, y de desempate la más cercana al jugador. Sin evadirMobs: solo por d.
+        table.sort(lista, function(x, y)
+            if evitar then
+                if x.segura ~= y.segura then return x.segura end
+                if x.dEnemigo ~= y.dEnemigo then return x.dEnemigo > y.dEnemigo end
+            end
+            return x.d < y.d
+        end)
 
         dbg.total, dbg.rango = total, enRango
         if #lista == 0 then
@@ -1097,7 +1221,7 @@ local function recogerBurbujas()
         for _, item in ipairs(lista) do
             if not activo then break end
             if not debeRecolectar() then break end
-            if tick() < pausaHasta then break end
+            if not emergencia and tick() < pausaHasta then break end
             if hechas >= limite then break end
             if not item.obj.Parent then continue end
 
@@ -1106,30 +1230,28 @@ local function recogerBurbujas()
 
             local pos = posBurbuja(item.obj) or item.pos
 
-            if evadirMobs then
-                local en = posicionesEnemigos()
-                if #en > 0 and distanciaMinima(pos, en) <= DISTANCIA_SEGURA then
-                    continue
-                end
-            end
-
             if desplazarA(root, pos, item.obj) then
                 visitaBurbuja[item.obj] = tick()
                 recogidas = recogidas + 1
                 hechas = hechas + 1
                 enPasada = enPasada + 1
                 dbg.movOk = dbg.movOk + 1
-                dbg.motivo = "recolectando"
+                dbg.motivo = emergencia and "EMERGENCIA: recolectando" or "recolectando"
                 actualizarContador()
 
-                local espera = math.max(1 / velocidad, MIN_PERMANENCIA)
-                task.wait(humanDelay(espera, espera * (rapido and 0.1 or 0.3)))
+                if emergencia then
+                    -- [CAMBIO 3] velocidad máxima: solo el tiempo mínimo sobre la burbuja
+                    task.wait(MIN_PERMANENCIA)
+                else
+                    local espera = math.max(1 / velocidad, MIN_PERMANENCIA)
+                    task.wait(humanDelay(espera, espera * (rapido and 0.1 or 0.3)))
+                end
 
                 if not rapido and recogidas % PAUSA_CADA == 0 then
                     local p = math.random() * (PAUSA_MAX - PAUSA_MIN) + PAUSA_MIN
                     pausaHasta = tick() + p
                     if actualizarInfo then actualizarInfo() end
-                    task.wait(p)
+                    esperarPausa(p)
                 end
             else
                 dbg.movFail = dbg.movFail + 1
@@ -1142,7 +1264,7 @@ local function recogerBurbujas()
     root = getRoot()
     if activo and hechas > 0 and not moverAleatorio and root and root.Parent then
         irAPlataformaSuave(root, DESTINO, {
-            velocidad = VELOCIDAD_MOV_BURBUJAS,
+            velocidad = emergencia and velocidadEmergencia() or VELOCIDAD_MOV_BURBUJAS,
             continuar = function() return activo and not moverAleatorio and not evadiendo end,
         })
     end
@@ -1151,12 +1273,16 @@ end
 -- Bucle 1: auto burbujas
 task.spawn(function()
     while not cerrado do
-        if controlOxigeno then
+        if emergencia then
+            task.wait(0.05) -- [CAMBIO 3] sin esperas largas en emergencia
+        elseif controlOxigeno then
             task.wait(0.3 + math.random() * 0.2)
         else
             task.wait(humanDelay(INTERVALO, INTERVALO_JITTER))
         end
-        if not cerrado and activo and tick() >= pausaHasta then
+        local okE, enEmergencia = pcall(actualizarEmergencia)
+        if not okE then enEmergencia = false end
+        if not cerrado and activo and (enEmergencia or tick() >= pausaHasta) then
             ocupado = true
             local ok, err = pcall(recogerBurbujas)
             ocupado = false
@@ -1195,7 +1321,7 @@ end)
 task.spawn(function()
     while not cerrado do
         task.wait(INTERVALO_EVASION)
-        if not cerrado and evadirMobs and not evadiendo and (tick() - ultimaEvasion) >= EVASION_COOLDOWN then
+        if not cerrado and evadirMobs and not emergencia and not evadiendo and (tick() - ultimaEvasion) >= EVASION_COOLDOWN then
             local ok, err = pcall(function()
                 local root = getRoot()
                 local hum = getHumanoid()
