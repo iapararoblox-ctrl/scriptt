@@ -11,7 +11,12 @@
     - La pausa por movimiento manual usa el joystick (MoveDirection), no cualquier toque
     - Botones más grandes y GUI protegida con gethui() si el ejecutor la tiene
 
-    NOVEDAD:
+    NOVEDAD 2:
+    - Ya NO hay teletransporte brusco: todos los desplazamientos (ir a burbujas,
+      TP aleatorio y huida de mobs) se hacen con movimiento suave, a velocidad
+      normal de caminata. La velocidad se cambia en "AJUSTES DE VELOCIDAD".
+
+    NOVEDAD 1:
     - La velocidad de recolección y la velocidad del TP aleatorio YA NO tienen
       slider: el jugador no puede cambiarlas. Solo se ajustan aquí abajo, en
       la sección "AJUSTES DE VELOCIDAD".
@@ -50,10 +55,25 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 --      pongas VELOCIDAD_BURBUJAS = 10.
 --      Si quieres ir más rápido, baja este número (por ejemplo 0.2),
 --      pero si las burbujas dejan de contarse, vuelve a subirlo.
+--
+-- 4) VELOCIDAD_MOV_BURBUJAS = qué tan rápido se desplaza el personaje al ir
+--      a una burbuja (en studs por segundo). También se usa para volver al
+--      punto de descanso después de recoger burbujas.
+--      16 = velocidad NORMAL de caminata de Roblox.
+--      Más alto = se mueve más rápido; más bajo = más lento.
+--
+-- 5) VELOCIDAD_MOV_TP = lo mismo, pero SOLO para el TP aleatorio.
+--      Es independiente de la anterior: puedes poner una distinta.
+--
+-- 6) VELOCIDAD_HUIDA = lo mismo, pero cuando huye de un mob.
+--      16 = velocidad normal. Si los mobs te alcanzan, súbela (ej. 24).
 ---------------------------------------------------------------------
-local VELOCIDAD_BURBUJAS = 3         -- burbujas por segundo   <<< CAMBIA ESTE
-local VELOCIDAD_TP = 0.4             -- TPs aleatorios por segundo   <<< CAMBIA ESTE
+local VELOCIDAD_BURBUJAS = 2         -- burbujas por segundo   <<< CAMBIA ESTE
+local VELOCIDAD_TP = 0.5             -- TPs aleatorios por segundo   <<< CAMBIA ESTE
 local TIEMPO_SOBRE_BURBUJA = 0.35    -- segundos mínimos sobre la burbuja
+local VELOCIDAD_MOV_BURBUJAS = 70    -- studs/s al ir a las burbujas (16 = normal)
+local VELOCIDAD_MOV_TP = 40          -- studs/s en el TP aleatorio (16 = normal)
+local VELOCIDAD_HUIDA = 40           -- studs/s al huir de mobs (16 = normal)
 ---------------------------------------------------------------------
 -- FIN DE LOS AJUSTES DE VELOCIDAD
 ---------------------------------------------------------------------
@@ -78,13 +98,6 @@ local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
 local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano con el joystick (no aplica en modo rápido)
 local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
-
--- Movimiento hacia las burbujas
-local MOVIMIENTO_SUAVE = false       -- true = desliza; false = TP instantáneo
-local VELOCIDAD_TWEEN = 100          -- studs por segundo del deslizamiento
-local TWEEN_MAX = 0.8                  -- duración máxima de cada desplazamiento (segundos)
-local VELOCIDAD_EVASION = 70         -- studs/s al huir de un mob (más rápido que el normal)
-local EVASION_TWEEN_MAX = 0.6        -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
@@ -278,14 +291,13 @@ local function deslizar(root, meta, dur, platDestino, continuar)
     end
 end
 
-local function duracionPara(dist, rapido)
-    local vel = rapido and VELOCIDAD_EVASION or VELOCIDAD_TWEEN
-    local tope = rapido and EVASION_TWEEN_MAX or TWEEN_MAX
-    return math.clamp(dist / vel, 0.08, tope)
+local function duracionPara(dist, vel)
+    return math.max(dist / math.max(vel, 1), 0.03)
 end
 
--- Ir a una burbuja (suave o instantáneo según MOVIMIENTO_SUAVE).
-local function teleportarA(root, destino)
+-- Ir a una burbuja caminando (deslizando) a velocidad normal. Sin TP brusco.
+-- obj: la burbuja; si desaparece mientras se camina, se cancela el trayecto.
+local function teleportarA(root, destino, obj)
     if not root or not root.Parent then return false end
     if evadiendo or not estadoSeguro() then return false end
 
@@ -293,45 +305,23 @@ local function teleportarA(root, destino)
     local meta = CFrame.new(destino) * rot
     local dist = (root.Position - destino).Magnitude
 
-    if not MOVIMIENTO_SUAVE or dist < 4 then
-        root.CFrame = meta
-        local v = root.AssemblyLinearVelocity
-        root.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
-        return true
-    end
-
-    local llego = deslizar(root, meta, duracionPara(dist), nil, function() return activo and not evadiendo end)
+    local llego = deslizar(root, meta, duracionPara(dist, VELOCIDAD_MOV_BURBUJAS), nil, function()
+        return activo and not evadiendo and (not obj or obj.Parent ~= nil)
+    end)
     if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
     return llego
 end
 
--- Coloca la plataforma Y el personaje encima en el mismo instante (sin yield).
--- forzar = true ignora el estado del personaje (se usa para huir de mobs).
-local function irAPlataforma(root, destino, forzar)
-    if not root or not root.Parent then return false end
-    if not forzar and not estadoSeguro() then return false end
-
-    crearPlataforma(destino)
-
-    local rot = root.CFrame - root.CFrame.Position
-    root.CFrame = CFrame.new(destino) * rot
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-    return true
-end
-
--- Igual que irAPlataforma pero deslizando personaje y plataforma juntos.
+-- Desliza personaje y plataforma juntos hasta "destino", a velocidad normal.
 -- opc.continuar: función que decide si el deslizamiento sigue
 -- opc.rapido: usa la velocidad de huida   opc.forzar: ignora el estado del personaje
+-- opc.velocidad: velocidad en studs/s (si no se indica, usa la del TP aleatorio)
 local function irAPlataformaSuave(root, destino, opc)
     opc = opc or {}
     if not root or not root.Parent then return false end
     if not opc.forzar and not estadoSeguro() then return false end
 
     local dist = (root.Position - destino).Magnitude
-    if not MOVIMIENTO_SUAVE or dist < 4 then
-        return irAPlataforma(root, destino, opc.forzar)
-    end
 
     crearPlataforma(root.Position) -- plataforma bajo los pies antes de empezar
     local rot = root.CFrame - root.CFrame.Position
@@ -341,7 +331,8 @@ local function irAPlataformaSuave(root, destino, opc)
         return tpAleatorio and not ocupado and not evadiendo
     end
 
-    local llego = deslizar(root, meta, duracionPara(dist, opc.rapido), platDestino, continuar)
+    local vel = opc.velocidad or (opc.rapido and VELOCIDAD_HUIDA) or VELOCIDAD_MOV_TP
+    local llego = deslizar(root, meta, duracionPara(dist, vel), platDestino, continuar)
     if root.Parent then root.AssemblyLinearVelocity = Vector3.zero end
     return llego
 end
@@ -984,7 +975,7 @@ local function recogerBurbujas()
                 end
             end
 
-            if teleportarA(root, pos) then
+            if teleportarA(root, pos, item.obj) then
                 visitaBurbuja[item.obj] = tick()
                 recogidas = recogidas + 1
                 hechas = hechas + 1
@@ -1015,6 +1006,7 @@ local function recogerBurbujas()
     root = getRoot()
     if activo and hechas > 0 and not tpAleatorio and root and root.Parent then
         irAPlataformaSuave(root, DESTINO, {
+            velocidad = VELOCIDAD_MOV_BURBUJAS,
             continuar = function() return activo and not tpAleatorio and not evadiendo end,
         })
     end
@@ -1037,7 +1029,7 @@ task.spawn(function()
     end
 end)
 
--- Bucle 2: TP aleatorio (independiente del interruptor principal)
+-- Bucle 2: TP aleatorio, ahora con movimiento suave (independiente del interruptor principal)
 -- Su ritmo lo marca SOLO la variable VELOCIDAD_TP (arriba, en AJUSTES DE VELOCIDAD)
 task.spawn(function()
     while not cerrado do
