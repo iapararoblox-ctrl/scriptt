@@ -1,15 +1,13 @@
---[[  AUTO BURBUJAS (versión móvil)
+--[[  AUTO BURBUJAS (versión móvil + PC)
     - Auto recolección de burbujas según el nivel de oxígeno
     - TP aleatorio sin repetir ubicaciones
     - Evadir mobs: si un enemigo se acerca, hace TP a una zona lejos de él
+    - Abrir cofres (NUEVO)
 
-    Cambios para teléfono:
-    - Panel con UIScale: se ajusta solo al tamaño de la pantalla (vertical/horizontal)
-    - Se puede arrastrar sin salirse de la pantalla; se vuelve a acomodar al girar el teléfono
-    - Cada fila de interruptor se activa tocando en cualquier parte de la fila
-    - Slider de oxígeno con zona táctil grande y seguimiento de UN solo dedo
-    - La pausa por movimiento manual usa el joystick (MoveDirection), no cualquier toque
-    - Botones más grandes y GUI protegida con gethui() si el ejecutor la tiene
+    NOVEDAD 4:
+    - Módulo "Abrir cofres": interruptor en el panel (funciona con toque en
+      teléfono y con clic en PC). Al activarlo abre TODOS los cofres de la lista
+      y repite cada cierto tiempo. Se configura en "AJUSTES DE COFRES" (abajo).
 
     NOVEDAD 3:
     - Huir al recibir daño: si el jugador pierde vida, se desplaza solo a otra
@@ -31,6 +29,7 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -100,6 +99,40 @@ local DANO_MINIMO = 1                -- vida mínima perdida de golpe para activ
 ---------------------------------------------------------------------
 
 ---------------------------------------------------------------------
+-- ╔═══════════════════════════════════════════════════════════════╗
+-- ║                AJUSTES DE COFRES (EDITA AQUÍ)                 ║
+-- ╚═══════════════════════════════════════════════════════════════╝
+-- 10) COFRES_CANTIDAD = cuántos cofres abre de cada tipo en cada envío.
+--       100 = abre hasta 100 de cada cofre.
+--
+-- 11) COFRES_INTERVALO = cada cuántos segundos repite el envío mientras el
+--       interruptor "Abrir cofres" esté en ON.
+--       10 = cada 10 segundos. Si quieres que sea más seguido, baja el número.
+--
+-- 12) COFRES_LISTA = los nombres de los cofres que va a abrir.
+--       Para quitar uno, borra su línea (o ponle -- delante).
+---------------------------------------------------------------------
+local COFRES_CANTIDAD = 100          -- cofres por tipo en cada envío   <<< CAMBIA ESTE
+local COFRES_INTERVALO = 10          -- segundos entre envíos   <<< CAMBIA ESTE
+local COFRES_LISTA = {
+    "WoodenChest",
+    "RareChest",
+    "EpicChest",
+    "GoldenChest",
+    "WhiteChest",
+    "VoidChest",
+    "RaidChest",
+    "InfernoChest",
+    "MythicalChest",
+    "MythicChest",
+    "PremiumChest",
+    "DeluxeChest",
+}
+---------------------------------------------------------------------
+-- FIN DE LOS AJUSTES DE COFRES
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
 -- Configuración general (no hace falta tocar)
 ---------------------------------------------------------------------
 local RADIO = 100000                 -- radio de recolección
@@ -128,7 +161,7 @@ local INTERVALO_EVASION = 0.02        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
-local PANEL_W, PANEL_H = 260, 326
+local PANEL_W, PANEL_H = 260, 362
 local BURBUJA_TAM = 56
 
 -- Estado
@@ -154,6 +187,9 @@ local evadirMobs = false
 local evasiones = 0
 local ultimaEvasion = 0
 local evadiendo = false
+local abrirCofres = false            -- interruptor del módulo de cofres
+local cofresEnvios = 0               -- cuántos envíos de cofres se han hecho
+local remotoCofres = nil
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
 local dbg = { total = 0, rango = 0, tpOk = 0, tpFail = 0, motivo = "—" }
 
@@ -164,6 +200,7 @@ local COL_ACENTO  = Color3.fromRGB(80, 170, 255)
 local COL_ON      = Color3.fromRGB(60, 200, 120)
 local COL_OFF     = Color3.fromRGB(90, 94, 115)
 local COL_ROJO    = Color3.fromRGB(220, 75, 80)
+local COL_DORADO  = Color3.fromRGB(240, 180, 60)
 local COL_TEXTO   = Color3.fromRGB(235, 238, 250)
 local COL_SUB     = Color3.fromRGB(150, 156, 180)
 
@@ -430,6 +467,43 @@ local function posicionSegura(enemigos, origen)
         end
     end
     return mejor, mejorDist
+end
+
+---------------------------------------------------------------------
+-- Cofres
+---------------------------------------------------------------------
+-- Busca el RemoteEvent de los cofres. Si la ruta no existe (el juego se
+-- actualizó, por ejemplo), devuelve nil en vez de romper el script.
+local function obtenerRemotoCofres()
+    if remotoCofres and remotoCofres.Parent then return remotoCofres end
+    local ok, r = pcall(function()
+        return ReplicatedStorage.Packages._Index["leifstout_networker@0.3.1"]
+            .networker._remotes.ChestService.RemoteEvent
+    end)
+    if ok and r then
+        remotoCofres = r
+        return r
+    end
+    return nil
+end
+
+-- Envía la orden de abrir cada tipo de cofre (todos a la vez).
+local function abrirTodosLosCofres()
+    local remoto = obtenerRemotoCofres()
+    if not remoto then
+        dbg.motivo = "cofres: no se encontró el remoto"
+        return false
+    end
+    for _, nombre in ipairs(COFRES_LISTA) do
+        task.spawn(function()
+            pcall(function()
+                remoto:FireServer("OpenMultipleChests", nombre, COFRES_CANTIDAD)
+            end)
+        end)
+    end
+    cofresEnvios = cofresEnvios + 1
+    dbg.motivo = string.format("cofres enviados (#%d)", cofresEnvios)
+    return true
 end
 
 ---------------------------------------------------------------------
@@ -807,9 +881,15 @@ sliderUmbral = crearSlider(panel, 206, {
 -- (Los sliders de velocidad de burbujas y de TP aleatorio fueron eliminados:
 --  ahora se ajustan solo desde la sección "AJUSTES DE VELOCIDAD" al inicio.)
 
+-- Módulo de cofres: toda la fila responde al toque (teléfono) o al clic (PC)
+crearFilaSwitch(panel, 264, "Abrir cofres: OFF", COL_DORADO, false, function(valor, lbl)
+    abrirCofres = valor
+    lbl.Text = valor and "Abrir cofres: ON" or "Abrir cofres: OFF"
+end)
+
 local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 268)
+lblContador.Position = UDim2.fromOffset(14, 304)
 
 local function actualizarContador()
     lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d", recogidas, evasiones)
@@ -817,7 +897,7 @@ end
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 12, COL_SUB)
 lblEstado.Size = UDim2.new(1, -28, 0, 32)
-lblEstado.Position = UDim2.fromOffset(14, 290)
+lblEstado.Position = UDim2.fromOffset(14, 326)
 lblEstado.TextWrapped = true
 lblEstado.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -866,6 +946,7 @@ local function cerrar()
     activo = false
     tpAleatorio = false
     evadirMobs = false
+    abrirCofres = false
     quitarPlataforma()
     for _, c in ipairs(conexiones) do c:Disconnect() end
     table.clear(conexiones)
@@ -1194,6 +1275,25 @@ task.spawn(function()
             end)
             evadiendo = false
             if not ok then warn("[ERROR huir por daño]", err) end
+        end
+    end
+end)
+
+-- Bucle 5: abrir cofres (independiente del resto; no mueve al personaje)
+-- Cada COFRES_INTERVALO segundos envía la orden mientras el interruptor esté en ON.
+task.spawn(function()
+    while not cerrado do
+        if abrirCofres then
+            local ok, err = pcall(abrirTodosLosCofres)
+            if not ok then warn("[ERROR cofres]", err) end
+            if actualizarInfo then actualizarInfo() end
+            -- espera el intervalo, pero se corta enseguida si se apaga el interruptor
+            local t0 = tick()
+            while not cerrado and abrirCofres and (tick() - t0) < math.max(1, COFRES_INTERVALO) do
+                task.wait(0.25)
+            end
+        else
+            task.wait(0.25)
         end
     end
 end)
