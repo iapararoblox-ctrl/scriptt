@@ -1,4 +1,5 @@
---[[  AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
+--[[  AAAAAAAH ES MUY FRUSTANTE HACER ESTO
+AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
 
     Ya no hay ningún TP: TODO el movimiento (ir a burbujas, moverse al azar,
     evadir mobs, huir por daño y volver al punto base) se hace desplazándose
