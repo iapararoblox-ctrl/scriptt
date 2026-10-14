@@ -974,5 +974,3 @@ task.spawn(function()
         if actualizarInfo then actualizarInfo() end
     end
 end)
-
-end -- fin de startMainScript
