@@ -22,7 +22,7 @@ local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1, 5      -- burbujas por segundo
+local VEL_MIN, VEL_MAX = 1, 15       -- burbujas por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
 local RADIO_TP = 120                 -- radio de TP aleatorio
@@ -45,7 +45,7 @@ local EVASION_TWEEN_MAX = 0.35       -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
-local DISTANCIA_SEGURA = 7          -- si un mob está más cerca que esto, hace TP lejos
+local DISTANCIA_SEGURA = 25          -- si un mob está más cerca que esto, hace TP lejos
 local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
 local INTERVALO_EVASION = 0.1        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
@@ -605,13 +605,23 @@ burbuja.Size = UDim2.fromOffset(52, 52)
 burbuja.Position = panel.Position
 burbuja.BackgroundColor3 = COL_ACENTO
 burbuja.BackgroundTransparency = 0.15
-burbuja.Text = "🫧"
-burbuja.TextSize = 26
+burbuja.Text = ""
 burbuja.AutoButtonColor = false
 burbuja.Visible = false
 burbuja.Parent = gui
 redondear(burbuja, 26)
 borde(burbuja, Color3.new(1, 1, 1), 2, 0.4)
+
+-- Imagen de la burbuja (el fondo detrás sigue marcando ON/OFF: azul / verde)
+local imagenBurbuja = Instance.new("ImageLabel")
+imagenBurbuja.Name = "Imagen"
+imagenBurbuja.AnchorPoint = Vector2.new(0.5, 0.5)
+imagenBurbuja.Position = UDim2.fromScale(0.5, 0.5)
+imagenBurbuja.Size = UDim2.fromScale(0.82, 0.82)
+imagenBurbuja.BackgroundTransparency = 1
+imagenBurbuja.Image = "rbxassetid://121465979557016"
+imagenBurbuja.ScaleType = Enum.ScaleType.Fit
+imagenBurbuja.Parent = burbuja
 
 crearFilaSwitch(panel, 48, "Auto burbujas: OFF", COL_ON, false, function(valor, lbl)
     activo = valor
