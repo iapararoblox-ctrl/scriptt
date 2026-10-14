@@ -617,10 +617,10 @@ local imagenBurbuja = Instance.new("ImageLabel")
 imagenBurbuja.Name = "Imagen"
 imagenBurbuja.AnchorPoint = Vector2.new(0.5, 0.5)
 imagenBurbuja.Position = UDim2.fromScale(0.5, 0.5)
-imagenBurbuja.Size = UDim2.fromScale(1,1)
+imagenBurbuja.Size = UDim2.fromScale(1, 1) -- Aumentado al 100%
 imagenBurbuja.BackgroundTransparency = 1
-imagenBurbuja.Image = "rbxassetid://86998528745950"
-imagenBurbuja.ScaleType = Enum.ScaleType.Fit
+imagenBurbuja.Image = "rbxthumb://type=Asset&id=86998528745950&w=420&h=420" -- O rbxassetid:// si ya te funcionó
+imagenBurbuja.ScaleType = Enum.ScaleType.Stretch -- Puedes cambiarlo a Enum.ScaleType.Crop si sigue viéndose chica
 imagenBurbuja.Parent = burbuja
 
 crearFilaSwitch(panel, 48, "Auto burbujas: OFF", COL_ON, false, function(valor, lbl)
