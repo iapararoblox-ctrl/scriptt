@@ -1,28 +1,24 @@
---[[  AUTO BURBUJAS (versión móvil + PC)
-    - Auto recolección de burbujas según el nivel de oxígeno
-    - TP aleatorio sin repetir ubicaciones
-    - Evadir mobs: si un enemigo se acerca, hace TP a una zona lejos de él
-    - Abrir cofres (NUEVO)
+--[[  AUTO BURBUJAS (móvil + PC) · UI MODULAR
 
-    NOVEDAD 4:
-    - Módulo "Abrir cofres": interruptor en el panel (funciona con toque en
-      teléfono y con clic en PC). Al activarlo abre TODOS los cofres de la lista
-      y repite cada cierto tiempo. Se configura en "AJUSTES DE COFRES" (abajo).
+    La interfaz ahora está dividida en 3 pestañas (módulos):
+      • BURBUJAS   → auto burbujas, "según oxígeno" y umbral
+      • MOVIMIENTO → TP aleatorio y evadir mobs
+      • COFRES     → interruptor general, intervalo, botón "Abrir ahora"
+                     y una fila POR CADA cofre (ON/OFF propio + cantidad propia)
 
-    NOVEDAD 3:
-    - Huir al recibir daño: si el jugador pierde vida, se desplaza solo a otra
-      ubicación con una velocidad propia. Se configura SOLO desde el código
-      (ver "AJUSTES DE VELOCIDAD", puntos 7, 8 y 9). No tiene interruptor en el panel.
+    COFRES (novedades):
+      - Cada cofre tiene su interruptor y su cantidad (toca "x100" para
+        cambiar entre 1 / 10 / 50 / 100).
+      - El intervalo se cambia desde la pestaña (5 / 10 / 30 / 60 s).
+      - "Abrir ahora" envía una ronda al instante sin esperar el intervalo.
+      - Los envíos se escalonan (una pequeña pausa entre cofres) en vez de
+        mandar todo en el mismo frame.
+      - Si el juego se actualiza y cambia la ruta del remoto, el script lo
+        busca solo por el nombre "ChestService".
+      - Contador de aperturas enviadas en la pestaña.
 
-    NOVEDAD 2:
-    - Ya NO hay teletransporte brusco: todos los desplazamientos (ir a burbujas,
-      TP aleatorio y huida de mobs) se hacen con movimiento suave, a velocidad
-      normal de caminata. La velocidad se cambia en "AJUSTES DE VELOCIDAD".
-
-    NOVEDAD 1:
-    - La velocidad de recolección y la velocidad del TP aleatorio YA NO tienen
-      slider: el jugador no puede cambiarlas. Solo se ajustan aquí abajo, en
-      la sección "AJUSTES DE VELOCIDAD".
+    Todo lo demás (velocidades, huida por daño, etc.) se ajusta en las
+    secciones "AJUSTES" de abajo, igual que antes.
 --]]
 
 local Players = game:GetService("Players")
@@ -38,62 +34,28 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- ╔═══════════════════════════════════════════════════════════════╗
 -- ║              AJUSTES DE VELOCIDAD (EDITA AQUÍ)                ║
 -- ╚═══════════════════════════════════════════════════════════════╝
--- Solo cambia el NÚMERO que está después del signo "=". Nada más.
+-- Solo cambia el NÚMERO que está después del signo "=".
 --
--- 1) VELOCIDAD_BURBUJAS = cuántas burbujas recoge por segundo.
---      1  = muy lento  (1 burbuja cada 1 segundo)
---      2  = normal     (1 burbuja cada 0.5 segundos)
---      3  = rápido
---      (ver el aviso de TIEMPO_SOBRE_BURBUJA más abajo: limita el máximo)
---
--- 2) VELOCIDAD_TP = cuántos teletransportes aleatorios hace por segundo.
---      0.5 = 1 TP cada 2 segundos (lento)
---      1   = 1 TP cada 1 segundo
---      2   = 2 TP por segundo
---      5   = muy rápido
---
--- 3) TIEMPO_SOBRE_BURBUJA = segundos mínimos que se queda encima de cada
---      burbuja para que el juego registre el toque.
---      OJO: este número pone un TOPE a la velocidad de burbujas.
---      Con 0.35 el máximo real es ~2.8 burbujas por segundo, aunque
---      pongas VELOCIDAD_BURBUJAS = 10.
---      Si quieres ir más rápido, baja este número (por ejemplo 0.2),
---      pero si las burbujas dejan de contarse, vuelve a subirlo.
---
--- 4) VELOCIDAD_MOV_BURBUJAS = qué tan rápido se desplaza el personaje al ir
---      a una burbuja (en studs por segundo). También se usa para volver al
---      punto de descanso después de recoger burbujas.
---      16 = velocidad NORMAL de caminata de Roblox.
---      Más alto = se mueve más rápido; más bajo = más lento.
---
--- 5) VELOCIDAD_MOV_TP = lo mismo, pero SOLO para el TP aleatorio.
---      Es independiente de la anterior: puedes poner una distinta.
---
--- 6) VELOCIDAD_HUIDA = lo mismo, pero cuando huye de un mob.
---      16 = velocidad normal. Si los mobs te alcanzan, súbela (ej. 24).
---
--- 7) HUIR_AL_RECIBIR_DANO = true o false.
---      true  = cuando pierdes vida, te mueves solo a otra ubicación.
---      false = esta función queda apagada.
---
--- 8) VELOCIDAD_HUIDA_DANO = qué tan rápido te mueves al huir por daño
---      (studs por segundo). Es independiente de todas las demás.
---      16 = normal, 30 = rápido, 50 = muy rápido.
---
--- 9) DANO_MINIMO = cuánta vida tienes que perder de golpe para que huya.
---      1 = huye con casi cualquier daño.
---      Si el oxígeno bajo te quita vida poco a poco y eso te hace huir sin
---      parar, sube este número (ej. 5 o 10) para ignorar esos daños chicos.
+-- VELOCIDAD_BURBUJAS    = burbujas por segundo (1 lento, 2 normal, 3 rápido)
+-- VELOCIDAD_TP          = TPs aleatorios por segundo (0.5 = 1 cada 2 s)
+-- TIEMPO_SOBRE_BURBUJA  = segundos mínimos sobre cada burbuja (pone tope a
+--                         la velocidad de burbujas; si dejan de contarse, súbelo)
+-- VELOCIDAD_MOV_BURBUJAS= studs/s al ir a una burbuja (16 = caminata normal)
+-- VELOCIDAD_MOV_TP      = studs/s en el TP aleatorio
+-- VELOCIDAD_HUIDA       = studs/s al huir de un mob
+-- HUIR_AL_RECIBIR_DANO  = true/false
+-- VELOCIDAD_HUIDA_DANO  = studs/s al huir por daño
+-- DANO_MINIMO           = vida mínima perdida de golpe para activar la huida
 ---------------------------------------------------------------------
-local VELOCIDAD_BURBUJAS = 2         -- burbujas por segundo   <<< CAMBIA ESTE
-local VELOCIDAD_TP = 0.5             -- TPs aleatorios por segundo   <<< CAMBIA ESTE
-local TIEMPO_SOBRE_BURBUJA = 0.35    -- segundos mínimos sobre la burbuja
-local VELOCIDAD_MOV_BURBUJAS = 80    -- studs/s al ir a las burbujas (16 = normal)
-local VELOCIDAD_MOV_TP = 50          -- studs/s en el TP aleatorio (16 = normal)
-local VELOCIDAD_HUIDA = 65           -- studs/s al huir de mobs (16 = normal)
-local HUIR_AL_RECIBIR_DANO = true    -- true = huye al perder vida; false = apagado
-local VELOCIDAD_HUIDA_DANO = 100      -- studs/s al huir por daño
-local DANO_MINIMO = 1                -- vida mínima perdida de golpe para activar la huida
+local VELOCIDAD_BURBUJAS = 2
+local VELOCIDAD_TP = 0.5
+local TIEMPO_SOBRE_BURBUJA = 0.35
+local VELOCIDAD_MOV_BURBUJAS = 80
+local VELOCIDAD_MOV_TP = 50
+local VELOCIDAD_HUIDA = 65
+local HUIR_AL_RECIBIR_DANO = true
+local VELOCIDAD_HUIDA_DANO = 100
+local DANO_MINIMO = 1
 ---------------------------------------------------------------------
 -- FIN DE LOS AJUSTES DE VELOCIDAD
 ---------------------------------------------------------------------
@@ -102,32 +64,31 @@ local DANO_MINIMO = 1                -- vida mínima perdida de golpe para activ
 -- ╔═══════════════════════════════════════════════════════════════╗
 -- ║                AJUSTES DE COFRES (EDITA AQUÍ)                 ║
 -- ╚═══════════════════════════════════════════════════════════════╝
--- 10) COFRES_CANTIDAD = cuántos cofres abre de cada tipo en cada envío.
---       100 = abre hasta 100 de cada cofre.
---
--- 11) COFRES_INTERVALO = cada cuántos segundos repite el envío mientras el
---       interruptor "Abrir cofres" esté en ON.
---       10 = cada 10 segundos. Si quieres que sea más seguido, baja el número.
---
--- 12) COFRES_LISTA = los nombres de los cofres que va a abrir.
---       Para quitar uno, borra su línea (o ponle -- delante).
+-- COFRES_CANTIDAD   = cantidad inicial por cofre (luego se cambia en la UI)
+-- COFRES_INTERVALO  = segundos iniciales entre rondas (luego se cambia en la UI)
+-- COFRES_PAUSA      = segundos de pausa entre un cofre y el siguiente
+-- COFRES_LISTA      = { nombre, activo_al_inicio }
+--                     Para quitar un cofre del todo, borra su línea.
 ---------------------------------------------------------------------
-local COFRES_CANTIDAD = 100          -- cofres por tipo en cada envío   <<< CAMBIA ESTE
-local COFRES_INTERVALO = 10          -- segundos entre envíos   <<< CAMBIA ESTE
+local COFRES_CANTIDAD = 100
+local COFRES_INTERVALO = 10
+local COFRES_PAUSA = 0.1
 local COFRES_LISTA = {
-    "WoodenChest",
-    "RareChest",
-    "EpicChest",
-    "GoldenChest",
-    "WhiteChest",
-    "VoidChest",
-    "RaidChest",
-    "InfernoChest",
-    "MythicalChest",
-    "MythicChest",
-    "PremiumChest",
-    "DeluxeChest",
+    { "WoodenChest",   true },
+    { "RareChest",     true },
+    { "EpicChest",     true },
+    { "GoldenChest",   true },
+    { "WhiteChest",    true },
+    { "VoidChest",     true },
+    { "RaidChest",     true },
+    { "InfernoChest",  true },
+    { "MythicalChest", true },
+    { "MythicChest",   true },
+    { "PremiumChest",  true },
+    { "DeluxeChest",   true },
 }
+local COFRES_OPCIONES_CANTIDAD = { 1, 10, 50, 100 }
+local COFRES_OPCIONES_INTERVALO = { 5, 10, 30, 60 }
 ---------------------------------------------------------------------
 -- FIN DE LOS AJUSTES DE COFRES
 ---------------------------------------------------------------------
@@ -135,39 +96,38 @@ local COFRES_LISTA = {
 ---------------------------------------------------------------------
 -- Configuración general (no hace falta tocar)
 ---------------------------------------------------------------------
-local RADIO = 100000                 -- radio de recolección
-local INTERVALO = 1.5                -- segundos base entre ciclos
-local INTERVALO_JITTER = 1.2         -- ±variación aleatoria
+local RADIO = 100000
+local INTERVALO = 1.5
+local INTERVALO_JITTER = 1.2
 local DESTINO = Vector3.new(11, 49, -553)
-local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
+local ALTURA_PLATAFORMA = 3.5
 
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
-local RADIO_TP = 300                 -- radio de TP aleatorio
+local RADIO_TP = 300
 local SEPARACION = 60
 local CANDIDATOS = 60
 
-local PAUSA_CADA = 8                 -- cada N burbujas, pausa larga
-local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
-local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
-local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano con el joystick (no aplica en modo rápido)
-local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
+local PAUSA_CADA = 8
+local PAUSA_MIN, PAUSA_MAX = 4, 9
+local BURBUJAS_POR_CICLO = 3
+local DETECTAR_INPUT = true
+local BURBUJA_ENFRIAMIENTO = 1
 
 -- Evadir mobs
-local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
-local DISTANCIA_SEGURA = 6           -- si un mob está más cerca que esto, hace TP lejos
-local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
-local INTERVALO_EVASION = 0.02        -- cada cuánto revisa los mobs
-local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
+local CARPETA_ENEMIGOS = "Enemies"
+local DISTANCIA_SEGURA = 6
+local DISTANCIA_DESTINO_MIN = 60
+local INTERVALO_EVASION = 0.02
+local EVASION_COOLDOWN = 0.3
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
-local PANEL_W, PANEL_H = 260, 362
+local PANEL_W, PANEL_H = 260, 400
 local BURBUJA_TAM = 56
 
 -- Estado
--- (se protegen de valores en 0 o negativos para que el script no se rompa)
-local velocidad = math.max(0.1, VELOCIDAD_BURBUJAS)   -- burbujas por segundo (fijo, solo desde el código)
-local velocidadTP = math.max(0.1, VELOCIDAD_TP)       -- TPs aleatorios por segundo (fijo, solo desde el código)
+local velocidad = math.max(0.1, VELOCIDAD_BURBUJAS)
+local velocidadTP = math.max(0.1, VELOCIDAD_TP)
 local MIN_PERMANENCIA = math.max(0, TIEMPO_SOBRE_BURBUJA)
 local umbralOxigeno = 50
 local controlOxigeno = true
@@ -187,11 +147,19 @@ local evadirMobs = false
 local evasiones = 0
 local ultimaEvasion = 0
 local evadiendo = false
-local abrirCofres = false            -- interruptor del módulo de cofres
-local cofresEnvios = 0               -- cuántos envíos de cofres se han hecho
+local abrirCofres = false
+local cofresEnvios = 0
+local cofresIntervalo = COFRES_INTERVALO
 local remotoCofres = nil
+local forzarRonda = false            -- "Abrir ahora"
 local visitaBurbuja = setmetatable({}, { __mode = "k" })
 local dbg = { total = 0, rango = 0, tpOk = 0, tpFail = 0, motivo = "—" }
+
+-- Estado por cofre: { nombre, activo, cantidad }
+local cofres = {}
+for _, c in ipairs(COFRES_LISTA) do
+    table.insert(cofres, { nombre = c[1], activo = c[2] ~= false, cantidad = COFRES_CANTIDAD })
+end
 
 -- Paleta
 local COL_FONDO   = Color3.fromRGB(24, 26, 36)
@@ -221,7 +189,6 @@ end
 
 ---------------------------------------------------------------------
 -- Detección de movimiento manual (joystick / teclado)
--- Usa MoveDirection: no se activa por tocar la cámara ni la interfaz.
 ---------------------------------------------------------------------
 if DETECTAR_INPUT then
     task.spawn(function()
@@ -277,8 +244,6 @@ local function getHumanoid()
     return char and char:FindFirstChildOfClass("Humanoid")
 end
 
--- Posición de la burbuja: usa su parte física (PrimaryPart o la primera BasePart);
--- el pivote del modelo puede quedar desplazado respecto a donde se detecta el toque.
 local function posBurbuja(obj)
     if obj:IsA("Model") then
         local parte = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
@@ -289,7 +254,6 @@ local function posBurbuja(obj)
     end
 end
 
--- Lista NEGRA: solo se bloquea cuando el personaje no está en condiciones.
 local ESTADOS_BLOQUEADOS = {
     [Enum.HumanoidStateType.Dead] = true,
     [Enum.HumanoidStateType.Ragdoll] = true,
@@ -303,7 +267,6 @@ local function estadoSeguro()
     return not ESTADOS_BLOQUEADOS[hum:GetState()]
 end
 
--- Plataforma invisible: sostiene al personaje (ya no se ve el "cuerpo fantasma")
 local function crearPlataforma(posicion)
     if not plataforma or not plataforma.Parent then
         plataforma = Instance.new("Part")
@@ -326,9 +289,6 @@ local function quitarPlataforma()
     end
 end
 
--- Desliza al personaje (y opcionalmente la plataforma) hasta "meta".
--- Interpolación manual: si una evasión de mob ocurre a mitad de camino, se
--- detecta antes de cada paso y el deslizamiento se corta sin pisar el TP de escape.
 local function deslizar(root, meta, dur, platDestino, continuar)
     local inicio = root.CFrame
     local platInicio = plataforma and plataforma.Parent and plataforma.Position
@@ -353,8 +313,6 @@ local function duracionPara(dist, vel)
     return math.max(dist / math.max(vel, 1), 0.03)
 end
 
--- Ir a una burbuja caminando (deslizando) a velocidad normal. Sin TP brusco.
--- obj: la burbuja; si desaparece mientras se camina, se cancela el trayecto.
 local function teleportarA(root, destino, obj)
     if not root or not root.Parent then return false end
     if evadiendo or not estadoSeguro() then return false end
@@ -370,10 +328,6 @@ local function teleportarA(root, destino, obj)
     return llego
 end
 
--- Desliza personaje y plataforma juntos hasta "destino", a velocidad normal.
--- opc.continuar: función que decide si el deslizamiento sigue
--- opc.rapido: usa la velocidad de huida   opc.forzar: ignora el estado del personaje
--- opc.velocidad: velocidad en studs/s (si no se indica, usa la del TP aleatorio)
 local function irAPlataformaSuave(root, destino, opc)
     opc = opc or {}
     if not root or not root.Parent then return false end
@@ -381,7 +335,7 @@ local function irAPlataformaSuave(root, destino, opc)
 
     local dist = (root.Position - destino).Magnitude
 
-    crearPlataforma(root.Position) -- plataforma bajo los pies antes de empezar
+    crearPlataforma(root.Position)
     local rot = root.CFrame - root.CFrame.Position
     local meta = CFrame.new(destino) * rot
     local platDestino = destino - Vector3.new(0, ALTURA_PLATAFORMA, 0)
@@ -395,7 +349,6 @@ local function irAPlataformaSuave(root, destino, opc)
     return llego
 end
 
--- Elige el candidato más lejano a todos los puntos ya usados
 local function posicionAleatoria(origen)
     if #visitados == 0 and origen then
         table.insert(visitados, Vector3.new(origen.X, DESTINO.Y, origen.Z))
@@ -427,7 +380,6 @@ end
 ---------------------------------------------------------------------
 -- Mobs
 ---------------------------------------------------------------------
--- Posiciones de los enemigos (Workspace.Enemies)
 local function posicionesEnemigos()
     local lista = {}
     local carpeta = Workspace:FindFirstChild(CARPETA_ENEMIGOS)
@@ -453,8 +405,6 @@ local function distanciaMinima(punto, enemigos)
     return minD
 end
 
--- Punto de escape: el más lejano a TODOS los mobs, alrededor del DESTINO.
--- Si ninguno cumple la distancia mínima, se queda con el mejor encontrado.
 local function posicionSegura(enemigos, origen)
     local mejor, mejorDist = nil, -1
     for _ = 1, CANDIDATOS do
@@ -472,8 +422,8 @@ end
 ---------------------------------------------------------------------
 -- Cofres
 ---------------------------------------------------------------------
--- Busca el RemoteEvent de los cofres. Si la ruta no existe (el juego se
--- actualizó, por ejemplo), devuelve nil en vez de romper el script.
+-- 1) Ruta conocida. 2) Si falla, busca cualquier RemoteEvent dentro de un
+--    objeto llamado "ChestService" (por si el juego cambia la versión).
 local function obtenerRemotoCofres()
     if remotoCofres and remotoCofres.Parent then return remotoCofres end
     local ok, r = pcall(function()
@@ -484,25 +434,44 @@ local function obtenerRemotoCofres()
         remotoCofres = r
         return r
     end
+    local ok2, r2 = pcall(function()
+        for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+            if d:IsA("RemoteEvent") and d.Parent and d.Parent.Name == "ChestService" then
+                return d
+            end
+        end
+    end)
+    if ok2 and r2 then
+        remotoCofres = r2
+        return r2
+    end
     return nil
 end
 
--- Envía la orden de abrir cada tipo de cofre (todos a la vez).
+-- Envía UNA ronda: cada cofre activo con su propia cantidad, escalonado.
 local function abrirTodosLosCofres()
     local remoto = obtenerRemotoCofres()
     if not remoto then
         dbg.motivo = "cofres: no se encontró el remoto"
         return false
     end
-    for _, nombre in ipairs(COFRES_LISTA) do
-        task.spawn(function()
+    local enviados = 0
+    for _, c in ipairs(cofres) do
+        if cerrado then break end
+        if c.activo and c.cantidad > 0 then
             pcall(function()
-                remoto:FireServer("OpenMultipleChests", nombre, COFRES_CANTIDAD)
+                remoto:FireServer("OpenMultipleChests", c.nombre, c.cantidad)
             end)
-        end)
+            enviados = enviados + 1
+            if COFRES_PAUSA > 0 then task.wait(COFRES_PAUSA) end
+        end
+    end
+    if enviados == 0 then
+        dbg.motivo = "cofres: ninguno seleccionado"
+        return false
     end
     cofresEnvios = cofresEnvios + 1
-    dbg.motivo = string.format("cofres enviados (#%d)", cofresEnvios)
+    dbg.motivo = string.format("cofres: ronda #%d (%d tipos)", cofresEnvios, enviados)
     return true
 end
 
@@ -547,7 +516,6 @@ local function esMovimiento(input)
         or input.UserInputType == Enum.UserInputType.Touch
 end
 
--- Mantiene un objeto dentro de la pantalla (posición siempre en offset, anclaje 0,0)
 local function clampear(obj, tam)
     local vs = viewport()
     local x = math.clamp(obj.Position.X.Offset, 0, math.max(0, vs.X - tam.X))
@@ -555,7 +523,6 @@ local function clampear(obj, tam)
     obj.Position = UDim2.fromOffset(x, y)
 end
 
--- tamano: función que devuelve el tamaño en pantalla del objeto (para limitarlo)
 local function hacerArrastrable(handle, target, alTocar, tamano)
     local arrastrando, movido = false, false
     local inicioInput, inicioPos, inputDrag
@@ -577,7 +544,7 @@ local function hacerArrastrable(handle, target, alTocar, tamano)
         if arrastrando and esMovimiento(input)
             and (input == inputDrag or input.UserInputType == Enum.UserInputType.MouseMovement) then
             local d = input.Position - inicioInput
-            if d.Magnitude > 8 then movido = true end -- un poco más de tolerancia en táctil
+            if d.Magnitude > 8 then movido = true end
             if movido then
                 target.Position = UDim2.fromOffset(inicioPos.X.Offset + d.X, inicioPos.Y.Offset + d.Y)
                 clampear(target, tamano())
@@ -586,7 +553,7 @@ local function hacerArrastrable(handle, target, alTocar, tamano)
     end)
 end
 
--- Toda la fila es táctil: tocar el texto o el interruptor da igual.
+-- Interruptor reutilizable. Devuelve (label, setEstado) para poder cambiarlo por código.
 local function crearFilaSwitch(parent, y, textoInicial, colorOn, inicial, alCambiar)
     local fila = Instance.new("TextButton")
     fila.Size = UDim2.new(1, -16, 0, 32)
@@ -690,7 +657,6 @@ local function crearSlider(parent, y, cfg)
         setValor(math.floor(v / cfg.paso + 0.5) * cfg.paso)
     end
 
-    -- Zona táctil grande: todo el contenedor responde (no solo la barra fina)
     local deslizando, inputSlider = false, nil
     conectar(cont.InputBegan, function(input)
         if esPuntero(input) and not deslizando then
@@ -715,10 +681,25 @@ local function crearSlider(parent, y, cfg)
     return cont
 end
 
+-- Botoncito de texto (para cantidad, intervalo, "abrir ahora")
+local function crearBoton(parent, texto, color, x, y, w, h, tam)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(w, h)
+    b.Position = x
+    b.BackgroundColor3 = color
+    b.Text = texto
+    b.TextColor3 = COL_TEXTO
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = tam or 12
+    b.AutoButtonColor = true
+    b.Parent = parent
+    redondear(b, 8)
+    return b
+end
+
 ---------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------
--- Evita duplicados si se ejecuta dos veces
 local function padreGui()
     local ok, h = pcall(function() return gethui and gethui() end)
     if ok and h then return h end
@@ -733,7 +714,7 @@ end
 local gui = Instance.new("ScreenGui")
 gui.Name = "BurbujasUI"
 gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true            -- coordenadas = pantalla completa (también con notch)
+gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 999
 gui.Parent = destinoGui
@@ -748,7 +729,6 @@ panel.Parent = gui
 redondear(panel, 14)
 borde(panel, COL_ACENTO, 1.5, 0.5)
 
--- Escala automática: en pantallas pequeñas el panel se reduce para caber entero
 local escala = Instance.new("UIScale")
 escala.Parent = panel
 
@@ -817,7 +797,6 @@ burbuja.Parent = gui
 redondear(burbuja, BURBUJA_TAM / 2)
 borde(burbuja, Color3.new(1, 1, 1), 2, 0.4)
 
--- Imagen de la burbuja (el fondo detrás sigue marcando ON/OFF: azul / verde)
 local imagenBurbuja = Instance.new("ImageLabel")
 imagenBurbuja.Name = "Imagen"
 imagenBurbuja.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -828,7 +807,48 @@ imagenBurbuja.Image = "rbxthumb://type=Asset&id=86998528745950&w=420&h=420"
 imagenBurbuja.ScaleType = Enum.ScaleType.Stretch
 imagenBurbuja.Parent = burbuja
 
-crearFilaSwitch(panel, 48, "Auto burbujas: OFF", COL_ON, false, function(valor, lbl)
+---------------------------------------------------------------------
+-- Pestañas (módulos)
+---------------------------------------------------------------------
+local PAGINA_Y = 74                   -- donde empiezan las páginas
+local PIE_ALTO = 56                   -- alto del pie (contador + estado)
+
+local paginas, botonesTab = {}, {}
+local function mostrarPagina(nombre)
+    for n, pg in pairs(paginas) do
+        pg.Visible = (n == nombre)
+    end
+    for n, b in pairs(botonesTab) do
+        local sel = (n == nombre)
+        b.BackgroundColor3 = sel and COL_ACENTO or COL_BARRA
+        b.TextColor3 = sel and Color3.new(1, 1, 1) or COL_SUB
+    end
+end
+
+local function crearPagina(nombre, texto, indice, total)
+    local ancho = (PANEL_W - 16 - (total - 1) * 4) / total
+    local b = crearBoton(panel, texto, COL_BARRA, UDim2.fromOffset(8 + (indice - 1) * (ancho + 4), 44), ancho, 26, 12)
+    botonesTab[nombre] = b
+
+    local pg = Instance.new("Frame")
+    pg.Name = "Pagina_" .. nombre
+    pg.Position = UDim2.fromOffset(0, PAGINA_Y)
+    pg.Size = UDim2.new(1, 0, 1, -(PAGINA_Y + PIE_ALTO))
+    pg.BackgroundTransparency = 1
+    pg.Visible = false
+    pg.Parent = panel
+    paginas[nombre] = pg
+
+    b.MouseButton1Click:Connect(function() mostrarPagina(nombre) end)
+    return pg
+end
+
+local pgBurbujas = crearPagina("burbujas", "Burbujas", 1, 3)
+local pgMov = crearPagina("mov", "Movimiento", 2, 3)
+local pgCofres = crearPagina("cofres", "Cofres", 3, 3)
+
+-- ===== MÓDULO 1: BURBUJAS =====
+crearFilaSwitch(pgBurbujas, 8, "Auto burbujas: OFF", COL_ON, false, function(valor, lbl)
     activo = valor
     if not activo then
         recolectando = false
@@ -839,15 +859,8 @@ crearFilaSwitch(panel, 48, "Auto burbujas: OFF", COL_ON, false, function(valor, 
     if actualizarInfo then actualizarInfo() end
 end)
 
-crearFilaSwitch(panel, 82, "TP aleatorio: OFF", COL_ACENTO, false, function(valor, lbl)
-    tpAleatorio = valor
-    visitados = {}
-    if not valor and not activo and not evadirMobs then quitarPlataforma() end
-    lbl.Text = valor and "TP aleatorio: ON" or "TP aleatorio: OFF"
-end)
-
 local sliderUmbral
-crearFilaSwitch(panel, 116, "Según oxígeno: ON", COL_ON, true, function(valor, lbl)
+crearFilaSwitch(pgBurbujas, 42, "Según oxígeno: ON", COL_ON, true, function(valor, lbl)
     controlOxigeno = valor
     recolectando = false
     lbl.Text = valor and "Según oxígeno: ON" or "Según oxígeno: OFF"
@@ -857,17 +870,11 @@ crearFilaSwitch(panel, 116, "Según oxígeno: ON", COL_ON, true, function(valor,
     if actualizarInfo then actualizarInfo() end
 end)
 
-crearFilaSwitch(panel, 150, "Evadir mobs: OFF", COL_ROJO, false, function(valor, lbl)
-    evadirMobs = valor
-    if not valor and not activo and not tpAleatorio then quitarPlataforma() end
-    lbl.Text = valor and "Evadir mobs: ON" or "Evadir mobs: OFF"
-end)
-
-local lblOxigeno = crearTexto(panel, "Oxígeno: …", 13, COL_SUB)
+local lblOxigeno = crearTexto(pgBurbujas, "Oxígeno: …", 13, COL_SUB)
 lblOxigeno.Size = UDim2.new(1, -28, 0, 18)
-lblOxigeno.Position = UDim2.fromOffset(14, 182)
+lblOxigeno.Position = UDim2.fromOffset(14, 80)
 
-sliderUmbral = crearSlider(panel, 206, {
+sliderUmbral = crearSlider(pgBurbujas, 106, {
     min = UMBRAL_MIN, max = UMBRAL_MAX, paso = 5, inicial = umbralOxigeno,
     textoMin = "5%", textoMax = "95%",
     formato = function(v) return string.format("Recolectar si oxígeno ≤ %d%%", v) end,
@@ -878,26 +885,121 @@ sliderUmbral = crearSlider(panel, 206, {
     end,
 })
 
--- (Los sliders de velocidad de burbujas y de TP aleatorio fueron eliminados:
---  ahora se ajustan solo desde la sección "AJUSTES DE VELOCIDAD" al inicio.)
+-- ===== MÓDULO 2: MOVIMIENTO =====
+crearFilaSwitch(pgMov, 8, "TP aleatorio: OFF", COL_ACENTO, false, function(valor, lbl)
+    tpAleatorio = valor
+    visitados = {}
+    if not valor and not activo and not evadirMobs then quitarPlataforma() end
+    lbl.Text = valor and "TP aleatorio: ON" or "TP aleatorio: OFF"
+end)
 
--- Módulo de cofres: toda la fila responde al toque (teléfono) o al clic (PC)
-crearFilaSwitch(panel, 264, "Abrir cofres: OFF", COL_DORADO, false, function(valor, lbl)
+crearFilaSwitch(pgMov, 42, "Evadir mobs: OFF", COL_ROJO, false, function(valor, lbl)
+    evadirMobs = valor
+    if not valor and not activo and not tpAleatorio then quitarPlataforma() end
+    lbl.Text = valor and "Evadir mobs: ON" or "Evadir mobs: OFF"
+end)
+
+local lblMovInfo = crearTexto(pgMov, "Huir por daño: " .. (HUIR_AL_RECIBIR_DANO and "activado (código)" or "apagado (código)"), 12, COL_SUB)
+lblMovInfo.Size = UDim2.new(1, -28, 0, 18)
+lblMovInfo.Position = UDim2.fromOffset(14, 82)
+
+-- ===== MÓDULO 3: COFRES =====
+local lblCofresEstado
+local filasCofres = {}
+
+crearFilaSwitch(pgCofres, 4, "Abrir cofres: OFF", COL_DORADO, false, function(valor, lbl)
     abrirCofres = valor
     lbl.Text = valor and "Abrir cofres: ON" or "Abrir cofres: OFF"
 end)
 
-local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0", 13, COL_SUB)
-lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 304)
+local btnIntervalo = crearBoton(pgCofres, "", COL_BARRA, UDim2.fromOffset(12, 38), 112, 26, 12)
+local function textoIntervalo() return string.format("Cada %ds", cofresIntervalo) end
+btnIntervalo.Text = textoIntervalo()
+btnIntervalo.MouseButton1Click:Connect(function()
+    local idx = 1
+    for i, v in ipairs(COFRES_OPCIONES_INTERVALO) do
+        if v == cofresIntervalo then idx = i break end
+    end
+    cofresIntervalo = COFRES_OPCIONES_INTERVALO[(idx % #COFRES_OPCIONES_INTERVALO) + 1]
+    btnIntervalo.Text = textoIntervalo()
+end)
 
-local function actualizarContador()
-    lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d", recogidas, evasiones)
+local btnAhora = crearBoton(pgCofres, "Abrir ahora", COL_DORADO, UDim2.fromOffset(130, 38), 118, 26, 12)
+btnAhora.TextColor3 = Color3.fromRGB(30, 24, 8)
+btnAhora.MouseButton1Click:Connect(function()
+    forzarRonda = true
+end)
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Position = UDim2.fromOffset(8, 70)
+scroll.Size = UDim2.new(1, -16, 1, -74)
+scroll.BackgroundColor3 = COL_BARRA
+scroll.BackgroundTransparency = 0.4
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = COL_ACENTO
+scroll.CanvasSize = UDim2.fromOffset(0, #cofres * 34 + 6)
+scroll.Parent = pgCofres
+redondear(scroll, 10)
+
+for i, c in ipairs(cofres) do
+    local y = 4 + (i - 1) * 34
+
+    local lbl = crearTexto(scroll, c.nombre:gsub("Chest$", ""), 13, c.activo and COL_DORADO or COL_SUB)
+    lbl.Size = UDim2.fromOffset(86, 26)
+    lbl.Position = UDim2.fromOffset(8, y)
+
+    local btnCant = crearBoton(scroll, "x" .. c.cantidad, COL_FONDO, UDim2.fromOffset(94, y), 48, 26, 12)
+    btnCant.MouseButton1Click:Connect(function()
+        local idx = 0
+        for k, v in ipairs(COFRES_OPCIONES_CANTIDAD) do
+            if v == c.cantidad then idx = k break end
+        end
+        c.cantidad = COFRES_OPCIONES_CANTIDAD[(idx % #COFRES_OPCIONES_CANTIDAD) + 1]
+        btnCant.Text = "x" .. c.cantidad
+    end)
+
+    local sw = Instance.new("TextButton")
+    sw.Size = UDim2.fromOffset(44, 24)
+    sw.Position = UDim2.new(1, -56, 0, y + 1)
+    sw.BackgroundColor3 = c.activo and COL_DORADO or COL_OFF
+    sw.Text = ""
+    sw.AutoButtonColor = false
+    sw.Parent = scroll
+    redondear(sw, 12)
+
+    local perilla = Instance.new("Frame")
+    perilla.Size = UDim2.fromOffset(18, 18)
+    perilla.Position = UDim2.fromOffset(c.activo and 23 or 3, 3)
+    perilla.BackgroundColor3 = Color3.new(1, 1, 1)
+    perilla.BorderSizePixel = 0
+    perilla.Parent = sw
+    redondear(perilla, 9)
+
+    sw.MouseButton1Click:Connect(function()
+        c.activo = not c.activo
+        local info = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
+        TweenService:Create(sw, info, { BackgroundColor3 = c.activo and COL_DORADO or COL_OFF }):Play()
+        TweenService:Create(perilla, info, { Position = UDim2.fromOffset(c.activo and 23 or 3, 3) }):Play()
+        lbl.TextColor3 = c.activo and COL_DORADO or COL_SUB
+    end)
+    filasCofres[i] = lbl
 end
 
-local lblEstado = crearTexto(panel, "Estado: inactivo", 12, COL_SUB)
+---------------------------------------------------------------------
+-- Pie (visible en todas las pestañas)
+---------------------------------------------------------------------
+local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0  ·  Cofres: 0", 12, COL_SUB)
+lblContador.Size = UDim2.new(1, -28, 0, 18)
+lblContador.Position = UDim2.new(0, 14, 1, -(PIE_ALTO - 2))
+
+local function actualizarContador()
+    lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d  ·  Cofres: %d", recogidas, evasiones, cofresEnvios)
+end
+
+local lblEstado = crearTexto(panel, "Estado: inactivo", 11, COL_SUB)
 lblEstado.Size = UDim2.new(1, -28, 0, 32)
-lblEstado.Position = UDim2.fromOffset(14, 326)
+lblEstado.Position = UDim2.new(0, 14, 1, -(PIE_ALTO - 20))
 lblEstado.TextWrapped = true
 lblEstado.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -921,10 +1023,12 @@ actualizarInfo = function()
     end
     lblEstado.Text = string.format("%s · %s\nBurb %d · en rango %d · TP %d ok / %d fallo",
         base, dbg.motivo, dbg.total, dbg.rango, dbg.tpOk, dbg.tpFail)
+    actualizarContador()
 end
 
 conectar(LocalPlayer:GetAttributeChangedSignal("Oxygen"), actualizarInfo)
 conectar(LocalPlayer:GetAttributeChangedSignal("MaxOxygen"), actualizarInfo)
+mostrarPagina("burbujas")
 actualizarInfo()
 
 local function minimizar()
@@ -958,7 +1062,6 @@ btnCerrar.MouseButton1Click:Connect(cerrar)
 hacerArrastrable(barra, panel, nil, tamPanel)
 hacerArrastrable(burbuja, burbuja, restaurar, tamBurbuja)
 
--- Al girar el teléfono / cambiar el tamaño de pantalla: reescala y reacomoda
 local function reajustar()
     if cerrado then return end
     escala.Scale = calcularEscala()
@@ -982,7 +1085,6 @@ end)
 ---------------------------------------------------------------------
 -- Lógica principal
 ---------------------------------------------------------------------
--- Modo rápido: el oxígeno está bajo el umbral y hay que llenar cuanto antes.
 local function esRapido()
     return controlOxigeno and recolectando
 end
@@ -995,7 +1097,6 @@ local function recogerBurbujas()
     if not root or not root.Parent then dbg.motivo = "sin personaje"; return end
     if not estadoSeguro() then dbg.motivo = "estado no válido"; return end
 
-    -- fuera del modo rápido, pausa si el jugador se mueve a mano con el joystick
     if not esRapido() and DETECTAR_INPUT and (tick() - lastInputTime) < 0.8 then
         dbg.motivo = "pausa por movimiento"
         return
@@ -1021,10 +1122,8 @@ local function recogerBurbujas()
         if not root or not root.Parent then break end
         local origen = root.Position
 
-        -- con "Evadir mobs" activo, no va a burbujas que tengan un mob encima
         local enemigos = evadirMobs and posicionesEnemigos() or {}
 
-        -- lista de burbujas disponibles, la más cercana primero
         local lista = {}
         local total, enRango = 0, 0
         for _, bubble in ipairs(folder:GetChildren()) do
@@ -1066,10 +1165,8 @@ local function recogerBurbujas()
             root = getRoot()
             if not root or not root.Parent then break end
 
-            -- la burbuja flota: toma su posición actual justo antes del TP
             local pos = posBurbuja(item.obj) or item.pos
 
-            -- revisa otra vez que no haya un mob encima justo antes del TP
             if evadirMobs then
                 local en = posicionesEnemigos()
                 if #en > 0 and distanciaMinima(pos, en) <= DISTANCIA_SEGURA then
@@ -1086,7 +1183,6 @@ local function recogerBurbujas()
                 dbg.motivo = "recolectando"
                 actualizarContador()
 
-                -- permanece un mínimo sobre la burbuja para que se registre el toque
                 local espera = math.max(1 / velocidad, MIN_PERMANENCIA)
                 task.wait(humanDelay(espera, espera * (rapido and 0.1 or 0.3)))
 
@@ -1104,7 +1200,6 @@ local function recogerBurbujas()
         end
     until not (esRapido() and activo and enPasada > 0 and pasadas < 30)
 
-    -- Sin TP aleatorio: vuelve al destino y se queda encima de la plataforma.
     root = getRoot()
     if activo and hechas > 0 and not tpAleatorio and root and root.Parent then
         irAPlataformaSuave(root, DESTINO, {
@@ -1131,8 +1226,7 @@ task.spawn(function()
     end
 end)
 
--- Bucle 2: TP aleatorio, ahora con movimiento suave (independiente del interruptor principal)
--- Su ritmo lo marca SOLO la variable VELOCIDAD_TP (arriba, en AJUSTES DE VELOCIDAD)
+-- Bucle 2: TP aleatorio
 task.spawn(function()
     while not cerrado do
         local intervaloTP = 1 / velocidadTP
@@ -1144,7 +1238,6 @@ task.spawn(function()
                 local root = getRoot()
                 if not root or not root.Parent then return end
 
-                -- si hay mobs y "Evadir mobs" está activo, no cae cerca de ellos
                 local destino = posicionAleatoria(root.Position)
                 if evadirMobs then
                     local en = posicionesEnemigos()
@@ -1159,7 +1252,7 @@ task.spawn(function()
     end
 end)
 
--- Bucle 3: evadir mobs por TELETRANSPORTE (independiente del resto)
+-- Bucle 3: evadir mobs
 task.spawn(function()
     while not cerrado do
         task.wait(INTERVALO_EVASION)
@@ -1173,13 +1266,11 @@ task.spawn(function()
                 local enemigos = posicionesEnemigos()
                 if #enemigos == 0 then return end
 
-                -- ¿algún mob demasiado cerca?
                 if distanciaMinima(root.Position, enemigos) >= DISTANCIA_SEGURA then return end
 
-                -- TP a la zona más lejana de todos los mobs
                 local destino, dist = posicionSegura(enemigos, root.Position)
                 if destino then
-                    evadiendo = true            -- frena cualquier otro desplazamiento
+                    evadiendo = true
                     ultimaEvasion = tick()
                     local llego = irAPlataformaSuave(root, destino, {
                         rapido = true,
@@ -1202,8 +1293,6 @@ task.spawn(function()
 end)
 
 -- Bucle 4: huir al recibir daño (se configura SOLO desde el código)
--- Elige un punto lejos de donde estás y de los mobs, y se mueve hacia allá
--- con la velocidad VELOCIDAD_HUIDA_DANO.
 local function posicionLejosDe(origen, enemigos)
     local plano = Vector3.new(origen.X, DESTINO.Y, origen.Z)
     local mejor, mejorPuntaje = nil, -1
@@ -1231,7 +1320,6 @@ task.spawn(function()
                     humPrev = nil
                     return
                 end
-                -- personaje nuevo (respawn): reinicia la referencia de vida
                 if hum ~= humPrev then
                     humPrev, vidaPrev = hum, hum.Health
                     return
@@ -1256,7 +1344,7 @@ task.spawn(function()
                     return
                 end
 
-                evadiendo = true            -- frena cualquier otro desplazamiento
+                evadiendo = true
                 ultimaEvasion = tick()
                 local llego = irAPlataformaSuave(root, destino, {
                     forzar = true,
@@ -1266,7 +1354,6 @@ task.spawn(function()
                 evadiendo = false
                 ultimaEvasion = tick()
 
-                -- el daño recibido durante la huida no cuenta como uno nuevo
                 local h = getHumanoid()
                 vidaPrev = h and h.Health or 0
                 if llego then
@@ -1279,17 +1366,19 @@ task.spawn(function()
     end
 end)
 
--- Bucle 5: abrir cofres (independiente del resto; no mueve al personaje)
--- Cada COFRES_INTERVALO segundos envía la orden mientras el interruptor esté en ON.
+-- Bucle 5: cofres (módulo independiente; no mueve al personaje)
+-- Envía una ronda cada "cofresIntervalo" segundos mientras el interruptor esté
+-- ON, o al instante si se pulsa "Abrir ahora".
 task.spawn(function()
     while not cerrado do
-        if abrirCofres then
+        if abrirCofres or forzarRonda then
+            forzarRonda = false
             local ok, err = pcall(abrirTodosLosCofres)
             if not ok then warn("[ERROR cofres]", err) end
             if actualizarInfo then actualizarInfo() end
-            -- espera el intervalo, pero se corta enseguida si se apaga el interruptor
             local t0 = tick()
-            while not cerrado and abrirCofres and (tick() - t0) < math.max(1, COFRES_INTERVALO) do
+            while not cerrado and not forzarRonda and abrirCofres
+                and (tick() - t0) < math.max(1, cofresIntervalo) do
                 task.wait(0.25)
             end
         else
