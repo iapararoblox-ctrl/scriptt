@@ -619,7 +619,7 @@ imagenBurbuja.AnchorPoint = Vector2.new(0.5, 0.5)
 imagenBurbuja.Position = UDim2.fromScale(0.5, 0.5)
 imagenBurbuja.Size = UDim2.fromScale(0.82, 0.82)
 imagenBurbuja.BackgroundTransparency = 1
-imagenBurbuja.Image = "rbxassetid://121465979557016"
+imagenBurbuja.Image = "rbxassetid://6031075931"
 imagenBurbuja.ScaleType = Enum.ScaleType.Fit
 imagenBurbuja.Parent = burbuja
 
