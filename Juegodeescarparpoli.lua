@@ -10,6 +10,9 @@
     - Sliders con zona táctil grande y seguimiento de UN solo dedo (no choca con el joystick)
     - La pausa por movimiento manual ahora usa el joystick (MoveDirection), no cualquier toque
     - Botones más grandes y GUI protegida con gethui() si el ejecutor la tiene
+
+    Novedad:
+    - Velocidad de recolección de burbujas y velocidad del TP aleatorio son INDEPENDIENTES
 --]]
 
 local Players = game:GetService("Players")
@@ -26,11 +29,11 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local RADIO = 100000                 -- radio de recolección
 local INTERVALO = 1.5                -- segundos base entre ciclos
 local INTERVALO_JITTER = 1.2 --0.6 estaba         -- ±variación aleatoria
-local INTERVALO_TP = 1.8             -- segundos entre TPs aleatorios
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1,  5       -- burbujas por segundo
+local VEL_MIN, VEL_MAX = 1,  5       -- burbujas por segundo (recolección)
+local VELTP_MIN, VELTP_MAX = 0.5, 5  -- TPs aleatorios por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
 local RADIO_TP = 300                 -- radio de TP aleatorio
@@ -59,11 +62,12 @@ local INTERVALO_EVASION = 0.1        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
-local PANEL_W, PANEL_H = 260, 384
+local PANEL_W, PANEL_H = 260, 438
 local BURBUJA_TAM = 56
 
 -- Estado
-local velocidad = 6
+local velocidad = 6                  -- velocidad de recolección de burbujas
+local velocidadTP = 0.5              -- velocidad del TP aleatorio (TPs por segundo)
 local umbralOxigeno = 50
 local controlOxigeno = true
 local recolectando = false
@@ -675,7 +679,7 @@ local function crearBotonBarra(texto, posX)
     return b
 end
 
-local btnCerrar = crearBotonBarra("✕", -38)
+local btnCerrar = crearBotonBarra("x", -38)
 local btnMin = crearBotonBarra("–", -76)
 btnCerrar.MouseEnter:Connect(function() btnCerrar.BackgroundColor3 = COL_ROJO end)
 btnCerrar.MouseLeave:Connect(function() btnCerrar.BackgroundColor3 = COL_FONDO end)
@@ -754,16 +758,25 @@ sliderUmbral = crearSlider(panel, 206, {
     end,
 })
 
+-- Slider 1: velocidad de RECOLECCIÓN de burbujas
 crearSlider(panel, 262, {
     min = VEL_MIN, max = VEL_MAX, paso = 1, inicial = velocidad,
     textoMin = "Lento", textoMax = "Rápido",
-    formato = function(v) return string.format("Velocidad: %d burb/s  (%.2fs)", v, 1 / v) end,
+    formato = function(v) return string.format("Vel. burbujas: %d burb/s  (%.2fs)", v, 1 / v) end,
     alCambiar = function(v) velocidad = v end,
+})
+
+-- Slider 2: velocidad del TP ALEATORIO (independiente del anterior)
+crearSlider(panel, 318, {
+    min = VELTP_MIN, max = VELTP_MAX, paso = 0.5, inicial = velocidadTP,
+    textoMin = "Lento", textoMax = "Rápido",
+    formato = function(v) return string.format("Vel. TP aleatorio: %.1f TP/s  (%.2fs)", v, 1 / v) end,
+    alCambiar = function(v) velocidadTP = v end,
 })
 
 local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 324)
+lblContador.Position = UDim2.fromOffset(14, 380)
 
 local function actualizarContador()
     lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d", recogidas, evasiones)
@@ -771,7 +784,7 @@ end
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 12, COL_SUB)
 lblEstado.Size = UDim2.new(1, -28, 0, 32)
-lblEstado.Position = UDim2.fromOffset(14, 346)
+lblEstado.Position = UDim2.fromOffset(14, 402)
 lblEstado.TextWrapped = true
 lblEstado.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -1004,9 +1017,11 @@ task.spawn(function()
 end)
 
 -- Bucle 2: TP aleatorio (independiente del interruptor principal)
+-- Su ritmo lo marca SOLO el slider "Vel. TP aleatorio" (velocidadTP)
 task.spawn(function()
     while not cerrado do
-        task.wait(humanDelay(INTERVALO_TP, 0.4))
+        local intervaloTP = 1 / velocidadTP
+        task.wait(math.max(0.05, humanDelay(intervaloTP, intervaloTP * 0.22)))
         if not cerrado and tpAleatorio and not ocupado
         and tick() >= pausaHasta
         and (not DETECTAR_INPUT or (tick() - lastInputTime) > 1.2) then
