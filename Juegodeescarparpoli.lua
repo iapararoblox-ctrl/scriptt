@@ -788,7 +788,7 @@ punto.BorderSizePixel = 0
 punto.Parent = barra
 redondear(punto, 5)
 
-local titulo = crearTexto(barra, "MAYKEL DEV1", 15, COL_TEXTO, Enum.Font.GothamBold)
+local titulo = crearTexto(barra, "MAYKEL DEV2", 15, COL_TEXTO, Enum.Font.GothamBold)
 titulo.Size = UDim2.new(1, -130, 1, 0)
 titulo.Position = UDim2.fromOffset(32, 0)
 
