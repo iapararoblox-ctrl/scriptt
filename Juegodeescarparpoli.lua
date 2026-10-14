@@ -72,8 +72,8 @@ local BURBUJA_ENFRIAMIENTO = 1
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"
-local DISTANCIA_SEGURA = 6
-local INTERVALO_EVASION = 0.02
+local DISTANCIA_SEGURA = 15
+local INTERVALO_EVASION = 0.01
 local EVASION_COOLDOWN = 0.3
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
