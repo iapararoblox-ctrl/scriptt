@@ -1,3 +1,6 @@
+-----------------------------------------------------------------------------
+-----------------------------MAYKEL CREADOR ---------------------------------
+-----------------------------------------------------------------------------
 --[[  AUTO BURBUJAS (móvil + PC) · UI MODULAR · SOLO DESPLAZAMIENTO
 
     Ya no hay ningún TP: TODO el movimiento (ir a burbujas, moverse al azar,
