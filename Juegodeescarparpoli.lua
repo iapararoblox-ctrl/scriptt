@@ -1,7 +1,7 @@
 --[[  AUTO BURBUJAS
     - Auto recolección de burbujas según el nivel de oxígeno
     - TP aleatorio sin repetir ubicaciones
-    - Evadir mobs: si un enemigo se acerca, hace TP a una zona lejos de él
+    - Evadir mobs: si un enemigo se acerca, hace TP a una zona  lejos de él
 --]]
 
 local Players = game:GetService("Players")
