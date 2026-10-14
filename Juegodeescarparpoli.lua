@@ -7,12 +7,14 @@
     - Panel con UIScale: se ajusta solo al tamaño de la pantalla (vertical/horizontal)
     - Se puede arrastrar sin salirse de la pantalla; se vuelve a acomodar al girar el teléfono
     - Cada fila de interruptor se activa tocando en cualquier parte de la fila
-    - Sliders con zona táctil grande y seguimiento de UN solo dedo (no choca con el joystick)
-    - La pausa por movimiento manual ahora usa el joystick (MoveDirection), no cualquier toque
+    - Slider de oxígeno con zona táctil grande y seguimiento de UN solo dedo
+    - La pausa por movimiento manual usa el joystick (MoveDirection), no cualquier toque
     - Botones más grandes y GUI protegida con gethui() si el ejecutor la tiene
 
-    Novedad:
-    - Velocidad de recolección de burbujas y velocidad del TP aleatorio son INDEPENDIENTES
+    NOVEDAD:
+    - La velocidad de recolección y la velocidad del TP aleatorio YA NO tienen
+      slider: el jugador no puede cambiarlas. Solo se ajustan aquí abajo, en
+      la sección "AJUSTES DE VELOCIDAD".
 --]]
 
 local Players = game:GetService("Players")
@@ -24,50 +26,82 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 ---------------------------------------------------------------------
--- Configuración
+-- ╔═══════════════════════════════════════════════════════════════╗
+-- ║              AJUSTES DE VELOCIDAD (EDITA AQUÍ)                ║
+-- ╚═══════════════════════════════════════════════════════════════╝
+-- Solo cambia el NÚMERO que está después del signo "=". Nada más.
+--
+-- 1) VELOCIDAD_BURBUJAS = cuántas burbujas recoge por segundo.
+--      1  = muy lento  (1 burbuja cada 1 segundo)
+--      2  = normal     (1 burbuja cada 0.5 segundos)
+--      3  = rápido
+--      (ver el aviso de TIEMPO_SOBRE_BURBUJA más abajo: limita el máximo)
+--
+-- 2) VELOCIDAD_TP = cuántos teletransportes aleatorios hace por segundo.
+--      0.5 = 1 TP cada 2 segundos (lento)
+--      1   = 1 TP cada 1 segundo
+--      2   = 2 TP por segundo
+--      5   = muy rápido
+--
+-- 3) TIEMPO_SOBRE_BURBUJA = segundos mínimos que se queda encima de cada
+--      burbuja para que el juego registre el toque.
+--      OJO: este número pone un TOPE a la velocidad de burbujas.
+--      Con 0.35 el máximo real es ~2.8 burbujas por segundo, aunque
+--      pongas VELOCIDAD_BURBUJAS = 10.
+--      Si quieres ir más rápido, baja este número (por ejemplo 0.2),
+--      pero si las burbujas dejan de contarse, vuelve a subirlo.
+---------------------------------------------------------------------
+local VELOCIDAD_BURBUJAS = 3         -- burbujas por segundo   <<< CAMBIA ESTE
+local VELOCIDAD_TP = 0.4             -- TPs aleatorios por segundo   <<< CAMBIA ESTE
+local TIEMPO_SOBRE_BURBUJA = 0.35    -- segundos mínimos sobre la burbuja
+---------------------------------------------------------------------
+-- FIN DE LOS AJUSTES DE VELOCIDAD
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+-- Configuración general (no hace falta tocar)
 ---------------------------------------------------------------------
 local RADIO = 100000                 -- radio de recolección
 local INTERVALO = 1.5                -- segundos base entre ciclos
-local INTERVALO_JITTER = 1.2 --0.6 estaba         -- ±variación aleatoria
+local INTERVALO_JITTER = 1.2         -- ±variación aleatoria
 local DESTINO = Vector3.new(11, 49, -553)
 local ALTURA_PLATAFORMA = 3.5        -- distancia centro del personaje -> centro de la plataforma
 
-local VEL_MIN, VEL_MAX = 1,  5       -- burbujas por segundo (recolección)
-local VELTP_MIN, VELTP_MAX = 0.5, 5  -- TPs aleatorios por segundo
 local UMBRAL_MIN, UMBRAL_MAX = 5, 95
 
 local RADIO_TP = 300                 -- radio de TP aleatorio
 local SEPARACION = 60
 local CANDIDATOS = 60
 
-local PAUSA_CADA = 8                -- cada N burbujas, pausa larga
+local PAUSA_CADA = 8                 -- cada N burbujas, pausa larga
 local PAUSA_MIN, PAUSA_MAX = 4, 9    -- segundos de pausa
 local BURBUJAS_POR_CICLO = 3         -- burbujas máximas por ciclo
 local DETECTAR_INPUT = true          -- pausar si el jugador se mueve a mano con el joystick (no aplica en modo rápido)
 local BURBUJA_ENFRIAMIENTO = 1       -- segundos antes de volver a visitar la misma burbuja
-local MIN_PERMANENCIA = 0.35         -- segundos mínimos sobre la burbuja (para que registre el toque)
 
 -- Movimiento hacia las burbujas
-local MOVIMIENTO_SUAVE = true        -- true = desliza; false = TP instantáneo
+local MOVIMIENTO_SUAVE = false       -- true = desliza; false = TP instantáneo
 local VELOCIDAD_TWEEN = 100          -- studs por segundo del deslizamiento
-local TWEEN_MAX = 1                -- duración máxima de cada desplazamiento (segundos)
-local VELOCIDAD_EVASION = 70       -- studs/s al huir de un mob (más rápido que el normal)
-local EVASION_TWEEN_MAX = 0.6       -- duración máxima de la huida (segundos)
+local TWEEN_MAX = 0.8                  -- duración máxima de cada desplazamiento (segundos)
+local VELOCIDAD_EVASION = 70         -- studs/s al huir de un mob (más rápido que el normal)
+local EVASION_TWEEN_MAX = 0.6        -- duración máxima de la huida (segundos)
 
 -- Evadir mobs
 local CARPETA_ENEMIGOS = "Enemies"   -- Workspace.<nombre> con los enemigos
-local DISTANCIA_SEGURA = 6          -- si un mob está más cerca que esto, hace TP lejos
+local DISTANCIA_SEGURA = 6           -- si un mob está más cerca que esto, hace TP lejos
 local DISTANCIA_DESTINO_MIN = 60     -- el punto de escape debe quedar al menos así de lejos de todos los mobs
 local INTERVALO_EVASION = 0.1        -- cada cuánto revisa los mobs
 local EVASION_COOLDOWN = 0.3         -- mínimo entre dos evasiones
 
 -- Tamaño base del panel (se escala solo en pantallas pequeñas)
-local PANEL_W, PANEL_H = 260, 438
+local PANEL_W, PANEL_H = 260, 326
 local BURBUJA_TAM = 56
 
 -- Estado
-local velocidad = 6                  -- velocidad de recolección de burbujas
-local velocidadTP = 0.5              -- velocidad del TP aleatorio (TPs por segundo)
+-- (se protegen de valores en 0 o negativos para que el script no se rompa)
+local velocidad = math.max(0.1, VELOCIDAD_BURBUJAS)   -- burbujas por segundo (fijo, solo desde el código)
+local velocidadTP = math.max(0.1, VELOCIDAD_TP)       -- TPs aleatorios por segundo (fijo, solo desde el código)
+local MIN_PERMANENCIA = math.max(0, TIEMPO_SOBRE_BURBUJA)
 local umbralOxigeno = 50
 local controlOxigeno = true
 local recolectando = false
@@ -758,25 +792,12 @@ sliderUmbral = crearSlider(panel, 206, {
     end,
 })
 
--- Slider 1: velocidad de RECOLECCIÓN de burbujas
-crearSlider(panel, 262, {
-    min = VEL_MIN, max = VEL_MAX, paso = 1, inicial = velocidad,
-    textoMin = "Lento", textoMax = "Rápido",
-    formato = function(v) return string.format("Vel. burbujas: %d burb/s  (%.2fs)", v, 1 / v) end,
-    alCambiar = function(v) velocidad = v end,
-})
-
--- Slider 2: velocidad del TP ALEATORIO (independiente del anterior)
-crearSlider(panel, 318, {
-    min = VELTP_MIN, max = VELTP_MAX, paso = 0.5, inicial = velocidadTP,
-    textoMin = "Lento", textoMax = "Rápido",
-    formato = function(v) return string.format("Vel. TP aleatorio: %.1f TP/s  (%.2fs)", v, 1 / v) end,
-    alCambiar = function(v) velocidadTP = v end,
-})
+-- (Los sliders de velocidad de burbujas y de TP aleatorio fueron eliminados:
+--  ahora se ajustan solo desde la sección "AJUSTES DE VELOCIDAD" al inicio.)
 
 local lblContador = crearTexto(panel, "Recogidas: 0  ·  Evasiones: 0", 13, COL_SUB)
 lblContador.Size = UDim2.new(1, -28, 0, 20)
-lblContador.Position = UDim2.fromOffset(14, 380)
+lblContador.Position = UDim2.fromOffset(14, 268)
 
 local function actualizarContador()
     lblContador.Text = string.format("Recogidas: %d  ·  Evasiones: %d", recogidas, evasiones)
@@ -784,7 +805,7 @@ end
 
 local lblEstado = crearTexto(panel, "Estado: inactivo", 12, COL_SUB)
 lblEstado.Size = UDim2.new(1, -28, 0, 32)
-lblEstado.Position = UDim2.fromOffset(14, 402)
+lblEstado.Position = UDim2.fromOffset(14, 290)
 lblEstado.TextWrapped = true
 lblEstado.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -1017,7 +1038,7 @@ task.spawn(function()
 end)
 
 -- Bucle 2: TP aleatorio (independiente del interruptor principal)
--- Su ritmo lo marca SOLO el slider "Vel. TP aleatorio" (velocidadTP)
+-- Su ritmo lo marca SOLO la variable VELOCIDAD_TP (arriba, en AJUSTES DE VELOCIDAD)
 task.spawn(function()
     while not cerrado do
         local intervaloTP = 1 / velocidadTP
