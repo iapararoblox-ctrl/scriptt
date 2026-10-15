@@ -6,6 +6,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -18,6 +19,15 @@ local VERTICAL_SPEED = 50 -- velocidad extra al subir/bajar con teclas
 local UP_KEY = Enum.KeyCode.Space
 local DOWN_KEY = Enum.KeyCode.LeftShift
 local TOGGLE_KEY = Enum.KeyCode.F -- atajo opcional en PC
+
+-- Combate
+local ENEMIES_FOLDER = "BADEnemies"  -- carpeta en workspace con los enemigos
+local DETECT_RANGE = 80              -- distancia para detectar enemigos
+local MELEE_RANGE = 15               -- distancia para atacar con espada
+local SAFE_DISTANCE = 30             -- con arco: distancia mínima que intenta mantener
+local ATTACK_INTERVAL = 0.35         -- segundos entre ataques
+local ATTACK_COUNT = 3               -- veces que dispara el remote por ataque
+-- El modo (cuerpo a cuerpo / a distancia) se elige desde el panel
 
 ---------------------------------------------------------------------
 -- ESTADO
@@ -162,6 +172,138 @@ local function getParts()
 	return hum, root
 end
 
+---------------------------------------------------------------------
+-- LÓGICA: COMBATE (apuntar, atacar y mantener distancia)
+---------------------------------------------------------------------
+local autoAttack = false
+local keepDistance = false
+local currentTarget -- parte del enemigo más cercano
+local attackToken = 0
+local wasAiming = false
+local combatMode = "melee" -- "melee" (cuerpo a cuerpo) o "ranged" (a distancia)
+
+local function getEquippedTool()
+	local char = player.Character
+	return char and char:FindFirstChildOfClass("Tool")
+end
+
+local function getAttackRemote()
+	local bad = ReplicatedStorage:FindFirstChild("BAD")
+	local remotes = bad and bad:FindFirstChild("Remotes")
+	return remotes and remotes:FindFirstChild("Action")
+end
+
+local function findNearestEnemy()
+	local folder = workspace:FindFirstChild(ENEMIES_FOLDER)
+	local _, root = getParts()
+	if not folder or not root then return nil end
+
+	local best, bestDist = nil, DETECT_RANGE
+	for _, hum in ipairs(folder:GetDescendants()) do
+		if hum:IsA("Humanoid") and hum.Health > 0 then
+			local model = hum.Parent
+			local part = model:FindFirstChild("HumanoidRootPart")
+				or model.PrimaryPart
+				or model:FindFirstChildWhichIsA("BasePart")
+			if part then
+				local d = (part.Position - root.Position).Magnitude
+				if d < bestDist then
+					best, bestDist = part, d
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- Dirección para alejarse del enemigo (solo con arma a distancia)
+local function getEvadeVector()
+	if not keepDistance or not currentTarget or not currentTarget.Parent then return nil end
+	if combatMode ~= "ranged" then return nil end
+	local _, root = getParts()
+	if not root then return nil end
+
+	local offset = root.Position - currentTarget.Position
+	local flat = Vector3.new(offset.X, 0, offset.Z)
+	if flat.Magnitude > SAFE_DISTANCE or flat.Magnitude < 0.01 then
+		return nil
+	end
+	return flat.Unit
+end
+
+-- Busca el enemigo más cercano 10 veces por segundo
+task.spawn(function()
+	while true do
+		if autoAttack or keepDistance then
+			currentTarget = findNearestEnemy()
+		else
+			currentTarget = nil
+		end
+		task.wait(0.1)
+	end
+end)
+
+-- Apuntar al enemigo y alejarse (cuando NO estás volando)
+RunService:BindToRenderStep("CFlyCombat", Enum.RenderPriority.Input.Value + 1, function()
+	local hum, root = getParts()
+	if not hum or not root or flying then return end
+
+	local evade = getEvadeVector()
+	if evade then
+		hum:Move(evade, false)
+	end
+
+	local aiming = autoAttack and currentTarget ~= nil and currentTarget.Parent ~= nil
+	if aiming then
+		hum.AutoRotate = false
+		wasAiming = true
+		local p = currentTarget.Position
+		local from = root.Position
+		root.CFrame = CFrame.lookAt(from, Vector3.new(p.X, from.Y, p.Z))
+	elseif wasAiming then
+		hum.AutoRotate = true
+		wasAiming = false
+	end
+end)
+
+local function startAttackLoop()
+	attackToken += 1
+	local token = attackToken
+	task.spawn(function()
+		while autoAttack and token == attackToken do
+			local _, root = getParts()
+			if root and currentTarget and currentTarget.Parent then
+				local dist = (currentTarget.Position - root.Position).Magnitude
+				if combatMode == "ranged" then
+					local tool = getEquippedTool()
+					if tool then
+						tool:Activate() -- arma a distancia (arco, etc.)
+					end
+				elseif dist <= MELEE_RANGE then
+					local remote = getAttackRemote()
+					if remote then
+						for _ = 1, ATTACK_COUNT do
+							remote:FireServer("attack", nil)
+						end
+					end
+				end
+			end
+			task.wait(ATTACK_INTERVAL)
+		end
+	end)
+end
+
+local function setAutoAttack(state)
+	autoAttack = state
+	if state then
+		startAttackLoop()
+	end
+end
+
+local function setKeepDistance(state)
+	keepDistance = state
+end
+
 local function stopFly()
 	flying = false
 	if connection then
@@ -233,6 +375,12 @@ local function startFly()
 			dir = (look * forward + flatRight.Unit * side) * SPEED
 		end
 
+		-- Mantener distancia también mientras vuelas
+		local evade = getEvadeVector()
+		if evade then
+			dir = dir + evade * SPEED
+		end
+
 		-- Extra opcional: Espacio sube y Shift baja
 		local vertical = 0
 		if UserInputService:IsKeyDown(UP_KEY) or h.Jump then
@@ -247,8 +395,13 @@ local function startFly()
 		r.AssemblyAngularVelocity = Vector3.zero
 
 		local pos = r.Position + velocity * dt
-		if flatLook.Magnitude > 0 then
-			r.CFrame = CFrame.lookAt(pos, pos + flatLook)
+		local faceDir = flatLook
+		if autoAttack and currentTarget and currentTarget.Parent then
+			local d = currentTarget.Position - r.Position
+			faceDir = Vector3.new(d.X, 0, d.Z)
+		end
+		if faceDir.Magnitude > 0 then
+			r.CFrame = CFrame.lookAt(pos, pos + faceDir)
 		else
 			r.CFrame = CFrame.new(pos) * (r.CFrame - r.Position)
 		end
@@ -301,7 +454,7 @@ end
 ---------------------------------------------------------------------
 local PANEL_W = 280
 local TITLE_H = 50
-local FULL_H = 262
+local FULL_H = 308
 local MIN_H = TITLE_H + 4
 
 local panel = Instance.new("Frame")
@@ -377,12 +530,22 @@ local minBtn = makeCircleButton("−", COLORS.yellow, -88)
 local closeBtn = makeCircleButton("✕", COLORS.red, -46)
 
 -- Cuerpo con las opciones
-local body = Instance.new("Frame")
+local body = Instance.new("ScrollingFrame")
 body.Name = "Body"
 body.BackgroundTransparency = 1
+body.BorderSizePixel = 0
 body.Position = UDim2.new(0, 14, 0, TITLE_H + 12)
-body.Size = UDim2.new(1, -28, 0, 190)
+body.Size = UDim2.new(1, -28, 0, 232)
+body.CanvasSize = UDim2.new()
+body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+body.ScrollBarThickness = 3
+body.ScrollBarImageColor3 = COLORS.accentA
+body.ScrollingDirection = Enum.ScrollingDirection.Y
 body.Parent = panel
+
+local bodyPadding = Instance.new("UIPadding")
+bodyPadding.PaddingRight = UDim.new(0, 6)
+bodyPadding.Parent = body
 
 local list = Instance.new("UIListLayout")
 list.Padding = UDim.new(0, 8)
@@ -477,6 +640,60 @@ end)
 
 createRow(3, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
 	setNoclip(value)
+end)
+
+-- Selector: cuerpo a cuerpo / a distancia
+local function createModeSelector(order)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 58)
+	row.BackgroundColor3 = COLORS.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = body
+	corner(row, UDim.new(0, 14))
+
+	local buttons = {}
+
+	local function selectMode(mode)
+		combatMode = mode
+		for key, b in pairs(buttons) do
+			local active = key == mode
+			tween(b, { BackgroundColor3 = active and COLORS.accentA or COLORS.off })
+			b.TextColor3 = active and Color3.new(1, 1, 1) or COLORS.subtext
+		end
+	end
+
+	local function makeButton(mode, text, position)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(0.5, -12, 0, 40)
+		b.Position = position
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 13
+		b.AutoButtonColor = false
+		b.BorderSizePixel = 0
+		b.BackgroundColor3 = COLORS.off
+		b.Parent = row
+		corner(b, UDim.new(0, 10))
+		b.Activated:Connect(function()
+			selectMode(mode)
+		end)
+		buttons[mode] = b
+	end
+
+	makeButton("melee", "Cuerpo a cuerpo", UDim2.new(0, 8, 0.5, -20))
+	makeButton("ranged", "A distancia", UDim2.new(0.5, 4, 0.5, -20))
+	selectMode(combatMode)
+end
+
+createModeSelector(4)
+
+createRow(5, "Auto-ataque", "Apunta y ataca al más cercano", false, function(value)
+	setAutoAttack(value)
+end)
+
+createRow(6, "Mantener distancia", "Solo en modo a distancia", false, function(value)
+	setKeepDistance(value)
 end)
 
 -- Botón pequeño para reabrir el panel cuando se cierra
