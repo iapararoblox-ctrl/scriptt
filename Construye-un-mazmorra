@@ -26,9 +26,20 @@ local DETECT_RANGE = 80              -- distancia para detectar enemigos
 local MELEE_RANGE = 15               -- distancia para atacar en cuerpo a cuerpo
 local SAFE_DISTANCE = 30             -- modo a distancia: distancia que intenta mantener
 local ATTACK_INTERVAL = 0.35         -- segundos entre ataques
-local ATTACK_COUNT = 3               -- veces que dispara el remote por ataque
+local WEAPON_NAME = "Dungeon Blade"  -- arma que se equipa sola si está en la mochila
+local USE_TOOL_ACTIVATE = true       -- usa tool:Activate() (lanza el ataque real del arma)
+local FIRE_REMOTE = true             -- además dispara el remote "attack" con los pasos de abajo
+
+-- Pasos del remote tal como los grabaste.
+-- arg = segundo argumento, count = veces que se dispara en cada ataque.
+-- (En tu grabación los counts eran 4, 3, 7 y 9; empieza con 1 y súbelos si hace falta.)
+local ATTACK_STEPS = {
+	{ arg = 6, count = 1 },
+	{ arg = 5, count = 1 },
+	{ arg = 7, count = 1 },
+	{ arg = nil, count = 1 },
+}
 local TP_DISTANCE = 6                -- a qué distancia del enemigo te teletransportas
-local RANGED_ACTIVATE_TOOL = true    -- en modo a distancia, también usa tool:Activate()
 
 ---------------------------------------------------------------------
 -- ESTADO
@@ -210,11 +221,54 @@ local function getAttackRemote()
 	return remotes and remotes:FindFirstChild("Action")
 end
 
+local warned = {}
+local function warnOnce(key, message)
+	if not warned[key] then
+		warned[key] = true
+		warn("[CFly] " .. message)
+	end
+end
+
+-- Equipa el arma si está en la mochila
+local function equipWeapon()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return nil end
+
+	local tool = char:FindFirstChild(WEAPON_NAME)
+	if tool and tool:IsA("Tool") then
+		return tool
+	end
+
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	local inBackpack = backpack and backpack:FindFirstChild(WEAPON_NAME)
+	if inBackpack and inBackpack:IsA("Tool") then
+		hum:EquipTool(inBackpack)
+		return inBackpack
+	end
+
+	return getEquippedTool()
+end
+
 local function fireAttack()
-	local remote = getAttackRemote()
-	if remote then
-		for _ = 1, ATTACK_COUNT do
-			remote:FireServer("attack", nil)
+	local tool = equipWeapon()
+
+	-- Ataque real del arma (lo mismo que haces al tocar la pantalla)
+	if USE_TOOL_ACTIVATE and tool and tool.Parent == player.Character then
+		tool:Activate()
+	end
+
+	-- Además, dispara el remote con los pasos grabados
+	if FIRE_REMOTE then
+		local remote = getAttackRemote()
+		if not remote then
+			warnOnce("remote", "No encontré ReplicatedStorage.BAD.Remotes.Action")
+			return
+		end
+		for _, step in ipairs(ATTACK_STEPS) do
+			for _ = 1, step.count do
+				remote:FireServer("attack", step.arg)
+			end
 		end
 	end
 end
@@ -222,7 +276,11 @@ end
 local function findNearestEnemy()
 	local folder = workspace:FindFirstChild(ENEMIES_FOLDER)
 	local _, root = getParts()
-	if not folder or not root then return nil end
+	if not folder then
+		warnOnce("folder", "No encontré la carpeta workspace." .. ENEMIES_FOLDER)
+		return nil
+	end
+	if not root then return nil end
 
 	local best, bestDist = nil, DETECT_RANGE
 	for _, hum in ipairs(folder:GetDescendants()) do
@@ -239,6 +297,21 @@ local function findNearestEnemy()
 			end
 		end
 	end
+	-- Respaldo: enemigos sin Humanoid (modelos simples)
+	if not best then
+		for _, model in ipairs(folder:GetChildren()) do
+			if model:IsA("Model") and not model:FindFirstChildOfClass("Humanoid") then
+				local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+				if part then
+					local d = (part.Position - root.Position).Magnitude
+					if d < bestDist then
+						best, bestDist = part, d
+					end
+				end
+			end
+		end
+	end
+
 	return best
 end
 
@@ -317,17 +390,9 @@ local function startAttackLoop()
 			local _, root = getParts()
 			if root and currentTarget and currentTarget.Parent then
 				local dist = (currentTarget.Position - root.Position).Magnitude
-				if combatMode == "ranged" then
-					-- A distancia: ataca mientras haya un enemigo detectado
-					fireAttack()
-					if RANGED_ACTIVATE_TOOL then
-						local tool = getEquippedTool()
-						if tool then
-							tool:Activate()
-						end
-					end
-				elseif dist <= MELEE_RANGE then
-					-- Cuerpo a cuerpo: solo si está cerca
+				-- A distancia: ataca con cualquier enemigo detectado.
+				-- Cuerpo a cuerpo: solo si está cerca.
+				if combatMode == "ranged" or dist <= MELEE_RANGE then
 					fireAttack()
 				end
 			end
