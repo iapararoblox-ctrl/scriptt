@@ -22,7 +22,7 @@ local TOGGLE_KEY = Enum.KeyCode.F -- atajo opcional en PC
 
 -- Combate
 local ENEMIES_FOLDER = "BADEnemies"  -- carpeta en workspace con los enemigos
-local DETECT_RANGE = 80              -- distancia para detectar enemigos
+local DETECT_RANGE = 100              -- distancia para detectar enemigos
 local MELEE_RANGE = 15               -- distancia para atacar en cuerpo a cuerpo
 local SAFE_DISTANCE = 30             -- modo a distancia: distancia que intenta mantener
 local ATTACK_INTERVAL = 0.1        -- segundos entre ataques
