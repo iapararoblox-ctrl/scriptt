@@ -1,0 +1,541 @@
+-- CFly + Noclip con panel para celular
+-- Colócalo como LocalScript en StarterPlayer > StarterPlayerScripts
+-- (reemplaza el script anterior de CFly)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+---------------------------------------------------------------------
+-- CONFIGURACIÓN
+---------------------------------------------------------------------
+local SPEED = 60          -- velocidad al volar (studs/segundo)
+local VERTICAL_SPEED = 50 -- velocidad extra al subir/bajar con teclas
+local UP_KEY = Enum.KeyCode.Space
+local DOWN_KEY = Enum.KeyCode.LeftShift
+local TOGGLE_KEY = Enum.KeyCode.F -- atajo opcional en PC
+
+---------------------------------------------------------------------
+-- ESTADO
+---------------------------------------------------------------------
+local flying = false
+local noclip = false
+local connection
+local flyAttachment, flyVelocity
+local noclipConn
+local originalCollide = {}
+
+-- Referencias que se asignan más abajo
+local bubble
+local setFlyRow
+local toggleFly
+
+---------------------------------------------------------------------
+-- TEMA / HELPERS DE UI
+---------------------------------------------------------------------
+local COLORS = {
+	panel = Color3.fromRGB(22, 24, 36),
+	row = Color3.fromRGB(33, 36, 52),
+	text = Color3.fromRGB(240, 242, 255),
+	subtext = Color3.fromRGB(150, 155, 180),
+	on = Color3.fromRGB(72, 220, 150),
+	off = Color3.fromRGB(70, 74, 96),
+	accentA = Color3.fromRGB(140, 90, 255),
+	accentB = Color3.fromRGB(60, 190, 255),
+	red = Color3.fromRGB(255, 95, 110),
+	yellow = Color3.fromRGB(255, 200, 70),
+	bubbleOff = Color3.fromRGB(200, 50, 50),
+	bubbleOn = Color3.fromRGB(50, 200, 90),
+}
+
+local function corner(obj, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = radius
+	c.Parent = obj
+	return c
+end
+
+local function tween(obj, props, t)
+	TweenService:Create(
+		obj,
+		TweenInfo.new(t or 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		props
+	):Play()
+end
+
+-- Hace que "target" se pueda arrastrar tomando "handle".
+-- Si el usuario solo toca (sin arrastrar) se llama a onTap.
+local function makeDraggable(handle, target, onTap)
+	local dragging, moved = false, false
+	local dragStart, startPos, activeInput
+
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			moved = false
+			activeInput = input
+			dragStart = input.Position
+			startPos = target.Position
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input == activeInput or input.UserInputType == Enum.UserInputType.MouseMovement then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 8 then
+				moved = true
+			end
+			if moved then
+				target.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y
+				)
+			end
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if not dragging then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+			if not moved and onTap then
+				onTap()
+			end
+		end
+	end)
+end
+
+---------------------------------------------------------------------
+-- GUI BASE + BURBUJA
+---------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "CFlyGui"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 10
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+bubble = Instance.new("TextButton")
+bubble.Name = "Bubble"
+bubble.Size = UDim2.fromOffset(64, 64)
+bubble.Position = UDim2.new(1, -90, 0.5, 0)
+bubble.BackgroundColor3 = COLORS.bubbleOff
+bubble.Text = "FLY\nOFF"
+bubble.TextColor3 = Color3.new(1, 1, 1)
+bubble.TextScaled = true
+bubble.Font = Enum.Font.GothamBold
+bubble.AutoButtonColor = false
+bubble.Parent = gui
+corner(bubble, UDim.new(1, 0))
+
+local bubbleStroke = Instance.new("UIStroke")
+bubbleStroke.Thickness = 3
+bubbleStroke.Color = Color3.new(1, 1, 1)
+bubbleStroke.Parent = bubble
+
+local bubblePadding = Instance.new("UIPadding")
+bubblePadding.PaddingTop = UDim.new(0, 12)
+bubblePadding.PaddingBottom = UDim.new(0, 12)
+bubblePadding.PaddingLeft = UDim.new(0, 10)
+bubblePadding.PaddingRight = UDim.new(0, 10)
+bubblePadding.Parent = bubble
+
+makeDraggable(bubble, bubble, function()
+	toggleFly()
+end)
+
+---------------------------------------------------------------------
+-- LÓGICA: VUELO (CFLY)
+---------------------------------------------------------------------
+local function getParts()
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	return hum, root
+end
+
+local function stopFly()
+	flying = false
+	if connection then
+		connection:Disconnect()
+		connection = nil
+	end
+	if flyVelocity then
+		flyVelocity:Destroy()
+		flyVelocity = nil
+	end
+	if flyAttachment then
+		flyAttachment:Destroy()
+		flyAttachment = nil
+	end
+	local hum = getParts()
+	if hum then
+		hum.PlatformStand = false
+	end
+	bubble.Text = "FLY\nOFF"
+	tween(bubble, { BackgroundColor3 = COLORS.bubbleOff })
+	if setFlyRow then setFlyRow(false, true) end
+end
+
+local function startFly()
+	local hum, root = getParts()
+	if not hum or not root then return end
+
+	flying = true
+	hum.PlatformStand = true
+
+	-- Fuerza que cancela la gravedad (evita que te hundas)
+	flyAttachment = Instance.new("Attachment")
+	flyAttachment.Name = "CFlyAttachment"
+	flyAttachment.Parent = root
+
+	flyVelocity = Instance.new("LinearVelocity")
+	flyVelocity.Name = "CFlyVelocity"
+	flyVelocity.Attachment0 = flyAttachment
+	flyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	flyVelocity.MaxForce = math.huge
+	flyVelocity.VectorVelocity = Vector3.zero
+	flyVelocity.Parent = root
+
+	bubble.Text = "FLY\nON"
+	tween(bubble, { BackgroundColor3 = COLORS.bubbleOn })
+	if setFlyRow then setFlyRow(true, true) end
+
+	connection = RunService.RenderStepped:Connect(function(dt)
+		local h, r = getParts()
+		if not h or not r then return end
+
+		-- Dirección según la cámara (sube/baja según donde mires)
+		local camCF = camera.CFrame
+		local look = camCF.LookVector
+		local flatLook = Vector3.new(look.X, 0, look.Z)
+		local flatRight = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
+
+		local move = h.MoveDirection
+		local forward, side = 0, 0
+		if flatLook.Magnitude > 0 then
+			forward = move:Dot(flatLook.Unit)
+		end
+		if flatRight.Magnitude > 0 then
+			side = move:Dot(flatRight.Unit)
+		end
+
+		local dir = Vector3.zero
+		if flatRight.Magnitude > 0 then
+			dir = (look * forward + flatRight.Unit * side) * SPEED
+		end
+
+		-- Extra opcional: Espacio sube y Shift baja
+		local vertical = 0
+		if UserInputService:IsKeyDown(UP_KEY) or h.Jump then
+			vertical = VERTICAL_SPEED
+		elseif UserInputService:IsKeyDown(DOWN_KEY) then
+			vertical = -VERTICAL_SPEED
+		end
+
+		local velocity = dir + Vector3.new(0, vertical, 0)
+
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+
+		local pos = r.Position + velocity * dt
+		if flatLook.Magnitude > 0 then
+			r.CFrame = CFrame.lookAt(pos, pos + flatLook)
+		else
+			r.CFrame = CFrame.new(pos) * (r.CFrame - r.Position)
+		end
+	end)
+end
+
+toggleFly = function()
+	if flying then
+		stopFly()
+	else
+		startFly()
+	end
+end
+
+---------------------------------------------------------------------
+-- LÓGICA: ATRAVESAR PAREDES (NOCLIP)
+---------------------------------------------------------------------
+local function setNoclip(state)
+	noclip = state
+	if noclipConn then
+		noclipConn:Disconnect()
+		noclipConn = nil
+	end
+
+	if state then
+		noclipConn = RunService.Stepped:Connect(function()
+			local char = player.Character
+			if not char then return end
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then
+					if originalCollide[part] == nil then
+						originalCollide[part] = part.CanCollide
+					end
+					part.CanCollide = false
+				end
+			end
+		end)
+	else
+		for part, original in pairs(originalCollide) do
+			if part and part.Parent then
+				part.CanCollide = original
+			end
+		end
+		originalCollide = {}
+	end
+end
+
+---------------------------------------------------------------------
+-- PANEL (bonito, para celular)
+---------------------------------------------------------------------
+local PANEL_W = 280
+local TITLE_H = 50
+local FULL_H = 262
+local MIN_H = TITLE_H + 4
+
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.AnchorPoint = Vector2.new(0.5, 0)
+panel.Position = UDim2.new(0.5, 0, 0.12, 0)
+panel.Size = UDim2.fromOffset(PANEL_W, FULL_H)
+panel.BackgroundColor3 = COLORS.panel
+panel.BorderSizePixel = 0
+panel.ClipsDescendants = true
+panel.Parent = gui
+corner(panel, UDim.new(0, 20))
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Thickness = 2
+panelStroke.Color = Color3.new(1, 1, 1)
+panelStroke.Parent = panel
+
+local strokeGradient = Instance.new("UIGradient")
+strokeGradient.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+strokeGradient.Rotation = 45
+strokeGradient.Parent = panelStroke
+
+-- Barra de título (zona para arrastrar)
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
+titleBar.BackgroundTransparency = 1
+titleBar.Active = true
+titleBar.Parent = panel
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(18, 0)
+title.Size = UDim2.new(1, -110, 1, 0)
+title.Text = "✈  Panel de Vuelo"
+title.TextColor3 = COLORS.text
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextTruncate = Enum.TextTruncate.AtEnd
+title.Parent = titleBar
+
+-- Línea decorativa con degradado
+local divider = Instance.new("Frame")
+divider.Position = UDim2.new(0, 16, 0, TITLE_H)
+divider.Size = UDim2.new(1, -32, 0, 2)
+divider.BackgroundColor3 = Color3.new(1, 1, 1)
+divider.BorderSizePixel = 0
+divider.Parent = panel
+corner(divider, UDim.new(1, 0))
+local dividerGradient = Instance.new("UIGradient")
+dividerGradient.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+dividerGradient.Parent = divider
+
+-- Botones minimizar y cerrar
+local function makeCircleButton(text, color, xOffset)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(34, 34)
+	b.Position = UDim2.new(1, xOffset, 0, 8)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(30, 30, 40)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 18
+	b.AutoButtonColor = true
+	b.Parent = panel
+	corner(b, UDim.new(1, 0))
+	return b
+end
+
+local minBtn = makeCircleButton("−", COLORS.yellow, -88)
+local closeBtn = makeCircleButton("✕", COLORS.red, -46)
+
+-- Cuerpo con las opciones
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.BackgroundTransparency = 1
+body.Position = UDim2.new(0, 14, 0, TITLE_H + 12)
+body.Size = UDim2.new(1, -28, 0, 190)
+body.Parent = panel
+
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 8)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = body
+
+-- Fila con interruptor (toggle)
+local function createRow(order, titleText, subtitleText, initial, callback)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 58)
+	row.BackgroundColor3 = COLORS.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = body
+	corner(row, UDim.new(0, 14))
+
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Position = UDim2.fromOffset(14, 8)
+	t.Size = UDim2.new(1, -92, 0, 22)
+	t.Text = titleText
+	t.TextColor3 = COLORS.text
+	t.Font = Enum.Font.GothamBold
+	t.TextSize = 15
+	t.TextXAlignment = Enum.TextXAlignment.Left
+	t.TextTruncate = Enum.TextTruncate.AtEnd
+	t.Parent = row
+
+	local s = Instance.new("TextLabel")
+	s.BackgroundTransparency = 1
+	s.Position = UDim2.fromOffset(14, 30)
+	s.Size = UDim2.new(1, -92, 0, 18)
+	s.Text = subtitleText
+	s.TextColor3 = COLORS.subtext
+	s.Font = Enum.Font.Gotham
+	s.TextSize = 12
+	s.TextXAlignment = Enum.TextXAlignment.Left
+	s.TextTruncate = Enum.TextTruncate.AtEnd
+	s.Parent = row
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.fromOffset(52, 30)
+	track.Position = UDim2.new(1, -66, 0.5, -15)
+	track.BackgroundColor3 = COLORS.off
+	track.BorderSizePixel = 0
+	track.Parent = row
+	corner(track, UDim.new(1, 0))
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(24, 24)
+	knob.Position = UDim2.new(0, 3, 0.5, -12)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+	corner(knob, UDim.new(1, 0))
+
+	-- Toda la fila es táctil (más fácil en celular)
+	local hit = Instance.new("TextButton")
+	hit.Size = UDim2.new(1, 0, 1, 0)
+	hit.BackgroundTransparency = 1
+	hit.Text = ""
+	hit.ZIndex = 5
+	hit.Parent = row
+
+	local state = initial
+	local function set(value, silent)
+		state = value
+		tween(track, { BackgroundColor3 = value and COLORS.on or COLORS.off })
+		tween(knob, { Position = value and UDim2.new(1, -27, 0.5, -12) or UDim2.new(0, 3, 0.5, -12) })
+		if not silent then
+			callback(value)
+		end
+	end
+
+	hit.Activated:Connect(function()
+		set(not state)
+	end)
+
+	set(initial, true)
+	return set
+end
+
+createRow(1, "Burbuja de vuelo", "Mostrar el botón flotante", true, function(value)
+	bubble.Visible = value
+end)
+
+setFlyRow = createRow(2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
+	if value ~= flying then
+		toggleFly()
+	end
+end)
+
+createRow(3, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
+	setNoclip(value)
+end)
+
+-- Botón pequeño para reabrir el panel cuando se cierra
+local reopenBtn = Instance.new("TextButton")
+reopenBtn.Name = "ReopenButton"
+reopenBtn.Size = UDim2.fromOffset(46, 46)
+reopenBtn.Position = UDim2.new(0, 14, 0.35, 0)
+reopenBtn.BackgroundColor3 = COLORS.panel
+reopenBtn.BackgroundTransparency = 0.1
+reopenBtn.Text = "☰"
+reopenBtn.TextColor3 = COLORS.text
+reopenBtn.Font = Enum.Font.GothamBold
+reopenBtn.TextSize = 22
+reopenBtn.AutoButtonColor = false
+reopenBtn.Visible = false
+reopenBtn.Parent = gui
+corner(reopenBtn, UDim.new(1, 0))
+
+local reopenStroke = Instance.new("UIStroke")
+reopenStroke.Thickness = 2
+reopenStroke.Color = Color3.new(1, 1, 1)
+reopenStroke.Parent = reopenBtn
+local reopenGradient = Instance.new("UIGradient")
+reopenGradient.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+reopenGradient.Rotation = 45
+reopenGradient.Parent = reopenStroke
+
+-- Comportamiento de minimizar / cerrar / reabrir
+local minimized = false
+
+minBtn.Activated:Connect(function()
+	minimized = not minimized
+	minBtn.Text = minimized and "+" or "−"
+	tween(panel, { Size = UDim2.fromOffset(PANEL_W, minimized and MIN_H or FULL_H) }, 0.22)
+end)
+
+closeBtn.Activated:Connect(function()
+	panel.Visible = false
+	reopenBtn.Visible = true
+end)
+
+makeDraggable(titleBar, panel)
+makeDraggable(reopenBtn, reopenBtn, function()
+	panel.Visible = true
+	reopenBtn.Visible = false
+end)
+
+---------------------------------------------------------------------
+-- EXTRAS
+---------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == TOGGLE_KEY then
+		toggleFly()
+	end
+end)
+
+-- Si el personaje reaparece, apagar el vuelo (el noclip se mantiene)
+player.CharacterAdded:Connect(function()
+	stopFly()
+	originalCollide = {}
+end)
