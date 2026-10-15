@@ -1,4 +1,4 @@
--- CFly + Noclip + Combate + TP, con panel para celular
+-- CFly + Noclip + Combate + TP + Auto-cofres, con panel para celular
 -- Colócalo como LocalScript en StarterPlayer > StarterPlayerScripts
 -- (reemplaza el script anterior)
 
@@ -22,17 +22,17 @@ local TOGGLE_KEY = Enum.KeyCode.F -- atajo opcional en PC
 
 -- Combate
 local ENEMIES_FOLDER = "BADEnemies"  -- carpeta en workspace con los enemigos
-local DETECT_RANGE = 1000000000              -- distancia para detectar enemigos
+local DETECT_RANGE = 1000000000      -- distancia para detectar enemigos
 local MELEE_RANGE = 15               -- distancia para atacar en cuerpo a cuerpo
-local SAFE_DISTANCE = 60            -- modo a distancia: distancia que intenta mantener
-local ATTACK_INTERVAL = 0.1        -- segundos entre ataques
+local SAFE_DISTANCE = 70             -- modo a distancia: distancia que intenta mantener
+local EVADE_SPEED = 90               -- velocidad con la que te alejas (más alto = esquiva más rápido)
+local ATTACK_INTERVAL = 0.1          -- segundos entre ataques
 local WEAPON_NAME = "Dungeon Blade"  -- arma que se equipa sola si está en la mochila
 local USE_TOOL_ACTIVATE = true       -- usa tool:Activate() (lanza el ataque real del arma)
 local FIRE_REMOTE = true             -- además dispara el remote "attack" con los pasos de abajo
 
 -- Pasos del remote tal como los grabaste.
 -- arg = segundo argumento, count = veces que se dispara en cada ataque.
--- (En tu grabación los counts eran 4, 3, 7 y 9; empieza con 1 y súbelos si hace falta.)
 local ATTACK_STEPS = {
 	{ arg = 6, count = 1 },
 	{ arg = 5, count = 1 },
@@ -40,6 +40,13 @@ local ATTACK_STEPS = {
 	{ arg = nil, count = 1 },
 }
 local TP_DISTANCE = 6                -- a qué distancia del enemigo te teletransportas
+
+-- Auto-cofres: workspace.Labyrinth.Chest (cada Chest tiene Body > ProximityPrompt)
+local CHEST_ROOT = "Labyrinth"       -- carpeta en workspace donde están los cofres
+local CHEST_NAME = "Chest"           -- nombre de los cofres
+local CHEST_OFFSET_Y = 3             -- altura sobre el cofre al teletransportarte
+local CHEST_TP_DELAY = 0.15          -- espera después de teletransportarte
+local CHEST_MAX_TRIES = 3            -- intentos por cofre antes de saltarlo
 
 ---------------------------------------------------------------------
 -- ESTADO
@@ -51,11 +58,15 @@ local autoAttack = false   -- apuntar + atacar
 local tpAttack = false     -- teletransportarse al enemigo + atacar
 local tpEnemy = false      -- solo teletransportarse al enemigo
 local keepDistance = false -- mantener distancia (modo a distancia)
+local autoChest = false    -- recoger cofres automáticamente
+local chestBusy = false    -- true mientras se recoge un cofre (pausa TP/evasión)
 local combatMode = "melee" -- "melee" (cuerpo a cuerpo) o "ranged" (a distancia)
 
 local currentTarget        -- parte del enemigo más cercano
 local attackToken = 0
+local chestToken = 0
 local wasAiming = false
+local enemyCache = {}      -- lista de enemigos (Humanoid o Model), se refresca sola
 
 local connection
 local flyAttachment, flyVelocity
@@ -67,13 +78,16 @@ local allConnections = {}
 local bubble
 local setFlyRow
 local toggleFly
+local chestSub
+local chestsCollected = 0
 
 ---------------------------------------------------------------------
 -- TEMA / HELPERS DE UI
 ---------------------------------------------------------------------
 local COLORS = {
-	panel = Color3.fromRGB(22, 24, 36),
-	row = Color3.fromRGB(33, 36, 52),
+	panel = Color3.fromRGB(20, 22, 34),
+	row = Color3.fromRGB(32, 35, 51),
+	rowOn = Color3.fromRGB(32, 52, 58),
 	text = Color3.fromRGB(240, 242, 255),
 	subtext = Color3.fromRGB(150, 155, 180),
 	on = Color3.fromRGB(72, 220, 150),
@@ -107,11 +121,45 @@ local function track(conn)
 	return conn
 end
 
--- Hace que "target" se pueda arrastrar tomando "handle".
+-- GUI base (IgnoreGuiInset = true para que las coordenadas sean de pantalla completa)
+local gui = Instance.new("ScreenGui")
+gui.Name = "CFlyGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 10
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+-- Márgenes para que nada quede pegado/fuera de la pantalla
+local EDGE = 8       -- margen izquierdo/derecho/inferior
+local TOP_EDGE = 44  -- margen superior (deja libre el menú de Roblox)
+
+-- Coloca un objeto en (x, y) de pantalla (esquina superior izquierda),
+-- limitándolo SIEMPRE a que quede dentro de la pantalla.
+local function placeAt(obj, x, y)
+	local screen = gui.AbsoluteSize
+	if screen.X <= 0 or screen.Y <= 0 then return end
+	local size = obj.AbsoluteSize
+	local maxX = math.max(EDGE, screen.X - size.X - EDGE)
+	local maxY = math.max(TOP_EDGE, screen.Y - size.Y - EDGE)
+	x = math.clamp(x, EDGE, maxX)
+	y = math.clamp(y, TOP_EDGE, maxY)
+	obj.Position = UDim2.fromOffset(
+		x + obj.AnchorPoint.X * size.X,
+		y + obj.AnchorPoint.Y * size.Y
+	)
+end
+
+local function clampToScreen(obj)
+	local p = obj.AbsolutePosition
+	placeAt(obj, p.X, p.Y)
+end
+
+-- Hace que "target" se pueda arrastrar tomando "handle" (sin salirse de la pantalla).
 -- Si el usuario solo toca (sin arrastrar) se llama a onTap.
 local function makeDraggable(handle, target, onTap)
 	local dragging, moved = false, false
-	local dragStart, startPos, activeInput
+	local dragStart, startAbs, activeInput
 
 	handle.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -120,7 +168,7 @@ local function makeDraggable(handle, target, onTap)
 			moved = false
 			activeInput = input
 			dragStart = input.Position
-			startPos = target.Position
+			startAbs = target.AbsolutePosition
 		end
 	end)
 
@@ -132,10 +180,7 @@ local function makeDraggable(handle, target, onTap)
 				moved = true
 			end
 			if moved then
-				target.Position = UDim2.new(
-					startPos.X.Scale, startPos.X.Offset + delta.X,
-					startPos.Y.Scale, startPos.Y.Offset + delta.Y
-				)
+				placeAt(target, startAbs.X + delta.X, startAbs.Y + delta.Y)
 			end
 		end
 	end))
@@ -153,15 +198,8 @@ local function makeDraggable(handle, target, onTap)
 end
 
 ---------------------------------------------------------------------
--- GUI BASE + BURBUJA
+-- BURBUJA
 ---------------------------------------------------------------------
-local gui = Instance.new("ScreenGui")
-gui.Name = "CFlyGui"
-gui.ResetOnSpawn = false
-gui.DisplayOrder = 10
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = player:WaitForChild("PlayerGui")
-
 bubble = Instance.new("TextButton")
 bubble.Name = "Bubble"
 bubble.Size = UDim2.fromOffset(64, 64)
@@ -273,83 +311,116 @@ local function fireAttack()
 	end
 end
 
-local function findNearestEnemy()
+-- Lista de enemigos en caché: se refresca varias veces por segundo,
+-- y las distancias se calculan cada frame (detección casi instantánea).
+local function refreshEnemies()
 	local folder = workspace:FindFirstChild(ENEMIES_FOLDER)
-	local _, root = getParts()
 	if not folder then
 		warnOnce("folder", "No encontré la carpeta workspace." .. ENEMIES_FOLDER)
-		return nil
+		enemyCache = {}
+		return
 	end
-	if not root then return nil end
-
-	local best, bestDist = nil, DETECT_RANGE
-	for _, hum in ipairs(folder:GetDescendants()) do
-		if hum:IsA("Humanoid") and hum.Health > 0 then
-			local model = hum.Parent
-			local part = model:FindFirstChild("HumanoidRootPart")
-				or model.PrimaryPart
-				or model:FindFirstChildWhichIsA("BasePart")
-			if part then
-				local d = (part.Position - root.Position).Magnitude
-				if d < bestDist then
-					best, bestDist = part, d
-				end
-			end
+	local list = {}
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("Humanoid") then
+			table.insert(list, d)
 		end
 	end
 	-- Respaldo: enemigos sin Humanoid (modelos simples)
-	if not best then
-		for _, model in ipairs(folder:GetChildren()) do
-			if model:IsA("Model") and not model:FindFirstChildOfClass("Humanoid") then
-				local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
-				if part then
-					local d = (part.Position - root.Position).Magnitude
-					if d < bestDist then
-						best, bestDist = part, d
-					end
-				end
-			end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") and not model:FindFirstChildOfClass("Humanoid") then
+			table.insert(list, model)
 		end
 	end
-
-	return best
+	enemyCache = list
 end
 
--- Dirección para alejarse del enemigo (solo en modo a distancia)
-local function getEvadeVector()
-	if not keepDistance or combatMode ~= "ranged" then return nil end
-	if not currentTarget or not currentTarget.Parent then return nil end
+-- Devuelve la parte principal de un enemigo vivo (o nil)
+local function getEnemyPart(entry)
+	if not entry or not entry.Parent then return nil end
+	local model = entry
+	if entry:IsA("Humanoid") then
+		if entry.Health <= 0 then return nil end
+		model = entry.Parent
+	end
+	if not model or not model.Parent then return nil end
+	return model:FindFirstChild("HumanoidRootPart")
+		or (model:IsA("Model") and model.PrimaryPart)
+		or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function findNearestEnemy()
 	local _, root = getParts()
 	if not root then return nil end
 
-	local offset = root.Position - currentTarget.Position
-	local flat = Vector3.new(offset.X, 0, offset.Z)
-	if flat.Magnitude > SAFE_DISTANCE or flat.Magnitude < 0.01 then
-		return nil
+	local best, bestDist = nil, DETECT_RANGE
+	for _, entry in ipairs(enemyCache) do
+		local part = getEnemyPart(entry)
+		if part then
+			local d = (part.Position - root.Position).Magnitude
+			if d < bestDist then
+				best, bestDist = part, d
+			end
+		end
 	end
-	return flat.Unit
+	return best
 end
 
--- Busca el enemigo más cercano 10 veces por segundo
+-- Dirección para alejarse de TODOS los enemigos cercanos (solo en modo a distancia).
+-- Los enemigos más cerca empujan más fuerte.
+local function getEvadeVector()
+	if not keepDistance or combatMode ~= "ranged" or chestBusy then return nil end
+	local _, root = getParts()
+	if not root then return nil end
+
+	local sum = Vector3.zero
+	for _, entry in ipairs(enemyCache) do
+		local part = getEnemyPart(entry)
+		if part then
+			local offset = root.Position - part.Position
+			local flat = Vector3.new(offset.X, 0, offset.Z)
+			local d = flat.Magnitude
+			if d < SAFE_DISTANCE then
+				local dir = d > 0.01 and flat.Unit or Vector3.new(0, 0, 1)
+				local weight = 0.35 + 0.65 * (1 - d / SAFE_DISTANCE)
+				sum = sum + dir * weight
+			end
+		end
+	end
+	if sum.Magnitude < 0.01 then return nil end
+	return sum.Unit
+end
+
+-- Refresca la lista de enemigos
 task.spawn(function()
 	while running do
 		if attackOn() or keepDistance or tpEnemy then
-			currentTarget = findNearestEnemy()
-		else
-			currentTarget = nil
+			refreshEnemies()
 		end
-		task.wait(0.1)
+		task.wait(0.25)
 	end
 end)
+
+-- Enemigo más cercano en cada frame (reacción inmediata)
+track(RunService.Heartbeat:Connect(function()
+	if attackOn() or keepDistance or tpEnemy then
+		currentTarget = findNearestEnemy()
+	else
+		currentTarget = nil
+	end
+end))
 
 -- Apuntar al enemigo y alejarse (cuando NO estás volando)
 RunService:BindToRenderStep("CFlyCombat", Enum.RenderPriority.Input.Value + 1, function()
 	local hum, root = getParts()
-	if not hum or not root or flying then return end
+	if not hum or not root or flying or chestBusy then return end
 
 	local evade = getEvadeVector()
 	if evade then
 		hum:Move(evade, false)
+		-- velocidad directa: esquivas al instante, sin esperar a la aceleración del humanoide
+		local v = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(evade.X * EVADE_SPEED, v.Y, evade.Z * EVADE_SPEED)
 	end
 
 	local aiming = attackOn() and currentTarget ~= nil and currentTarget.Parent ~= nil
@@ -367,7 +438,7 @@ end)
 
 -- Teletransportarse junto al enemigo (funciona caminando o volando)
 RunService:BindToRenderStep("CFlyTeleport", Enum.RenderPriority.Last.Value, function()
-	if not (tpEnemy or tpAttack) then return end
+	if not (tpEnemy or tpAttack) or chestBusy then return end
 	local hum, root = getParts()
 	if not hum or not root then return end
 	if not currentTarget or not currentTarget.Parent then return end
@@ -404,6 +475,7 @@ end
 local function setAutoAttack(state)
 	autoAttack = state
 	if attackOn() then
+		refreshEnemies()
 		startAttackLoop()
 	end
 end
@@ -411,16 +483,146 @@ end
 local function setTpAttack(state)
 	tpAttack = state
 	if attackOn() then
+		refreshEnemies()
 		startAttackLoop()
 	end
 end
 
 local function setTpEnemy(state)
 	tpEnemy = state
+	if state then refreshEnemies() end
 end
 
 local function setKeepDistance(state)
 	keepDistance = state
+	if state then refreshEnemies() end
+end
+
+---------------------------------------------------------------------
+-- LÓGICA: AUTO-COFRES (workspace.Labyrinth.Chest > Body > ProximityPrompt)
+---------------------------------------------------------------------
+local chestAttempts = {}
+
+-- Todos los ProximityPrompt activos que estén dentro de un "Chest" del laberinto
+local function getChestPrompts()
+	local root = workspace:FindFirstChild(CHEST_ROOT)
+	if not root then
+		warnOnce("chestroot", "No encontré workspace." .. CHEST_ROOT)
+		return {}
+	end
+	local list = {}
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled and d:FindFirstAncestor(CHEST_NAME) then
+			table.insert(list, d)
+		end
+	end
+	return list
+end
+
+local function promptPosition(prompt)
+	local par = prompt.Parent
+	if not par then return nil end
+	if par:IsA("BasePart") then
+		return par.Position
+	elseif par:IsA("Attachment") then
+		return par.WorldPosition
+	end
+	local model = par:FindFirstAncestorOfClass("Model")
+	return model and model:GetPivot().Position or nil
+end
+
+-- Va hasta el cofre e interactúa con su ProximityPrompt
+local function collectChest(prompt)
+	local _, root = getParts()
+	if not root then return end
+	local pos = promptPosition(prompt)
+	if not pos then return end
+
+	-- por si el prompt exige línea de vista o poca distancia (solo cambia tu cliente)
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		if prompt.MaxActivationDistance < 12 then
+			prompt.MaxActivationDistance = 12
+		end
+	end)
+
+	local wasAnchored = root.Anchored
+	root.CFrame = CFrame.new(pos + Vector3.new(0, CHEST_OFFSET_Y, 0))
+	root.AssemblyLinearVelocity = Vector3.zero
+	if not flying then
+		root.Anchored = true -- evita caerte mientras interactúas
+	end
+
+	task.wait(CHEST_TP_DELAY)
+
+	if prompt.Parent and prompt.Enabled then
+		pcall(function() prompt:InputHoldBegin() end)
+		task.wait(math.max(prompt.HoldDuration, 0) + 0.2)
+		pcall(function() prompt:InputHoldEnd() end)
+	end
+
+	root.Anchored = wasAnchored
+end
+
+local function startChestLoop()
+	chestToken += 1
+	local token = chestToken
+	task.spawn(function()
+		local lastReset = os.clock()
+		while running and autoChest and token == chestToken do
+			local hum, root = getParts()
+			if hum and root and hum.Health > 0 then
+				-- cofre más cercano que aún no hayamos agotado
+				local best, bestD
+				for _, p in ipairs(getChestPrompts()) do
+					if (chestAttempts[p] or 0) < CHEST_MAX_TRIES then
+						local pos = promptPosition(p)
+						if pos then
+							local d = (pos - root.Position).Magnitude
+							if not bestD or d < bestD then
+								best, bestD = p, d
+							end
+						end
+					end
+				end
+
+				if best then
+					chestBusy = true
+					pcall(collectChest, best)
+					chestAttempts[best] = (chestAttempts[best] or 0) + 1
+					if not best.Parent or not best.Enabled then
+						chestsCollected += 1
+						if chestSub then
+							chestSub.Text = "Recogidos: " .. chestsCollected
+						end
+					end
+					chestBusy = false
+				else
+					-- no quedan cofres: reintenta cada 10 s por si reaparecen
+					if os.clock() - lastReset > 10 then
+						chestAttempts = {}
+						lastReset = os.clock()
+					end
+					task.wait(0.8)
+				end
+			end
+			task.wait(0.15)
+		end
+		if token == chestToken then
+			chestBusy = false
+		end
+	end)
+end
+
+local function setAutoChest(state)
+	autoChest = state
+	chestToken += 1
+	if state then
+		chestAttempts = {}
+		startChestLoop()
+	else
+		chestBusy = false
+	end
 end
 
 ---------------------------------------------------------------------
@@ -500,7 +702,7 @@ local function startFly()
 		-- Mantener distancia también mientras vuelas
 		local evade = getEvadeVector()
 		if evade then
-			dir = dir + evade * SPEED
+			dir = dir + evade * EVADE_SPEED
 		end
 
 		-- Extra opcional: Espacio sube y Shift baja
@@ -578,8 +780,10 @@ end
 ---------------------------------------------------------------------
 local function shutdown()
 	running = false
-	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
+	autoAttack, tpAttack, tpEnemy, keepDistance, autoChest = false, false, false, false, false
+	chestBusy = false
 	attackToken += 1
+	chestToken += 1
 
 	stopFly()
 	setNoclip(false)
@@ -592,32 +796,37 @@ local function shutdown()
 	end
 	table.clear(allConnections)
 
-	local hum = getParts()
+	local hum, root = getParts()
 	if hum then
 		hum.AutoRotate = true
+	end
+	if root then
+		root.Anchored = false
 	end
 
 	gui:Destroy()
 end
 
 ---------------------------------------------------------------------
--- PANEL (bonito, para celular)
+-- PANEL (bonito, para celular, siempre dentro de la pantalla)
 ---------------------------------------------------------------------
-local PANEL_W = 280
-local TITLE_H = 50
-local FULL_H = 308
+local PANEL_W = 300
+local TITLE_H = 52
+local FULL_H = 420
 local MIN_H = TITLE_H + 4
+local minimized = false
+local panelW, panelFullH = PANEL_W, FULL_H
 
 local panel = Instance.new("Frame")
 panel.Name = "Panel"
 panel.AnchorPoint = Vector2.new(0.5, 0)
-panel.Position = UDim2.new(0.5, 0, 0.12, 0)
+panel.Position = UDim2.new(0.5, 0, 0, 60)
 panel.Size = UDim2.fromOffset(PANEL_W, FULL_H)
 panel.BackgroundColor3 = COLORS.panel
 panel.BorderSizePixel = 0
 panel.ClipsDescendants = true
 panel.Parent = gui
-corner(panel, UDim.new(0, 20))
+corner(panel, UDim.new(0, 22))
 
 local panelStroke = Instance.new("UIStroke")
 panelStroke.Thickness = 2
@@ -640,8 +849,8 @@ titleBar.Parent = panel
 local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(18, 0)
-title.Size = UDim2.new(1, -110, 1, 0)
-title.Text = "✈  Panel de Vuelo"
+title.Size = UDim2.new(1, -120, 1, 0)
+title.Text = "✈  Panel de Control"
 title.TextColor3 = COLORS.text
 title.Font = Enum.Font.GothamBold
 title.TextSize = 18
@@ -664,7 +873,7 @@ dividerGradient.Parent = divider
 -- Botones minimizar y cerrar
 local function makeCircleButton(text, color, xOffset)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.fromOffset(34, 34)
+	b.Size = UDim2.fromOffset(36, 36)
 	b.Position = UDim2.new(1, xOffset, 0, 8)
 	b.BackgroundColor3 = color
 	b.Text = text
@@ -677,16 +886,16 @@ local function makeCircleButton(text, color, xOffset)
 	return b
 end
 
-local minBtn = makeCircleButton("−", COLORS.yellow, -88)
-local closeBtn = makeCircleButton("✕", COLORS.red, -46)
+local minBtn = makeCircleButton("−", COLORS.yellow, -92)
+local closeBtn = makeCircleButton("✕", COLORS.red, -48)
 
--- Cuerpo con las opciones (se desplaza con el dedo)
+-- Cuerpo con las opciones (se desplaza con el dedo; su alto sigue al del panel)
 local body = Instance.new("ScrollingFrame")
 body.Name = "Body"
 body.BackgroundTransparency = 1
 body.BorderSizePixel = 0
 body.Position = UDim2.new(0, 14, 0, TITLE_H + 12)
-body.Size = UDim2.new(1, -28, 0, 232)
+body.Size = UDim2.new(1, -28, 1, -(TITLE_H + 22))
 body.CanvasSize = UDim2.new()
 body.AutomaticCanvasSize = Enum.AutomaticSize.Y
 body.ScrollBarThickness = 3
@@ -696,6 +905,7 @@ body.Parent = panel
 
 local bodyPadding = Instance.new("UIPadding")
 bodyPadding.PaddingRight = UDim.new(0, 6)
+bodyPadding.PaddingBottom = UDim.new(0, 6)
 bodyPadding.Parent = body
 
 local list = Instance.new("UIListLayout")
@@ -703,10 +913,27 @@ list.Padding = UDim.new(0, 8)
 list.SortOrder = Enum.SortOrder.LayoutOrder
 list.Parent = body
 
--- Fila con interruptor (toggle)
+-- Encabezado de sección
+local function createHeader(order, text)
+	local h = Instance.new("TextLabel")
+	h.Size = UDim2.new(1, 0, 0, 20)
+	h.BackgroundTransparency = 1
+	h.LayoutOrder = order
+	h.Text = text
+	h.TextColor3 = COLORS.accentB
+	h.Font = Enum.Font.GothamBold
+	h.TextSize = 12
+	h.TextXAlignment = Enum.TextXAlignment.Left
+	h.Parent = body
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 4)
+	pad.Parent = h
+end
+
+-- Fila con interruptor (toggle). Devuelve la función "set" y la etiqueta del subtítulo.
 local function createRow(order, titleText, subtitleText, initial, callback)
 	local row = Instance.new("Frame")
-	row.Size = UDim2.new(1, 0, 0, 58)
+	row.Size = UDim2.new(1, 0, 0, 60)
 	row.BackgroundColor3 = COLORS.row
 	row.BorderSizePixel = 0
 	row.LayoutOrder = order
@@ -715,7 +942,7 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 
 	local t = Instance.new("TextLabel")
 	t.BackgroundTransparency = 1
-	t.Position = UDim2.fromOffset(14, 8)
+	t.Position = UDim2.fromOffset(14, 9)
 	t.Size = UDim2.new(1, -92, 0, 22)
 	t.Text = titleText
 	t.TextColor3 = COLORS.text
@@ -727,7 +954,7 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 
 	local s = Instance.new("TextLabel")
 	s.BackgroundTransparency = 1
-	s.Position = UDim2.fromOffset(14, 30)
+	s.Position = UDim2.fromOffset(14, 32)
 	s.Size = UDim2.new(1, -92, 0, 18)
 	s.Text = subtitleText
 	s.TextColor3 = COLORS.subtext
@@ -765,6 +992,7 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 	local function set(value, silent)
 		state = value
 		tween(track_, { BackgroundColor3 = value and COLORS.on or COLORS.off })
+		tween(row, { BackgroundColor3 = value and COLORS.rowOn or COLORS.row })
 		tween(knob, { Position = value and UDim2.new(1, -27, 0.5, -12) or UDim2.new(0, 3, 0.5, -12) })
 		if not silent then
 			callback(value)
@@ -776,13 +1004,13 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 	end)
 
 	set(initial, true)
-	return set
+	return set, s
 end
 
 -- Selector: cuerpo a cuerpo / a distancia
 local function createModeSelector(order)
 	local row = Instance.new("Frame")
-	row.Size = UDim2.new(1, 0, 0, 58)
+	row.Size = UDim2.new(1, 0, 0, 60)
 	row.BackgroundColor3 = COLORS.row
 	row.BorderSizePixel = 0
 	row.LayoutOrder = order
@@ -802,7 +1030,7 @@ local function createModeSelector(order)
 
 	local function makeButton(mode, text, position)
 		local b = Instance.new("TextButton")
-		b.Size = UDim2.new(0.5, -12, 0, 40)
+		b.Size = UDim2.new(0.5, -12, 0, 42)
 		b.Position = position
 		b.Text = text
 		b.Font = Enum.Font.GothamBold
@@ -818,57 +1046,89 @@ local function createModeSelector(order)
 		buttons[mode] = b
 	end
 
-	makeButton("melee", "Cuerpo a cuerpo", UDim2.new(0, 8, 0.5, -20))
-	makeButton("ranged", "A distancia", UDim2.new(0.5, 4, 0.5, -20))
+	makeButton("melee", "⚔ Cuerpo a cuerpo", UDim2.new(0, 8, 0.5, -21))
+	makeButton("ranged", "🏹 A distancia", UDim2.new(0.5, 4, 0.5, -21))
 	selectMode(combatMode)
 end
 
 -- Opciones del panel
-createRow(1, "Burbuja de vuelo", "Mostrar el botón flotante", true, function(value)
+createHeader(1, "MOVIMIENTO")
+createRow(2, "Burbuja de vuelo", "Mostrar el botón flotante", true, function(value)
 	bubble.Visible = value
 end)
 
-setFlyRow = createRow(2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
+setFlyRow = createRow(3, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
 	if value ~= flying then
 		toggleFly()
 	end
 end)
 
-createRow(3, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
+createRow(4, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
 	setNoclip(value)
 end)
 
-createModeSelector(4)
+createHeader(5, "COMBATE")
+createModeSelector(6)
 
-createRow(5, "Auto-ataque", "Apunta y ataca al más cercano", false, function(value)
+createRow(7, "Auto-ataque", "Apunta y ataca al más cercano", false, function(value)
 	setAutoAttack(value)
 end)
 
-createRow(6, "TP + Auto-ataque", "Va hasta el enemigo y ataca", false, function(value)
+createRow(8, "TP + Auto-ataque", "Va hasta el enemigo y ataca", false, function(value)
 	setTpAttack(value)
 end)
 
-createRow(7, "TP al enemigo", "Te lleva junto al más cercano", false, function(value)
+createRow(9, "TP al enemigo", "Te lleva junto al más cercano", false, function(value)
 	setTpEnemy(value)
 end)
 
-createRow(8, "Mantener distancia", "Solo en modo a distancia", false, function(value)
+createRow(10, "Mantener distancia", "Esquiva rápido (modo a distancia)", false, function(value)
 	setKeepDistance(value)
 end)
 
--- Minimizar y cerrar
-local minimized = false
+createHeader(11, "RECOLECCIÓN")
+local _, chestSubLabel = createRow(12, "Auto-cofres", "Recoge todos los cofres", false, function(value)
+	setAutoChest(value)
+end)
+chestSub = chestSubLabel
 
+-- Ajusta el tamaño del panel a la pantalla (por si es un celular pequeño o se gira)
+local function fitPanel()
+	local screen = gui.AbsoluteSize
+	if screen.X <= 0 then return end
+	panelW = math.min(PANEL_W, screen.X - EDGE * 2)
+	panelFullH = math.min(FULL_H, screen.Y - TOP_EDGE - EDGE)
+	panel.Size = UDim2.fromOffset(panelW, minimized and MIN_H or panelFullH)
+end
+
+-- Minimizar y cerrar
 minBtn.Activated:Connect(function()
 	minimized = not minimized
 	minBtn.Text = minimized and "+" or "−"
-	tween(panel, { Size = UDim2.fromOffset(PANEL_W, minimized and MIN_H or FULL_H) }, 0.22)
+	tween(panel, { Size = UDim2.fromOffset(panelW, minimized and MIN_H or panelFullH) }, 0.22)
 end)
 
 -- Cierra el script por completo (apaga todo y elimina la interfaz)
 closeBtn.Activated:Connect(shutdown)
 
 makeDraggable(titleBar, panel)
+
+-- Mantener todo dentro de la pantalla (al cambiar tamaño, girar el celular o minimizar)
+gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	fitPanel()
+	clampToScreen(panel)
+	clampToScreen(bubble)
+end)
+panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	clampToScreen(panel)
+end)
+
+fitPanel()
+task.defer(function()
+	fitPanel()
+	clampToScreen(panel)
+	clampToScreen(bubble)
+end)
 
 ---------------------------------------------------------------------
 -- EXTRAS
@@ -884,4 +1144,5 @@ end))
 track(player.CharacterAdded:Connect(function()
 	stopFly()
 	originalCollide = {}
+	chestBusy = false
 end))
