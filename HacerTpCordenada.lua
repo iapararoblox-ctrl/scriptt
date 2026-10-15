@@ -17,7 +17,7 @@ local COLOR_OK = Color3.fromRGB(110, 230, 150)
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Helpers para crear objetos
+-- Helpers
 local function crear(clase, propiedades, hijos)
 	local obj = Instance.new(clase)
 	for k, v in pairs(propiedades or {}) do
@@ -41,7 +41,6 @@ local gui = crear("ScreenGui", {
 	Parent = playerGui,
 })
 
--- Botón flotante para abrir/cerrar
 local botonAbrir = crear("TextButton", {
 	Name = "AbrirTP",
 	Size = UDim2.fromOffset(48, 48),
@@ -51,12 +50,10 @@ local botonAbrir = crear("TextButton", {
 	TextSize = 24,
 	Font = Enum.Font.GothamBold,
 	TextColor3 = Color3.new(1, 1, 1),
-	AutoButtonColor = true,
 	Parent = gui,
 }, { redondear(12) })
 
--- Panel principal
-local PANEL_TAM = UDim2.fromOffset(300, 260)
+local PANEL_TAM = UDim2.fromOffset(300, 310)
 local panel = crear("Frame", {
 	Name = "Panel",
 	Size = PANEL_TAM,
@@ -70,7 +67,6 @@ local panel = crear("Frame", {
 	crear("UIStroke", { Color = COLOR_PRINCIPAL, Thickness = 2 }),
 })
 
--- Título
 crear("TextLabel", {
 	Size = UDim2.new(1, -60, 0, 50),
 	Position = UDim2.fromOffset(16, 0),
@@ -83,7 +79,6 @@ crear("TextLabel", {
 	Parent = panel,
 })
 
--- Botón cerrar
 local botonCerrar = crear("TextButton", {
 	Size = UDim2.fromOffset(30, 30),
 	Position = UDim2.new(1, -40, 0, 10),
@@ -95,7 +90,6 @@ local botonCerrar = crear("TextButton", {
 	Parent = panel,
 }, { redondear(8) })
 
--- Cajas de texto X, Y, Z
 local function crearCaja(texto, posX)
 	return crear("TextBox", {
 		Size = UDim2.new(0.27, 0, 0, 44),
@@ -116,15 +110,15 @@ local cajaX = crearCaja("X", 0.05)
 local cajaY = crearCaja("Y", 0.365)
 local cajaZ = crearCaja("Z", 0.68)
 
--- Texto de estado
 local estado = crear("TextLabel", {
 	Size = UDim2.new(0.9, 0, 0, 30),
-	Position = UDim2.new(0.05, 0, 0, 124),
+	Position = UDim2.new(0.05, 0, 0, 122),
 	BackgroundTransparency = 1,
 	Text = "Ingresa las coordenadas",
 	TextColor3 = Color3.fromRGB(180, 180, 200),
 	Font = Enum.Font.Gotham,
 	TextSize = 14,
+	TextWrapped = true,
 	Parent = panel,
 })
 
@@ -133,10 +127,9 @@ local function mostrarEstado(texto, color)
 	estado.TextColor3 = color or Color3.fromRGB(180, 180, 200)
 end
 
--- Botón principal
 local boton = crear("TextButton", {
-	Size = UDim2.new(0.9, 0, 0, 48),
-	Position = UDim2.new(0.05, 0, 0, 170),
+	Size = UDim2.new(0.9, 0, 0, 46),
+	Position = UDim2.new(0.05, 0, 0, 158),
 	BackgroundColor3 = COLOR_PRINCIPAL,
 	Text = "Teleportar",
 	TextColor3 = Color3.new(1, 1, 1),
@@ -151,6 +144,35 @@ local boton = crear("TextButton", {
 		Rotation = 90,
 	}),
 })
+
+-- Modo copiar ruta
+local modoRuta = false
+local botonModo = crear("TextButton", {
+	Size = UDim2.new(0.9, 0, 0, 36),
+	Position = UDim2.new(0.05, 0, 0, 212),
+	BackgroundColor3 = COLOR_CAMPO,
+	Text = "Copiar ruta: OFF",
+	TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamMedium,
+	TextSize = 15,
+	AutoButtonColor = false,
+	Parent = panel,
+}, { redondear(10) })
+
+local rutaBox = crear("TextBox", {
+	Size = UDim2.new(0.9, 0, 0, 34),
+	Position = UDim2.new(0.05, 0, 0, 258),
+	BackgroundColor3 = COLOR_CAMPO,
+	PlaceholderText = "Activa el modo y toca un objeto",
+	PlaceholderColor3 = Color3.fromRGB(140, 140, 160),
+	Text = "",
+	TextColor3 = COLOR_OK,
+	Font = Enum.Font.Code,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ClearTextOnFocus = false,
+	Parent = panel,
+}, { redondear(8) })
 
 -- ================= ANIMACIÓN DEL PANEL =================
 local abierto = false
@@ -176,8 +198,8 @@ local function alternarPanel()
 	end
 end
 
-botonAbrir.MouseButton1Click:Connect(alternarPanel)
-botonCerrar.MouseButton1Click:Connect(alternarPanel)
+botonAbrir.Activated:Connect(alternarPanel)
+botonCerrar.Activated:Connect(alternarPanel)
 
 -- ================= MOVIMIENTO SUAVE =================
 local viajando = false
@@ -200,6 +222,7 @@ local function teleportarSuave(destino)
 
 	if not hrp or not humanoid or humanoid.Health <= 0 then
 		mostrarEstado("No se encontró tu personaje", COLOR_ERROR)
+		warn("[TP] Sin HumanoidRootPart o Humanoid")
 		return
 	end
 
@@ -231,7 +254,7 @@ local function teleportarSuave(destino)
 	end)
 end
 
-boton.MouseButton1Click:Connect(function()
+boton.Activated:Connect(function()
 	if viajando then
 		terminarViaje("Viaje cancelado", COLOR_AVISO)
 		return
@@ -248,3 +271,60 @@ boton.MouseButton1Click:Connect(function()
 
 	teleportarSuave(Vector3.new(x, y, z))
 end)
+
+-- ================= COPIAR RUTA =================
+local function construirRuta(obj)
+	local partes = {}
+	local actual = obj
+	while actual and actual ~= game do
+		table.insert(partes, 1, actual.Name)
+		actual = actual.Parent
+	end
+
+	local ruta = "game"
+	for _, nombre in ipairs(partes) do
+		if nombre:match("^[%a_][%w_]*$") then
+			ruta = ruta .. "." .. nombre
+		else
+			ruta = ruta .. '["' .. nombre .. '"]'
+		end
+	end
+	return ruta
+end
+
+local function mostrarRuta(texto)
+	rutaBox.Text = texto
+	rutaBox:CaptureFocus()
+	rutaBox.SelectionStart = 1
+	rutaBox.CursorPosition = #texto + 1
+end
+
+botonModo.Activated:Connect(function()
+	modoRuta = not modoRuta
+	if modoRuta then
+		botonModo.Text = "Copiar ruta: ON"
+		botonModo.BackgroundColor3 = COLOR_OK
+		mostrarEstado("Toca un objeto del mundo", COLOR_OK)
+	else
+		botonModo.Text = "Copiar ruta: OFF"
+		botonModo.BackgroundColor3 = COLOR_CAMPO
+		mostrarEstado("Modo ruta desactivado", COLOR_AVISO)
+	end
+end)
+
+local mouse = player:GetMouse()
+mouse.Button1Down:Connect(function()
+	if not modoRuta then
+		return
+	end
+	local objetivo = mouse.Target
+	if not objetivo then
+		mostrarEstado("No apuntaste a ningún objeto", COLOR_AVISO)
+		return
+	end
+	mostrarRuta(construirRuta(objetivo))
+	mostrarEstado("Ruta lista: pulsa Ctrl+C para copiar", COLOR_OK)
+end)
+
+-- Si tu juego tiene algún script del servidor que mueve tu personaje, avísame
+-- qué mensajes salen en View > Output para revisarlo.
