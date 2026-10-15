@@ -1,6 +1,6 @@
--- CFly + Noclip con panel para celular
+-- CFly + Noclip + Combate + TP, con panel para celular
 -- Colócalo como LocalScript en StarterPlayer > StarterPlayerScripts
--- (reemplaza el script anterior de CFly)
+-- (reemplaza el script anterior)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -23,21 +23,34 @@ local TOGGLE_KEY = Enum.KeyCode.F -- atajo opcional en PC
 -- Combate
 local ENEMIES_FOLDER = "BADEnemies"  -- carpeta en workspace con los enemigos
 local DETECT_RANGE = 80              -- distancia para detectar enemigos
-local MELEE_RANGE = 15               -- distancia para atacar con espada
-local SAFE_DISTANCE = 30             -- con arco: distancia mínima que intenta mantener
+local MELEE_RANGE = 15               -- distancia para atacar en cuerpo a cuerpo
+local SAFE_DISTANCE = 30             -- modo a distancia: distancia que intenta mantener
 local ATTACK_INTERVAL = 0.35         -- segundos entre ataques
 local ATTACK_COUNT = 3               -- veces que dispara el remote por ataque
--- El modo (cuerpo a cuerpo / a distancia) se elige desde el panel
+local TP_DISTANCE = 6                -- a qué distancia del enemigo te teletransportas
+local RANGED_ACTIVATE_TOOL = true    -- en modo a distancia, también usa tool:Activate()
 
 ---------------------------------------------------------------------
 -- ESTADO
 ---------------------------------------------------------------------
+local running = true
 local flying = false
 local noclip = false
+local autoAttack = false   -- apuntar + atacar
+local tpAttack = false     -- teletransportarse al enemigo + atacar
+local tpEnemy = false      -- solo teletransportarse al enemigo
+local keepDistance = false -- mantener distancia (modo a distancia)
+local combatMode = "melee" -- "melee" (cuerpo a cuerpo) o "ranged" (a distancia)
+
+local currentTarget        -- parte del enemigo más cercano
+local attackToken = 0
+local wasAiming = false
+
 local connection
 local flyAttachment, flyVelocity
 local noclipConn
 local originalCollide = {}
+local allConnections = {}
 
 -- Referencias que se asignan más abajo
 local bubble
@@ -77,6 +90,12 @@ local function tween(obj, props, t)
 	):Play()
 end
 
+-- Guarda las conexiones para poder desconectarlas al cerrar el script
+local function track(conn)
+	table.insert(allConnections, conn)
+	return conn
+end
+
 -- Hace que "target" se pueda arrastrar tomando "handle".
 -- Si el usuario solo toca (sin arrastrar) se llama a onTap.
 local function makeDraggable(handle, target, onTap)
@@ -94,7 +113,7 @@ local function makeDraggable(handle, target, onTap)
 		end
 	end)
 
-	UserInputService.InputChanged:Connect(function(input)
+	track(UserInputService.InputChanged:Connect(function(input)
 		if not dragging then return end
 		if input == activeInput or input.UserInputType == Enum.UserInputType.MouseMovement then
 			local delta = input.Position - dragStart
@@ -108,9 +127,9 @@ local function makeDraggable(handle, target, onTap)
 				)
 			end
 		end
-	end)
+	end))
 
-	UserInputService.InputEnded:Connect(function(input)
+	track(UserInputService.InputEnded:Connect(function(input)
 		if not dragging then return end
 		if input.UserInputType == Enum.UserInputType.MouseButton1
 			or input.UserInputType == Enum.UserInputType.Touch then
@@ -119,7 +138,7 @@ local function makeDraggable(handle, target, onTap)
 				onTap()
 			end
 		end
-	end)
+	end))
 end
 
 ---------------------------------------------------------------------
@@ -162,7 +181,7 @@ makeDraggable(bubble, bubble, function()
 end)
 
 ---------------------------------------------------------------------
--- LÓGICA: VUELO (CFLY)
+-- PERSONAJE
 ---------------------------------------------------------------------
 local function getParts()
 	local char = player.Character
@@ -173,14 +192,12 @@ local function getParts()
 end
 
 ---------------------------------------------------------------------
--- LÓGICA: COMBATE (apuntar, atacar y mantener distancia)
+-- LÓGICA: COMBATE (apuntar, atacar, TP y mantener distancia)
 ---------------------------------------------------------------------
-local autoAttack = false
-local keepDistance = false
-local currentTarget -- parte del enemigo más cercano
-local attackToken = 0
-local wasAiming = false
-local combatMode = "melee" -- "melee" (cuerpo a cuerpo) o "ranged" (a distancia)
+-- ¿Hay que apuntar y atacar? (Auto-ataque o TP + ataque)
+local function attackOn()
+	return autoAttack or tpAttack
+end
 
 local function getEquippedTool()
 	local char = player.Character
@@ -191,6 +208,15 @@ local function getAttackRemote()
 	local bad = ReplicatedStorage:FindFirstChild("BAD")
 	local remotes = bad and bad:FindFirstChild("Remotes")
 	return remotes and remotes:FindFirstChild("Action")
+end
+
+local function fireAttack()
+	local remote = getAttackRemote()
+	if remote then
+		for _ = 1, ATTACK_COUNT do
+			remote:FireServer("attack", nil)
+		end
+	end
 end
 
 local function findNearestEnemy()
@@ -216,10 +242,10 @@ local function findNearestEnemy()
 	return best
 end
 
--- Dirección para alejarse del enemigo (solo con arma a distancia)
+-- Dirección para alejarse del enemigo (solo en modo a distancia)
 local function getEvadeVector()
-	if not keepDistance or not currentTarget or not currentTarget.Parent then return nil end
-	if combatMode ~= "ranged" then return nil end
+	if not keepDistance or combatMode ~= "ranged" then return nil end
+	if not currentTarget or not currentTarget.Parent then return nil end
 	local _, root = getParts()
 	if not root then return nil end
 
@@ -233,8 +259,8 @@ end
 
 -- Busca el enemigo más cercano 10 veces por segundo
 task.spawn(function()
-	while true do
-		if autoAttack or keepDistance then
+	while running do
+		if attackOn() or keepDistance or tpEnemy then
 			currentTarget = findNearestEnemy()
 		else
 			currentTarget = nil
@@ -253,7 +279,7 @@ RunService:BindToRenderStep("CFlyCombat", Enum.RenderPriority.Input.Value + 1, f
 		hum:Move(evade, false)
 	end
 
-	local aiming = autoAttack and currentTarget ~= nil and currentTarget.Parent ~= nil
+	local aiming = attackOn() and currentTarget ~= nil and currentTarget.Parent ~= nil
 	if aiming then
 		hum.AutoRotate = false
 		wasAiming = true
@@ -266,26 +292,43 @@ RunService:BindToRenderStep("CFlyCombat", Enum.RenderPriority.Input.Value + 1, f
 	end
 end)
 
+-- Teletransportarse junto al enemigo (funciona caminando o volando)
+RunService:BindToRenderStep("CFlyTeleport", Enum.RenderPriority.Last.Value, function()
+	if not (tpEnemy or tpAttack) then return end
+	local hum, root = getParts()
+	if not hum or not root then return end
+	if not currentTarget or not currentTarget.Parent then return end
+
+	local targetPos = currentTarget.Position
+	local offset = root.Position - targetPos
+	local flat = Vector3.new(offset.X, 0, offset.Z)
+	local away = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+
+	local dest = targetPos + away * TP_DISTANCE
+	root.CFrame = CFrame.lookAt(dest, Vector3.new(targetPos.X, dest.Y, targetPos.Z))
+	root.AssemblyLinearVelocity = Vector3.zero
+end)
+
 local function startAttackLoop()
 	attackToken += 1
 	local token = attackToken
 	task.spawn(function()
-		while autoAttack and token == attackToken do
+		while running and attackOn() and token == attackToken do
 			local _, root = getParts()
 			if root and currentTarget and currentTarget.Parent then
 				local dist = (currentTarget.Position - root.Position).Magnitude
 				if combatMode == "ranged" then
-					local tool = getEquippedTool()
-					if tool then
-						tool:Activate() -- arma a distancia (arco, etc.)
-					end
-				elseif dist <= MELEE_RANGE then
-					local remote = getAttackRemote()
-					if remote then
-						for _ = 1, ATTACK_COUNT do
-							remote:FireServer("attack", nil)
+					-- A distancia: ataca mientras haya un enemigo detectado
+					fireAttack()
+					if RANGED_ACTIVATE_TOOL then
+						local tool = getEquippedTool()
+						if tool then
+							tool:Activate()
 						end
 					end
+				elseif dist <= MELEE_RANGE then
+					-- Cuerpo a cuerpo: solo si está cerca
+					fireAttack()
 				end
 			end
 			task.wait(ATTACK_INTERVAL)
@@ -295,15 +338,29 @@ end
 
 local function setAutoAttack(state)
 	autoAttack = state
-	if state then
+	if attackOn() then
 		startAttackLoop()
 	end
+end
+
+local function setTpAttack(state)
+	tpAttack = state
+	if attackOn() then
+		startAttackLoop()
+	end
+end
+
+local function setTpEnemy(state)
+	tpEnemy = state
 end
 
 local function setKeepDistance(state)
 	keepDistance = state
 end
 
+---------------------------------------------------------------------
+-- LÓGICA: VUELO (CFLY)
+---------------------------------------------------------------------
 local function stopFly()
 	flying = false
 	if connection then
@@ -395,8 +452,10 @@ local function startFly()
 		r.AssemblyAngularVelocity = Vector3.zero
 
 		local pos = r.Position + velocity * dt
+
+		-- Mirar al enemigo si está el ataque activo; si no, hacia la cámara
 		local faceDir = flatLook
-		if autoAttack and currentTarget and currentTarget.Parent then
+		if attackOn() and currentTarget and currentTarget.Parent then
 			local d = currentTarget.Position - r.Position
 			faceDir = Vector3.new(d.X, 0, d.Z)
 		end
@@ -447,6 +506,33 @@ local function setNoclip(state)
 		end
 		originalCollide = {}
 	end
+end
+
+---------------------------------------------------------------------
+-- CERRAR EL SCRIPT POR COMPLETO
+---------------------------------------------------------------------
+local function shutdown()
+	running = false
+	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
+	attackToken += 1
+
+	stopFly()
+	setNoclip(false)
+
+	pcall(function() RunService:UnbindFromRenderStep("CFlyCombat") end)
+	pcall(function() RunService:UnbindFromRenderStep("CFlyTeleport") end)
+
+	for _, c in ipairs(allConnections) do
+		c:Disconnect()
+	end
+	table.clear(allConnections)
+
+	local hum = getParts()
+	if hum then
+		hum.AutoRotate = true
+	end
+
+	gui:Destroy()
 end
 
 ---------------------------------------------------------------------
@@ -529,7 +615,7 @@ end
 local minBtn = makeCircleButton("−", COLORS.yellow, -88)
 local closeBtn = makeCircleButton("✕", COLORS.red, -46)
 
--- Cuerpo con las opciones
+-- Cuerpo con las opciones (se desplaza con el dedo)
 local body = Instance.new("ScrollingFrame")
 body.Name = "Body"
 body.BackgroundTransparency = 1
@@ -586,20 +672,20 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 	s.TextTruncate = Enum.TextTruncate.AtEnd
 	s.Parent = row
 
-	local track = Instance.new("Frame")
-	track.Size = UDim2.fromOffset(52, 30)
-	track.Position = UDim2.new(1, -66, 0.5, -15)
-	track.BackgroundColor3 = COLORS.off
-	track.BorderSizePixel = 0
-	track.Parent = row
-	corner(track, UDim.new(1, 0))
+	local track_ = Instance.new("Frame")
+	track_.Size = UDim2.fromOffset(52, 30)
+	track_.Position = UDim2.new(1, -66, 0.5, -15)
+	track_.BackgroundColor3 = COLORS.off
+	track_.BorderSizePixel = 0
+	track_.Parent = row
+	corner(track_, UDim.new(1, 0))
 
 	local knob = Instance.new("Frame")
 	knob.Size = UDim2.fromOffset(24, 24)
 	knob.Position = UDim2.new(0, 3, 0.5, -12)
 	knob.BackgroundColor3 = Color3.new(1, 1, 1)
 	knob.BorderSizePixel = 0
-	knob.Parent = track
+	knob.Parent = track_
 	corner(knob, UDim.new(1, 0))
 
 	-- Toda la fila es táctil (más fácil en celular)
@@ -613,7 +699,7 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 	local state = initial
 	local function set(value, silent)
 		state = value
-		tween(track, { BackgroundColor3 = value and COLORS.on or COLORS.off })
+		tween(track_, { BackgroundColor3 = value and COLORS.on or COLORS.off })
 		tween(knob, { Position = value and UDim2.new(1, -27, 0.5, -12) or UDim2.new(0, 3, 0.5, -12) })
 		if not silent then
 			callback(value)
@@ -627,20 +713,6 @@ local function createRow(order, titleText, subtitleText, initial, callback)
 	set(initial, true)
 	return set
 end
-
-createRow(1, "Burbuja de vuelo", "Mostrar el botón flotante", true, function(value)
-	bubble.Visible = value
-end)
-
-setFlyRow = createRow(2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
-	if value ~= flying then
-		toggleFly()
-	end
-end)
-
-createRow(3, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
-	setNoclip(value)
-end)
 
 -- Selector: cuerpo a cuerpo / a distancia
 local function createModeSelector(order)
@@ -686,42 +758,40 @@ local function createModeSelector(order)
 	selectMode(combatMode)
 end
 
+-- Opciones del panel
+createRow(1, "Burbuja de vuelo", "Mostrar el botón flotante", true, function(value)
+	bubble.Visible = value
+end)
+
+setFlyRow = createRow(2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
+	if value ~= flying then
+		toggleFly()
+	end
+end)
+
+createRow(3, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
+	setNoclip(value)
+end)
+
 createModeSelector(4)
 
 createRow(5, "Auto-ataque", "Apunta y ataca al más cercano", false, function(value)
 	setAutoAttack(value)
 end)
 
-createRow(6, "Mantener distancia", "Solo en modo a distancia", false, function(value)
+createRow(6, "TP + Auto-ataque", "Va hasta el enemigo y ataca", false, function(value)
+	setTpAttack(value)
+end)
+
+createRow(7, "TP al enemigo", "Te lleva junto al más cercano", false, function(value)
+	setTpEnemy(value)
+end)
+
+createRow(8, "Mantener distancia", "Solo en modo a distancia", false, function(value)
 	setKeepDistance(value)
 end)
 
--- Botón pequeño para reabrir el panel cuando se cierra
-local reopenBtn = Instance.new("TextButton")
-reopenBtn.Name = "ReopenButton"
-reopenBtn.Size = UDim2.fromOffset(46, 46)
-reopenBtn.Position = UDim2.new(0, 14, 0.35, 0)
-reopenBtn.BackgroundColor3 = COLORS.panel
-reopenBtn.BackgroundTransparency = 0.1
-reopenBtn.Text = "☰"
-reopenBtn.TextColor3 = COLORS.text
-reopenBtn.Font = Enum.Font.GothamBold
-reopenBtn.TextSize = 22
-reopenBtn.AutoButtonColor = false
-reopenBtn.Visible = false
-reopenBtn.Parent = gui
-corner(reopenBtn, UDim.new(1, 0))
-
-local reopenStroke = Instance.new("UIStroke")
-reopenStroke.Thickness = 2
-reopenStroke.Color = Color3.new(1, 1, 1)
-reopenStroke.Parent = reopenBtn
-local reopenGradient = Instance.new("UIGradient")
-reopenGradient.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
-reopenGradient.Rotation = 45
-reopenGradient.Parent = reopenStroke
-
--- Comportamiento de minimizar / cerrar / reabrir
+-- Minimizar y cerrar
 local minimized = false
 
 minBtn.Activated:Connect(function()
@@ -730,29 +800,23 @@ minBtn.Activated:Connect(function()
 	tween(panel, { Size = UDim2.fromOffset(PANEL_W, minimized and MIN_H or FULL_H) }, 0.22)
 end)
 
-closeBtn.Activated:Connect(function()
-	panel.Visible = false
-	reopenBtn.Visible = true
-end)
+-- Cierra el script por completo (apaga todo y elimina la interfaz)
+closeBtn.Activated:Connect(shutdown)
 
 makeDraggable(titleBar, panel)
-makeDraggable(reopenBtn, reopenBtn, function()
-	panel.Visible = true
-	reopenBtn.Visible = false
-end)
 
 ---------------------------------------------------------------------
 -- EXTRAS
 ---------------------------------------------------------------------
-UserInputService.InputBegan:Connect(function(input, processed)
+track(UserInputService.InputBegan:Connect(function(input, processed)
 	if processed then return end
 	if input.KeyCode == TOGGLE_KEY then
 		toggleFly()
 	end
-end)
+end))
 
--- Si el personaje reaparece, apagar el vuelo (el noclip se mantiene)
-player.CharacterAdded:Connect(function()
+-- Si el personaje reaparece, apagar el vuelo (el resto se mantiene)
+track(player.CharacterAdded:Connect(function()
 	stopFly()
 	originalCollide = {}
-end)
+end))
