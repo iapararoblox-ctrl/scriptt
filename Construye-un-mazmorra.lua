@@ -57,7 +57,7 @@ local FOUNTAIN_NAME = "Fountain"
 local HEAL_THRESHOLD = 0.2           -- modo automático: se activa al 20% de vida
 local HEAL_DONE = 0.95               -- modo automático: no regresa hasta llegar a 95%
 local HEAL_POLL = 0.2
-local HEAL_RETURN_DIST = 12          -- si te alejas de la fuente, vuelves a ella (automático)
+local HEAL_RETURN_DIST = 12          -- modo automático: si te alejas, vuelves a la fuente
 local HEAL_COOLDOWN = 5
 local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5)
 local PROMPT_NEARBY_RANGE = 15
@@ -66,11 +66,11 @@ local PROMPT_NEARBY_RANGE = 15
 local BOSS_NAME = "StarRune"
 local BOSS_FALLBACK_HEIGHT = 4
 
--- Barra rectangular
-local BAR_W = 240
-local BAR_H = 34
+-- Barra rectangular (más pequeña)
+local BAR_W = 150
+local BAR_H = 26
 
--- Burbuja/botón de minimizar (pequeño)
+-- Botón de minimizar (pequeño)
 local MENU_SIZE = 36
 
 ---------------------------------------------------------------------
@@ -90,8 +90,10 @@ local healBusy = false
 local healToken = 0
 local savedHealCF = nil              -- posición guardada antes de ir a Fountain
 local atFountain = false
+local featureSnapshot = nil          -- qué opciones estaban activas antes de curar (manual)
 
 local bossEntries, bossButtons = {}, {}
+local featureToggles = {}            -- opciones de Combate/Farm que se apagan al curarse
 
 local currentTarget
 local attackToken, chestToken, crystalToken = 0, 0, 0
@@ -764,6 +766,36 @@ local function setCrystalFarm(state)
 end
 
 ---------------------------------------------------------------------
+-- APAGAR / RESTAURAR OPCIONES AL CURARSE (modo manual)
+---------------------------------------------------------------------
+local function registerFeature(name, setFn, getFn)
+	table.insert(featureToggles, { name = name, set = setFn, get = getFn })
+end
+
+-- Apaga todo lo de Combate y Farm que esté activo y guarda cuáles eran
+local function disableFeatures()
+	featureSnapshot = {}
+	for _, f in ipairs(featureToggles) do
+		if f.get() then
+			featureSnapshot[f.name] = true
+			f.set(false)
+		end
+	end
+end
+
+-- Vuelve a activar solo las que estaban encendidas antes
+local function restoreFeatures()
+	if not featureSnapshot then return end
+	local snap = featureSnapshot
+	featureSnapshot = nil
+	for _, f in ipairs(featureToggles) do
+		if snap[f.name] then
+			f.set(true)
+		end
+	end
+end
+
+---------------------------------------------------------------------
 -- CURACIÓN EN FOUNTAIN (manual y automática)
 ---------------------------------------------------------------------
 local function findFountain()
@@ -838,9 +870,10 @@ local function returnFromFountain()
 	end
 	atFountain = false
 	setHealVisual(false)
+	restoreFeatures()
 end
 
--- Botón manual: 1ª vez va a Fountain, 2ª vez vuelve
+-- Botón manual: 1ª vez va a Fountain (y apaga lo de combate/farm), 2ª vez vuelve
 local function onManualHealTap()
 	if atFountain then
 		returnFromFountain()
@@ -848,6 +881,7 @@ local function onManualHealTap()
 	else
 		local ok = moveToFountain()
 		if ok then
+			disableFeatures()
 			setHealVisual(true)
 			setStatus("En Fountain. Activa el prompt; con ↩ Volver regresas.")
 		end
@@ -931,6 +965,12 @@ end
 -- Cambia el modo: "manual", "auto" o "off"
 local function setHealModeOption(mode)
 	if healMode == mode then return end
+
+	-- Si estabas en Fountain, regresa antes de cambiar de modo
+	if atFountain then
+		returnFromFountain()
+	end
+
 	healMode = mode
 
 	for key, b in pairs(healModeButtons) do
@@ -940,10 +980,6 @@ local function setHealModeOption(mode)
 	end
 
 	if mode == "off" then
-		-- Si estaba en Fountain, regresa
-		if atFountain and savedHealCF then
-			returnFromFountain()
-		end
 		healBusy = false
 		healToken += 1
 	end
@@ -1029,7 +1065,7 @@ end
 ---------------------------------------------------------------------
 setFlyVisual = function(on)
 	if flyBtn then
-		flyBtn.Text = on and "✈ FLY ON" or "✈ FLY OFF"
+		flyBtn.Text = on and "✈ ON" or "✈ OFF"
 		tween(flyBtn, { BackgroundColor3 = on and COLORS.flyOn or COLORS.flyOff })
 	end
 end
@@ -1041,13 +1077,13 @@ setHealVisual = function(atF)
 	end
 end
 
--- Con modo manual: barra dividida (Curar | FLY). Con automático: solo FLY.
+-- Manual: barra dividida (Curar | FLY). Automático u off: solo FLY.
 setHealModeVisual = function()
 	if not healBtn then return end
 	local manual = healMode == "manual"
 	healBtn.Visible = manual
-	flyBtn.Size = manual and UDim2.new(0.5, -6, 1, -6) or UDim2.new(1, -6, 1, -6)
-	flyBtn.Position = manual and UDim2.new(0.5, 3, 0, 3) or UDim2.new(0, 3, 0, 3)
+	flyBtn.Size = manual and UDim2.new(0.5, -5, 1, -6) or UDim2.new(1, -6, 1, -6)
+	flyBtn.Position = manual and UDim2.new(0.5, 2, 0, 3) or UDim2.new(0, 3, 0, 3)
 end
 
 local function stopFly()
@@ -1206,6 +1242,7 @@ local function shutdown()
 	healMode = "off"
 	savedHealCF = nil
 	atFountain = false
+	featureSnapshot = nil
 	attackToken += 1
 	chestToken += 1
 	crystalToken += 1
@@ -1240,10 +1277,10 @@ bar.Position = UDim2.new(0.5, -BAR_W / 2, 0, 46)
 bar.BackgroundColor3 = COLORS.panel
 bar.BorderSizePixel = 0
 bar.Parent = gui
-corner(bar, UDim.new(0, 8))
+corner(bar, UDim.new(0, 6))
 
 local barStroke = Instance.new("UIStroke")
-barStroke.Thickness = 1.5
+barStroke.Thickness = 1.2
 barStroke.Color = Color3.new(1, 1, 1)
 barStroke.Parent = bar
 
@@ -1259,18 +1296,18 @@ local function makeBarButton(text, color)
 	b.Text = text
 	b.TextColor3 = Color3.new(1, 1, 1)
 	b.Font = Enum.Font.GothamBold
-	b.TextSize = 12
+	b.TextSize = 10
 	b.AutoButtonColor = false
 	b.Parent = bar
-	corner(b, UDim.new(0, 6))
+	corner(b, UDim.new(0, 4))
 	return b
 end
 
 healBtn = makeBarButton("🏥 Curar", COLORS.heal)
-healBtn.Size = UDim2.new(0.5, -6, 1, -6)
+healBtn.Size = UDim2.new(0.5, -5, 1, -6)
 healBtn.Position = UDim2.new(0, 3, 0, 3)
 
-flyBtn = makeBarButton("✈ FLY OFF", COLORS.flyOff)
+flyBtn = makeBarButton("✈ OFF", COLORS.flyOff)
 
 makeDraggable(healBtn, bar, function()
 	if healMode == "manual" then
@@ -1449,7 +1486,7 @@ local function makeTab(name, text, index)
 	return page
 end
 
--- Fila con interruptor
+-- Fila con interruptor. Devuelve set, etiqueta de subtítulo y getter del estado.
 local function createRow(page, order, titleText, subtitleText, initial, callback)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 56)
@@ -1507,6 +1544,9 @@ local function createRow(page, order, titleText, subtitleText, initial, callback
 	hit.Parent = row
 
 	local state = initial
+	local function get()
+		return state
+	end
 	local function set(value, silent)
 		state = value
 		tween(sw, { BackgroundColor3 = value and COLORS.on or COLORS.off })
@@ -1522,7 +1562,7 @@ local function createRow(page, order, titleText, subtitleText, initial, callback
 	end)
 
 	set(initial, true)
-	return set, s
+	return set, s, get
 end
 
 -- Botón de acción
@@ -1543,7 +1583,7 @@ local function createButtonRow(page, order, titleText, color, callback)
 	return btn
 end
 
--- Selector de modo de curación: Manual / Automático / Off
+-- Selector de modo de curación: Apagado / Manual / Automático
 local function createHealModeSelector(page, order)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 48)
@@ -1644,18 +1684,30 @@ end)
 -- Página: Combate
 local combatPage = pages.combat
 createModeSelector(combatPage, 1)
-createRow(combatPage, 2, "Auto-ataque", "Apunta y ataca al más cercano", false, setAutoAttack)
-createRow(combatPage, 3, "TP + Auto-ataque", "Va hasta el enemigo y ataca", false, setTpAttack)
-createRow(combatPage, 4, "TP al enemigo", "Te lleva junto al más cercano", false, setTpEnemy)
-createRow(combatPage, 5, "Mantener distancia", "Esquiva rápido (modo a distancia)", false, setKeepDistance)
+
+local aaSet, _, aaGet = createRow(combatPage, 2, "Auto-ataque", "Apunta y ataca al más cercano", false, setAutoAttack)
+registerFeature("autoAttack", aaSet, aaGet)
+
+local tpaSet, _, tpaGet = createRow(combatPage, 3, "TP + Auto-ataque", "Va hasta el enemigo y ataca", false, setTpAttack)
+registerFeature("tpAttack", tpaSet, tpaGet)
+
+local tpeSet, _, tpeGet = createRow(combatPage, 4, "TP al enemigo", "Te lleva junto al más cercano", false, setTpEnemy)
+registerFeature("tpEnemy", tpeSet, tpeGet)
+
+local kdSet, _, kdGet = createRow(combatPage, 5, "Mantener distancia", "Esquiva rápido (modo a distancia)", false, setKeepDistance)
+registerFeature("keepDistance", kdSet, kdGet)
 
 -- Página: Farm
 local farmPage = pages.farm
 createHealModeSelector(farmPage, 0)
-local _, chestLabel = createRow(farmPage, 1, "Auto-cofres", "Cofres recogidos: 0", false, setAutoChest)
+
+local chestSet, chestLabel, chestGet = createRow(farmPage, 1, "Auto-cofres", "Cofres recogidos: 0", false, setAutoChest)
 chestSub = chestLabel
-local _, crystalLabel = createRow(farmPage, 2, "Auto-cristales", "Cristales rotos: 0", false, setCrystalFarm)
+registerFeature("autoChest", chestSet, chestGet)
+
+local crystalSet, crystalLabel, crystalGet = createRow(farmPage, 2, "Auto-cristales", "Cristales rotos: 0", false, setCrystalFarm)
 crystalSub = crystalLabel
+registerFeature("crystalFarm", crystalSet, crystalGet)
 
 statusLabel = Instance.new("TextLabel")
 statusLabel.Name = "StatusLabel"
@@ -1779,7 +1831,7 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
 	end
 end))
 
--- Al morir o reaparecer: se limpia el estado de curación y de vuelo
+-- Al morir o reaparecer: se limpia el estado de curación
 track(player.CharacterAdded:Connect(function()
 	stopFly()
 	originalCollide = {}
@@ -1790,4 +1842,7 @@ track(player.CharacterAdded:Connect(function()
 	atFountain = false
 	healToken += 1
 	setHealVisual(false)
+	if featureSnapshot then
+		task.delay(1, restoreFeatures)
+	end
 end))
