@@ -1,8 +1,7 @@
--- Servicio de Teleport con UI Bonita
+-- Servicio de Teleport Avanzado con UI (Delta Executor)
 local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -20,12 +19,12 @@ screenGui.Parent = CoreGui
 -- Marco Principal
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 320, 0, 240)
-mainFrame.Position = UDim2.new(0.5, -160, 0.4, -120)
+mainFrame.Size = UDim2.new(0, 330, 0, 270)
+mainFrame.Position = UDim2.new(0.5, -165, 0.4, -135)
 mainFrame.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
 mainFrame.BorderSizePixel = 0
 mainFrame.Active = true
-mainFrame.Draggable = true -- Permite arrastrar la ventana
+mainFrame.Draggable = true
 mainFrame.Parent = screenGui
 
 local mainCorner = Instance.new("UICorner")
@@ -39,25 +38,25 @@ mainStroke.Parent = mainFrame
 
 -- Título
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Size = UDim2.new(1, -40, 0, 40)
+titleLabel.Size = UDim2.new(1, -40, 0, 35)
 titleLabel.Position = UDim2.new(0, 15, 0, 5)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "Teleport por Coordenadas"
+titleLabel.Text = "Teleport por Nombre / Coords"
 titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-titleLabel.TextSize = 16
+titleLabel.TextSize = 15
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.Parent = mainFrame
 
--- Botón de Cerrar
+-- Botón Cerrar
 local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 28, 0, 28)
-closeBtn.Position = UDim2.new(1, -35, 0, 10)
+closeBtn.Size = UDim2.new(0, 26, 0, 26)
+closeBtn.Position = UDim2.new(1, -33, 0, 8)
 closeBtn.BackgroundColor3 = Color3.fromRGB(38, 42, 52)
 closeBtn.Text = "X"
 closeBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
 closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14
+closeBtn.TextSize = 13
 closeBtn.Parent = mainFrame
 
 local closeCorner = Instance.new("UICorner")
@@ -68,17 +67,17 @@ closeBtn.MouseButton1Click:Connect(function()
     screenGui:Destroy()
 end)
 
--- Campo de Texto para Coordenadas
+-- Campo de Texto
 local textBox = Instance.new("TextBox")
-textBox.Size = UDim2.new(1, -30, 0, 42)
-textBox.Position = UDim2.new(0, 15, 0, 55)
+textBox.Size = UDim2.new(1, -30, 0, 40)
+textBox.Position = UDim2.new(0, 15, 0, 45)
 textBox.BackgroundColor3 = Color3.fromRGB(33, 36, 44)
-textBox.PlaceholderText = "Ej: 100, 50, -200"
-textBox.PlaceholderColor3 = Color3.fromRGB(120, 125, 140)
+textBox.PlaceholderText = "Nombre del modelo O coordenadas (X, Y, Z)"
+textBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 130)
 textBox.Text = ""
 textBox.TextColor3 = Color3.fromRGB(255, 255, 255)
 textBox.Font = Enum.Font.GothamMedium
-textBox.TextSize = 14
+textBox.TextSize = 13
 textBox.ClearTextOnFocus = false
 textBox.Parent = mainFrame
 
@@ -91,68 +90,123 @@ boxStroke.Color = Color3.fromRGB(50, 55, 68)
 boxStroke.Thickness = 1
 boxStroke.Parent = textBox
 
--- Botón de Teleport
-local tpBtn = Instance.new("TextButton")
-tpBtn.Size = UDim2.new(1, -30, 0, 42)
-tpBtn.Position = UDim2.new(0, 15, 0, 108)
-tpBtn.BackgroundColor3 = Color3.fromRGB(88, 101, 242)
-tpBtn.Text = "Teletransportar"
-tpBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-tpBtn.Font = Enum.Font.GothamBold
-tpBtn.TextSize = 14
-tpBtn.Parent = mainFrame
+-- Botón de TP por Coordenadas
+local tpCoordsBtn = Instance.new("TextButton")
+tpCoordsBtn.Size = UDim2.new(0.48, -10, 0, 38)
+tpCoordsBtn.Position = UDim2.new(0, 15, 0, 95)
+tpCoordsBtn.BackgroundColor3 = Color3.fromRGB(88, 101, 242)
+tpCoordsBtn.Text = "TP a Coordenadas"
+tpCoordsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+tpCoordsBtn.Font = Enum.Font.GothamBold
+tpCoordsBtn.TextSize = 12
+tpCoordsBtn.Parent = mainFrame
 
-local tpCorner = Instance.new("UICorner")
-tpCorner.CornerRadius = UDim.new(0, 8)
-tpCorner.Parent = tpBtn
+local tpCoordsCorner = Instance.new("UICorner")
+tpCoordsCorner.CornerRadius = UDim.new(0, 8)
+tpCoordsCorner.Parent = tpCoordsBtn
 
--- Etiqueta de Estado / Informes
+-- Botón de TP por Nombre de Model
+tpModelBtn = Instance.new("TextButton")
+tpModelBtn.Size = UDim2.new(0.48, -10, 0, 38)
+tpModelBtn.Position = UDim2.new(0.52, 0, 0, 95)
+tpModelBtn.BackgroundColor3 = Color3.fromRGB(57, 163, 102)
+tpModelBtn.Text = "TP a Modelo"
+tpModelBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+tpModelBtn.Font = Enum.Font.GothamBold
+tpModelBtn.TextSize = 12
+tpModelBtn.Parent = mainFrame
+
+local tpModelCorner = Instance.new("UICorner")
+tpModelCorner.CornerRadius = UDim.new(0, 8)
+tpModelCorner.Parent = tpModelBtn
+
+-- Etiqueta de Estado
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(1, -30, 0, 25)
-statusLabel.Position = UDim2.new(0, 15, 0, 158)
+statusLabel.Size = UDim2.new(1, -30, 0, 30)
+statusLabel.Position = UDim2.new(0, 15, 0, 142)
 statusLabel.BackgroundTransparency = 1
-statusLabel.Text = "Ingresa X, Y, Z para comenzar"
+statusLabel.Text = "Escribe un nombre o coordenadas para iniciar"
 statusLabel.TextColor3 = Color3.fromRGB(150, 155, 170)
 statusLabel.Font = Enum.Font.Gotham
 statusLabel.TextSize = 12
+statusLabel.TextWrapped = true
 statusLabel.Parent = mainFrame
 
--- Función para Teletransportar
-local function executeTeleport()
+-- Función para TP a Coordenadas
+tpCoordsBtn.MouseButton1Click:Connect(function()
     local text = textBox.Text
     local coords = {}
     
-    -- Extraer números (soporta comas, espacios o saltos)
     for num in string.gmatch(text, "[-%d%.]+") do
         table.insert(coords, tonumber(num))
     end
     
     if #coords >= 3 then
-        local x, y, z = coords[1], coords[2], coords[3]
-        
         local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
         local rootPart = character:FindFirstChild("HumanoidRootPart")
-        
         if rootPart then
-            rootPart.CFrame = CFrame.new(x, y, z)
-            statusLabel.Text = string.format("Teletransportado a: %.1f, %.1f, %.1f", x, y, z)
+            rootPart.CFrame = CFrame.new(coords[1], coords[2], coords[3])
+            statusLabel.Text = string.format("Teletransportado a: %.1f, %.1f, %.1f", coords[1], coords[2], coords[3])
             statusLabel.TextColor3 = Color3.fromRGB(87, 242, 135)
-        else
-            statusLabel.Text = "Error: Personaje no encontrado"
-            statusLabel.TextColor3 = Color3.fromRGB(237, 66, 69)
         end
     else
-        statusLabel.Text = "Formato inválido. Usa: X, Y, Z"
+        statusLabel.Text = "Formato inválido. Ejemplo: 100, 50, -200"
         statusLabel.TextColor3 = Color3.fromRGB(237, 66, 69)
     end
-end
+end)
 
-tpBtn.MouseButton1Click:Connect(executeTeleport)
+-- Función para TP por Nombre de Modelo
+tpModelBtn.MouseButton1Click:Connect(function()
+    local targetName = string.lower(textBox.Text)
+    if targetName == "" then
+        statusLabel.Text = "Escribe el nombre del modelo primero"
+        statusLabel.TextColor3 = Color3.fromRGB(237, 66, 69)
+        return
+    end
 
--- Botón para Copiar Posición Actual
+    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return end
+
+    local targetFound = nil
+
+    -- Buscar en todo el Workspace por nombre (sin importar mayúsculas/minúsculas)
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if string.lower(obj.Name) == targetName or string.find(string.lower(obj.Name), targetName) then
+            -- Comprobar si el objeto tiene una posición válida
+            if obj:IsA("BasePart") then
+                targetFound = obj
+                break
+            elseif obj:IsA("Model") then
+                if obj.PrimaryPart then
+                    targetFound = obj.PrimaryPart
+                    break
+                else
+                    local part = obj:FindFirstChildWhichIsA("BasePart", true)
+                    if part then
+                        targetFound = part
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if targetFound then
+        -- Teletransportar 3 bloques por encima para no quedar atrapado
+        rootPart.CFrame = targetFound.CFrame + Vector3.new(0, 3, 0)
+        statusLabel.Text = "¡Encontrado! Teletransportado a: " .. targetFound.Parent.Name
+        statusLabel.TextColor3 = Color3.fromRGB(87, 242, 135)
+    else
+        statusLabel.Text = "No se encontró ningún modelo con ese nombre"
+        statusLabel.TextColor3 = Color3.fromRGB(237, 66, 69)
+    end
+end)
+
+-- Botón para Copiar Posición
 local copyPosBtn = Instance.new("TextButton")
-copyPosBtn.Size = UDim2.new(1, -30, 0, 30)
-copyPosBtn.Position = UDim2.new(0, 15, 0, 192)
+copyPosBtn.Size = UDim2.new(1, -30, 0, 32)
+copyPosBtn.Position = UDim2.new(0, 15, 0, 185)
 copyPosBtn.BackgroundColor3 = Color3.fromRGB(33, 36, 44)
 copyPosBtn.Text = "Copiar mi posición actual"
 copyPosBtn.TextColor3 = Color3.fromRGB(180, 185, 200)
@@ -172,9 +226,9 @@ copyPosBtn.MouseButton1Click:Connect(function()
         textBox.Text = posStr
         if setclipboard then
             setclipboard(posStr)
-            statusLabel.Text = "¡Copiado al portapapeles!"
+            statusLabel.Text = "¡Posición copiada al portapapeles!"
         else
-            statusLabel.Text = "Posición cargada en la caja"
+            statusLabel.Text = "Posición pegada en el campo de texto"
         end
         statusLabel.TextColor3 = Color3.fromRGB(254, 231, 92)
     end
