@@ -1,4 +1,4 @@
--- CFly + Noclip + Combate + TP + Auto-cofres + Cristales, UI por pestañas
+-- CFly + Noclip + Combate + TP + Auto-cofres + Cristales + Auto-curar Fountain, UI por pestañas
 -- LocalScript en StarterPlayer > StarterPlayerScripts (reemplaza el anterior)
 
 local Players = game:GetService("Players")
@@ -51,6 +51,15 @@ local CRYSTAL_ATTACK_INTERVAL = 0.1   -- segundos entre disparos
 local CRYSTAL_TIMEOUT = 15            -- si no se rompe en estos segundos, pasa al siguiente
 local CRYSTAL_SKIP_TIME = 20          -- tiempo que se salta un cristal que no se rompió
 
+-- Auto-curar en Fountain (NUEVO)
+local FOUNTAIN_NAME = "Fountain"      -- nombre de la Part o Model de la fuente
+local HEAL_THRESHOLD = 0.2            -- se activa al 20% de vida
+local HEAL_DONE = 0.95                -- se considera curado al 95%
+local HEAL_TIMEOUT = 20               -- segundos máximos esperando la curación
+local HEAL_TP_DELAY = 0.2             -- espera tras teletransportarte antes de interactuar
+local HEAL_HEIGHT = 3                 -- altura sobre la fuente al teletransportarte
+local HEAL_COOLDOWN = 5               -- segundos de espera antes de volver a intentarlo
+
 ---------------------------------------------------------------------
 -- ESTADO
 ---------------------------------------------------------------------
@@ -59,6 +68,8 @@ local flying, noclip = false, false
 local autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
 local autoChest, chestBusy = false, false
 local crystalFarm, crystalBusy = false, false
+local autoHeal, healBusy = false, false          -- NUEVO
+local healToken, healLoopToken = 0, 0            -- NUEVO
 local chestsCollected, crystalsCollected = 0, 0
 local combatMode = "melee"
 local moveButtonsEnabled = false
@@ -81,7 +92,7 @@ local setFlyRow, toggleFly
 local chestSub, crystalSub
 
 local function isBusy()
-	return chestBusy or crystalBusy
+	return chestBusy or crystalBusy or healBusy   -- healBusy NUEVO
 end
 
 ---------------------------------------------------------------------
@@ -567,7 +578,7 @@ local function startChestLoop()
 		local lastReset = os.clock()
 		while running and autoChest and token == chestToken do
 			local hum, root = getParts()
-			if hum and root and hum.Health > 0 and not crystalBusy then
+			if hum and root and hum.Health > 0 and not crystalBusy and not healBusy then -- healBusy NUEVO
 				local best, bestD
 				for _, p in ipairs(getChestPrompts()) do
 					if (chestAttempts[p] or 0) < CHEST_MAX_TRIES then
@@ -656,7 +667,7 @@ local function farmCrystal(model)
 	local startT = os.clock()
 	while running and crystalFarm and crystalAlive(model) and os.clock() - startT < CRYSTAL_TIMEOUT do
 		local hum, root = getParts()
-		if hum and root and hum.Health > 0 then
+		if hum and root and hum.Health > 0 and not healBusy then -- healBusy NUEVO
 			teleportNearCrystal(model)
 			fireAttack()
 		end
@@ -676,7 +687,7 @@ local function startCrystalLoop()
 	task.spawn(function()
 		while running and crystalFarm and token == crystalToken do
 			local hum, root = getParts()
-			if hum and root and hum.Health > 0 then
+			if hum and root and hum.Health > 0 and not healBusy then -- healBusy NUEVO
 				local best, bestD
 				local now = os.clock()
 				for _, m in ipairs(getCrystalModels()) do
@@ -718,6 +729,138 @@ local function setCrystalFarm(state)
 		startCrystalLoop()
 	else
 		crystalBusy = false
+	end
+end
+
+---------------------------------------------------------------------
+-- AUTO-CURAR EN FOUNTAIN (NUEVO)
+-- Al 20% de vida: guarda posición, va al Fountain, usa su ProximityPrompt,
+-- espera la curación y regresa a la posición original.
+---------------------------------------------------------------------
+local function getPosition(obj)
+	if obj:IsA("BasePart") then
+		return obj.Position
+	elseif obj:IsA("Model") then
+		return obj:GetPivot().Position
+	end
+	return nil
+end
+
+-- Busca la Part/Model "Fountain" y su ProximityPrompt
+local function findFountain()
+	local found
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d.Name == FOUNTAIN_NAME and (d:IsA("BasePart") or d:IsA("Model")) then
+			local prompt = d:FindFirstChildWhichIsA("ProximityPrompt", true)
+			if prompt and prompt.Enabled then
+				return d, prompt
+			end
+			found = found or d
+		end
+	end
+
+	-- Si el prompt no está dentro de Fountain, busca uno cercano
+	if found then
+		local pos = getPosition(found)
+		local closest, closestD
+		if pos then
+			for _, p in ipairs(workspace:GetDescendants()) do
+				if p:IsA("ProximityPrompt") and p.Enabled then
+					local pp = promptPosition(p)
+					if pp then
+						local dist = (pp - pos).Magnitude
+						if dist < 15 and (not closestD or dist < closestD) then
+							closest, closestD = p, dist
+						end
+					end
+				end
+			end
+		end
+		return found, closest
+	end
+
+	return nil, nil
+end
+
+local function healAtFountain()
+	local hum, root = getParts()
+	if not hum or not root or hum.Health <= 0 then return false end
+
+	local fountain, prompt = findFountain()
+	if not fountain or not prompt then
+		warnOnce("fountain", "No encontré Fountain con ProximityPrompt")
+		return false
+	end
+
+	healToken += 1
+	local token = healToken
+	healBusy = true
+
+	local savedCF = root.CFrame
+	local wasAnchored = root.Anchored
+	local fpos = promptPosition(prompt) or getPosition(fountain)
+
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		if prompt.MaxActivationDistance < 12 then
+			prompt.MaxActivationDistance = 12
+		end
+	end)
+
+	-- Ir a la fuente
+	root.CFrame = CFrame.new(fpos + Vector3.new(0, HEAL_HEIGHT, 0))
+	root.AssemblyLinearVelocity = Vector3.zero
+	if not flying then
+		root.Anchored = true
+	end
+
+	task.wait(HEAL_TP_DELAY)
+
+	-- Interactuar con el ProximityPrompt
+	if prompt.Parent and prompt.Enabled then
+		pcall(function() prompt:InputHoldBegin() end)
+	end
+
+	-- Esperar a que se cure
+	local startT = os.clock()
+	while running and token == healToken and hum.Health > 0
+		and os.clock() - startT < HEAL_TIMEOUT do
+		if hum.Health >= hum.MaxHealth * HEAL_DONE then
+			break
+		end
+		task.wait(0.1)
+	end
+
+	pcall(function() prompt:InputHoldEnd() end)
+
+	-- Regresar a la posición original
+	if token == healToken and root.Parent then
+		root.CFrame = savedCF
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.Anchored = wasAnchored
+		healBusy = false
+	end
+
+	return true
+end
+
+local function setAutoHeal(state)
+	autoHeal = state
+	healLoopToken += 1
+	if state then
+		local token = healLoopToken
+		task.spawn(function()
+			while running and autoHeal and token == healLoopToken do
+				local hum = getParts()
+				if hum and hum.Health > 0
+					and hum.Health <= hum.MaxHealth * HEAL_THRESHOLD
+					and not isBusy() then
+					pcall(healAtFountain)
+					task.wait(HEAL_COOLDOWN)
+				end
+				task.wait(0.2)
+			end
+		end)
 	end
 end
 
@@ -774,7 +917,7 @@ local function startFly()
 		local h, r = getParts()
 		if not h or not r then return end
 
-		-- Mientras se teletransporta a cofres o cristales, el vuelo no mueve al personaje
+		-- Mientras se teletransporta a cofres, cristales o la fuente, el vuelo no mueve al personaje
 		if isBusy() then
 			r.AssemblyLinearVelocity = Vector3.zero
 			return
@@ -1186,12 +1329,13 @@ createRow(combatPage, 3, "TP + Auto-ataque", "Va hasta el enemigo y ataca", fals
 createRow(combatPage, 4, "TP al enemigo", "Te lleva junto al más cercano", false, setTpEnemy)
 createRow(combatPage, 5, "Mantener distancia", "Esquiva rápido (modo a distancia)", false, setKeepDistance)
 
--- Página: Farm (cofres y cristales)
+-- Página: Farm (cofres, cristales y curación)
 local farmPage = pages.farm
 local _, chestLabel = createRow(farmPage, 1, "Auto-cofres", "Cofres recogidos: 0", false, setAutoChest)
 chestSub = chestLabel
 local _, crystalLabel = createRow(farmPage, 2, "Auto-cristales", "Cristales rotos: 0", false, setCrystalFarm)
 crystalSub = crystalLabel
+createRow(farmPage, 3, "Auto-curar (Fountain)", "Al 20% de vida va a la fuente", false, setAutoHeal) -- NUEVO
 
 -- Página: Ajustes
 local settingsPage = pages.settings
@@ -1239,10 +1383,13 @@ local function shutdown()
 	running = false
 	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
 	autoChest, crystalFarm = false, false
-	chestBusy, crystalBusy = false, false
+	autoHeal = false                                  -- NUEVO
+	chestBusy, crystalBusy, healBusy = false, false, false
 	attackToken += 1
 	chestToken += 1
 	crystalToken += 1
+	healToken += 1                                    -- NUEVO
+	healLoopToken += 1                                -- NUEVO
 
 	stopFly()
 	setNoclip(false)
@@ -1316,4 +1463,6 @@ track(player.CharacterAdded:Connect(function()
 	originalCollide = {}
 	chestBusy = false
 	crystalBusy = false
+	healBusy = false          -- NUEVO
+	healToken += 1            -- NUEVO: cancela una curación en curso si moriste
 end))
