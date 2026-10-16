@@ -51,19 +51,21 @@ local CRYSTAL_ATTACK_INTERVAL = 0.1   -- segundos entre disparos
 local CRYSTAL_TIMEOUT = 15            -- si no se rompe en estos segundos, pasa al siguiente
 local CRYSTAL_SKIP_TIME = 20          -- tiempo que se salta un cristal que no se rompió
 
+-- Prompts (Fountain y jefes)
+local PROMPT_WAIT = 3                 -- segundos máximos esperando a que el prompt esté al alcance
+local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5) -- dónde te paras respecto al prompt
+
 -- Auto-curar en Fountain
 local FOUNTAIN_NAME = "Fountain"      -- nombre de la Part o Model de la fuente
 local HEAL_THRESHOLD = 0.2            -- se activa al 20% de vida
 local HEAL_DONE = 0.95                -- no se sale hasta llegar a este porcentaje
-local HEAL_TP_DELAY = 0.2             -- espera tras teletransportarte antes de interactuar
-local HEAL_HEIGHT = 3                 -- altura sobre la fuente al teletransportarte
+local HEAL_TP_DELAY = 0.2             -- espera tras teletransportarte
 local HEAL_COOLDOWN = 5               -- segundos de espera antes de volver a intentarlo
 local HEAL_RETURN_DIST = 12           -- si te alejas más de esto de la fuente, vuelves a ella
 local HEAL_POLL = 0.1                 -- frecuencia de revisión durante la curación
 
 -- Jefes (StarRune)
-local BOSS_NAME = "StarRune"          -- Part o Model; también sirve "StarRune1", "StarRune 2", etc.
-local BOSS_OFFSET_Y = 4               -- altura sobre el StarRune al teletransportarte
+local BOSS_NAME = "StarRune"          -- Part o Model llamado StarRune
 local BOSS_TP_DELAY = 0.2             -- espera tras teletransportarte antes de interactuar
 
 ---------------------------------------------------------------------
@@ -520,6 +522,71 @@ local function setKeepDistance(state)
 end
 
 ---------------------------------------------------------------------
+-- PROMPTS (helpers compartidos: cofres, Fountain y jefes)
+---------------------------------------------------------------------
+-- Posición real del ProximityPrompt según su padre
+local function promptPosition(prompt)
+	local par = prompt.Parent
+	if not par then return nil end
+	if par:IsA("Attachment") then
+		return par.WorldPosition
+	elseif par:IsA("BasePart") then
+		return par.Position
+	elseif par:IsA("Model") then
+		return par:GetPivot().Position
+	end
+	local m = par:FindFirstAncestorOfClass("Model")
+	return m and m:GetPivot().Position or nil
+end
+
+-- Espera a que el prompt esté habilitado y tu personaje esté dentro de su alcance
+local function waitPromptReady(prompt, root)
+	local t0 = os.clock()
+	while running and os.clock() - t0 < PROMPT_WAIT do
+		if prompt.Parent and prompt.Enabled and root and root.Parent then
+			local pos = promptPosition(prompt)
+			if pos and (root.Position - pos).Magnitude <= prompt.MaxActivationDistance then
+				return true
+			end
+		end
+		task.wait(0.1)
+	end
+	return false
+end
+
+-- Activa el prompt: usa fireproximityprompt si el executor lo tiene; si no, mantiene el hold
+local function usePrompt(prompt)
+	if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		if prompt.MaxActivationDistance < 12 then
+			prompt.MaxActivationDistance = 12
+		end
+	end)
+
+	if typeof(fireproximityprompt) == "function" then
+		pcall(fireproximityprompt, prompt)
+		return true
+	end
+
+	pcall(function() prompt:InputHoldBegin() end)
+	task.wait(math.max(prompt.HoldDuration, 0) + 0.3)
+	pcall(function() prompt:InputHoldEnd() end)
+	return true
+end
+
+-- Teletransporta al personaje junto al prompt
+local function standNearPrompt(prompt, root)
+	local pos = promptPosition(prompt)
+	if not pos or not root then return nil end
+	local dest = pos + PROMPT_STAND_OFFSET
+	root.CFrame = CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z))
+	root.AssemblyLinearVelocity = Vector3.zero
+	return pos
+end
+
+---------------------------------------------------------------------
 -- AUTO-COFRES
 ---------------------------------------------------------------------
 local function getChestPrompts()
@@ -535,18 +602,6 @@ local function getChestPrompts()
 		end
 	end
 	return list
-end
-
-local function promptPosition(prompt)
-	local par = prompt.Parent
-	if not par then return nil end
-	if par:IsA("BasePart") then
-		return par.Position
-	elseif par:IsA("Attachment") then
-		return par.WorldPosition
-	end
-	local model = par:FindFirstAncestorOfClass("Model")
-	return model and model:GetPivot().Position or nil
 end
 
 local function collectChest(prompt)
@@ -743,9 +798,8 @@ end
 
 ---------------------------------------------------------------------
 -- AUTO-CURAR EN FOUNTAIN
--- Al 20% de vida: guarda posición, va al Fountain y se queda ahí hasta
--- llegar al 95%. Si lo devuelven a su posición sin curar, vuelve a Fountain.
--- Al terminar regresa a la posición original.
+-- Al 20% de vida: guarda posición, va al prompt de Fountain y se queda
+-- hasta llegar al 95%. Si lo devuelven sin curar, vuelve. Al final regresa.
 ---------------------------------------------------------------------
 local function getPosition(obj)
 	if obj:IsA("BasePart") then
@@ -812,24 +866,14 @@ local function healAtFountain()
 	local savedCF = root.CFrame
 	local wasAnchored = root.Anchored
 
-	pcall(function()
-		prompt.RequiresLineOfSight = false
-		if prompt.MaxActivationDistance < 12 then
-			prompt.MaxActivationDistance = 12
-		end
-	end)
-
-	local function goToFountain(r)
-		r.CFrame = CFrame.new(fpos + Vector3.new(0, HEAL_HEIGHT, 0))
-		r.AssemblyLinearVelocity = Vector3.zero
-	end
-
-	-- Ir a la fuente
 	if not flying then
 		root.Anchored = true
 	end
-	goToFountain(root)
+
+	-- Ir junto al prompt
+	standNearPrompt(prompt, root)
 	task.wait(HEAL_TP_DELAY)
+	waitPromptReady(prompt, root)
 
 	-- Quedarse en la fuente hasta curarse
 	while running and autoHeal and token == healToken do
@@ -837,16 +881,14 @@ local function healAtFountain()
 		if not h or not r or h.Health <= 0 then break end
 		if h.Health >= h.MaxHealth * HEAL_DONE then break end
 
-		-- Si te devolvieron a otro lugar sin curarte, vuelves a la fuente
+		-- Si te devolvieron a otro lugar sin curarte, vuelves al prompt
 		if (r.Position - fpos).Magnitude > HEAL_RETURN_DIST then
-			goToFountain(r)
+			standNearPrompt(prompt, r)
+			task.wait(HEAL_TP_DELAY)
+			waitPromptReady(prompt, r)
 		end
 
-		if prompt.Parent and prompt.Enabled then
-			pcall(function() prompt:InputHoldBegin() end)
-			task.wait(math.max(prompt.HoldDuration, 0) + 0.2)
-			pcall(function() prompt:InputHoldEnd() end)
-		end
+		usePrompt(prompt)
 		task.wait(HEAL_POLL)
 	end
 
@@ -888,43 +930,26 @@ end
 
 ---------------------------------------------------------------------
 -- JEFES (StarRune)
--- Se ordenan por número: StarRune1 = Jefe 1, StarRune2 = Jefe 2, etc.
+-- Todos se llaman StarRune: el orden de aparición define Jefe 1, Jefe 2, etc.
 ---------------------------------------------------------------------
-local function isStarRuneName(name)
-	return string.match(name, "^StarRune%s*(%d*)$") ~= nil
-end
-
 local function getStarRunes()
-	local found = {}
+	local list = {}
 	for _, d in ipairs(workspace:GetDescendants()) do
-		if (d:IsA("BasePart") or d:IsA("Model")) and isStarRuneName(d.Name) then
-			-- Evita contar partes dentro de otro StarRune
+		if (d:IsA("BasePart") or d:IsA("Model")) and d.Name == BOSS_NAME then
+			-- Evita contar StarRunes que estén dentro de otro StarRune
 			local nested = false
 			local anc = d.Parent
 			while anc and anc ~= workspace do
-				if isStarRuneName(anc.Name) then
+				if anc.Name == BOSS_NAME then
 					nested = true
 					break
 				end
 				anc = anc.Parent
 			end
 			if not nested then
-				local num = tonumber(string.match(d.Name, "^StarRune%s*(%d*)$")) or math.huge
-				table.insert(found, { inst = d, num = num, idx = #found + 1 })
+				table.insert(list, d)
 			end
 		end
-	end
-
-	table.sort(found, function(a, b)
-		if a.num ~= b.num then
-			return a.num < b.num
-		end
-		return a.idx < b.idx
-	end)
-
-	local list = {}
-	for _, entry in ipairs(found) do
-		table.insert(list, entry.inst)
 	end
 	return list
 end
@@ -945,28 +970,23 @@ local function fightBoss(index)
 	local hum, root = getParts()
 	if not hum or not root or hum.Health <= 0 then return end
 
-	local pos = getPosition(inst)
-	if not pos then return end
 	local prompt = findPromptIn(inst)
+	if not prompt then
+		warnOnce("bossprompt" .. index, "Jefe " .. index .. " no tiene ProximityPrompt")
+		return
+	end
 
 	bossBusy = true
 	local ok, err = pcall(function()
 		local wasAnchored = root.Anchored
-		root.CFrame = CFrame.new(pos + Vector3.new(0, BOSS_OFFSET_Y, 0))
-		root.AssemblyLinearVelocity = Vector3.zero
 		if not flying then
 			root.Anchored = true
 		end
 
+		standNearPrompt(prompt, root)
 		task.wait(BOSS_TP_DELAY)
-
-		if prompt and prompt.Parent and prompt.Enabled then
-			pcall(function() prompt:InputHoldBegin() end)
-			task.wait(math.max(prompt.HoldDuration, 0) + 0.2)
-			pcall(function() prompt:InputHoldEnd() end)
-		else
-			warnOnce("bossprompt" .. index, "Jefe " .. index .. " no tiene ProximityPrompt activo")
-		end
+		waitPromptReady(prompt, root)
+		usePrompt(prompt)
 
 		if root.Parent then
 			root.Anchored = wasAnchored
