@@ -5,7 +5,7 @@ local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
--- Eliminar interfaz anterior si existe
+-- Eliminar interfaz anterior si existe 
 if CoreGui:FindFirstChild("TP_Gui_Executor") then
     CoreGui.TP_Gui_Executor:Destroy()
 end
