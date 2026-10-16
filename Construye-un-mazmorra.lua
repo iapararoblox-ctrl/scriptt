@@ -54,6 +54,7 @@ local CRYSTAL_SKIP_TIME = 20          -- tiempo que se salta un cristal que no s
 -- Prompts (Fountain y jefes)
 local PROMPT_WAIT = 3                 -- segundos máximos esperando a que el prompt esté al alcance
 local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5) -- dónde te paras respecto al prompt
+local PROMPT_NEARBY_RANGE = 15        -- si el jefe no tiene prompt dentro, busca uno a esta distancia
 
 -- Auto-curar en Fountain
 local FOUNTAIN_NAME = "Fountain"      -- nombre de la Part o Model de la fuente
@@ -65,8 +66,9 @@ local HEAL_RETURN_DIST = 12           -- si te alejas más de esto de la fuente,
 local HEAL_POLL = 0.1                 -- frecuencia de revisión durante la curación
 
 -- Jefes (StarRune)
-local BOSS_NAME = "StarRune"          -- Part o Model llamado StarRune
+local BOSS_NAME = "StarRune"          -- se reconoce con cualquier clase y con números: StarRune, StarRune1, StarRune 2...
 local BOSS_TP_DELAY = 0.2             -- espera tras teletransportarte antes de interactuar
+local BOSS_FALLBACK_HEIGHT = 4        -- altura si el jefe no tiene prompt y solo te teletransportas
 
 ---------------------------------------------------------------------
 -- ESTADO
@@ -80,6 +82,8 @@ local autoHeal, healBusy = false, false
 local healToken, healLoopToken = 0, 0
 local bossBusy = false
 local bossEntries, bossButtons = {}, {}
+local refreshBosses                  -- se define más abajo
+local bossStatus                     -- etiqueta de estado en Farm
 local chestsCollected, crystalsCollected = 0, 0
 local combatMode = "melee"
 local moveButtonsEnabled = false
@@ -930,49 +934,116 @@ end
 
 ---------------------------------------------------------------------
 -- JEFES (StarRune)
--- Todos se llaman StarRune: el orden de aparición define Jefe 1, Jefe 2, etc.
+-- Busca en todo el juego, sin importar la clase ni el número del nombre.
+-- El orden de aparición define Jefe 1, Jefe 2, etc.
 ---------------------------------------------------------------------
+local function normalizeName(s)
+	return string.lower((string.gsub(s, "%s+", "")))
+end
+
+local function isBossName(name)
+	local pattern = "^" .. string.lower(BOSS_NAME) .. "%d*$"
+	return string.match(normalizeName(name), pattern) ~= nil
+end
+
+local function setBossStatus(text)
+	if bossStatus then
+		bossStatus.Text = text
+	end
+end
+
+-- Escanea workspace y, si no hay nada, ReplicatedStorage y Lighting
 local function getStarRunes()
-	local list = {}
-	for _, d in ipairs(workspace:GetDescendants()) do
-		if (d:IsA("BasePart") or d:IsA("Model")) and d.Name == BOSS_NAME then
-			-- Evita contar StarRunes que estén dentro de otro StarRune
-			local nested = false
-			local anc = d.Parent
-			while anc and anc ~= workspace do
-				if anc.Name == BOSS_NAME then
-					nested = true
-					break
+	local found, seen = {}, {}
+
+	local function scan(root)
+		for _, d in ipairs(root:GetDescendants()) do
+			if not seen[d] and isBossName(d.Name) then
+				seen[d] = true
+				-- Evita contar un StarRune que esté dentro de otro ya contado
+				local nested = false
+				local anc = d.Parent
+				while anc and anc ~= game do
+					if seen[anc] then
+						nested = true
+						break
+					end
+					anc = anc.Parent
 				end
-				anc = anc.Parent
-			end
-			if not nested then
-				table.insert(list, d)
+				if not nested then
+					table.insert(found, d)
+				end
 			end
 		end
 	end
-	return list
+
+	scan(workspace)
+	if #found == 0 then
+		scan(ReplicatedStorage)
+		scan(game:GetService("Lighting"))
+	end
+	return found
 end
 
-local function findPromptIn(inst)
+-- Posición del StarRune, sea de la clase que sea
+local function getBossPosition(inst)
+	if inst:IsA("BasePart") then
+		return inst.Position
+	elseif inst:IsA("Attachment") then
+		return inst.WorldPosition
+	elseif inst:IsA("Model") then
+		return inst:GetPivot().Position
+	end
+	local part = inst:FindFirstChildWhichIsA("BasePart", true)
+	if part then return part.Position end
+	local att = inst:FindFirstChildWhichIsA("Attachment", true)
+	if att then return att.WorldPosition end
+	return nil
+end
+
+-- ProximityPrompt del jefe: dentro del objeto o, si no hay, el más cercano
+local function findBossPrompt(inst)
 	if inst:IsA("ProximityPrompt") then return inst end
-	return inst:FindFirstChildWhichIsA("ProximityPrompt", true)
+	local inside = inst:FindFirstChildWhichIsA("ProximityPrompt", true)
+	if inside then return inside end
+
+	local pos = getBossPosition(inst)
+	if not pos then return nil end
+	local closest, closestD
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			local pp = promptPosition(d)
+			if pp then
+				local dist = (pp - pos).Magnitude
+				if dist <= PROMPT_NEARBY_RANGE and (not closestD or dist < closestD) then
+					closest, closestD = d, dist
+				end
+			end
+		end
+	end
+	return closest
 end
 
 local function fightBoss(index)
+	if bossBusy or healBusy then return end
+
 	local inst = bossEntries[index]
 	if not inst or not inst.Parent then
-		warnOnce("boss" .. index, "No encontré Jefe " .. index .. " (StarRune)")
-		return
+		refreshBosses()
+		inst = bossEntries[index]
+		if not inst then
+			setBossStatus("Jefe " .. index .. " no encontrado. Pulsa Buscar jefes.")
+			return
+		end
 	end
-	if bossBusy or healBusy then return end
 
 	local hum, root = getParts()
 	if not hum or not root or hum.Health <= 0 then return end
 
-	local prompt = findPromptIn(inst)
-	if not prompt then
-		warnOnce("bossprompt" .. index, "Jefe " .. index .. " no tiene ProximityPrompt")
+	local prompt = findBossPrompt(inst)
+	local pos = getBossPosition(inst)
+	if not prompt and not pos then
+		setBossStatus("Jefe " .. index .. " no tiene posición ni prompt")
 		return
 	end
 
@@ -983,10 +1054,16 @@ local function fightBoss(index)
 			root.Anchored = true
 		end
 
-		standNearPrompt(prompt, root)
-		task.wait(BOSS_TP_DELAY)
-		waitPromptReady(prompt, root)
-		usePrompt(prompt)
+		if prompt then
+			standNearPrompt(prompt, root)
+			task.wait(BOSS_TP_DELAY)
+			waitPromptReady(prompt, root)
+			usePrompt(prompt)
+		else
+			root.CFrame = CFrame.new(pos + Vector3.new(0, BOSS_FALLBACK_HEIGHT, 0))
+			root.AssemblyLinearVelocity = Vector3.zero
+			task.wait(BOSS_TP_DELAY)
+		end
 
 		if root.Parent then
 			root.Anchored = wasAnchored
@@ -1191,7 +1268,7 @@ local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(18, 0)
 title.Size = UDim2.new(1, -120, 1, 0)
-title.Text = "MAYKEL DEV1"
+title.Text = "✈  CFly"
 title.TextColor3 = COLORS.text
 title.Font = Enum.Font.GothamBold
 title.TextSize = 18
@@ -1472,8 +1549,21 @@ local _, crystalLabel = createRow(farmPage, 2, "Auto-cristales", "Cristales roto
 crystalSub = crystalLabel
 createRow(farmPage, 3, "Auto-curar (Fountain)", "Al 20% de vida va a la fuente", false, setAutoHeal)
 
+bossStatus = Instance.new("TextLabel")
+bossStatus.Name = "BossStatus"
+bossStatus.BackgroundTransparency = 1
+bossStatus.Size = UDim2.new(1, 0, 0, 30)
+bossStatus.Text = "Buscando StarRunes..."
+bossStatus.TextColor3 = COLORS.subtext
+bossStatus.Font = Enum.Font.Gotham
+bossStatus.TextSize = 11
+bossStatus.TextWrapped = true
+bossStatus.TextXAlignment = Enum.TextXAlignment.Left
+bossStatus.LayoutOrder = 8
+bossStatus.Parent = farmPage
+
 -- Jefes: se llenan con los StarRune encontrados
-local function refreshBosses()
+refreshBosses = function()
 	bossEntries = getStarRunes()
 	for i = 1, #bossEntries do
 		if not bossButtons[i] then
@@ -1486,9 +1576,17 @@ local function refreshBosses()
 	for i = #bossEntries + 1, #bossButtons do
 		bossButtons[i].Visible = false
 	end
+
+	if #bossEntries > 0 then
+		setBossStatus("StarRunes encontrados: " .. #bossEntries)
+	else
+		setBossStatus("No encontré StarRunes. Acércate a la zona y pulsa Buscar jefes.")
+	end
 end
 
-createButtonRow(farmPage, 9, "🔄 Buscar jefes (StarRune)", COLORS.accentA, refreshBosses)
+createButtonRow(farmPage, 9, "🔄 Buscar jefes (StarRune)", COLORS.accentA, function()
+	refreshBosses()
+end)
 
 -- Reintenta hasta encontrar los StarRune (por si el mapa aún no cargó)
 task.spawn(function()
