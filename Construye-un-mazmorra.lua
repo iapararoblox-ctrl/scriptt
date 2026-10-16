@@ -1,4 +1,4 @@
--- CFly + Noclip + Combate + TP + Auto-cofres + Cristales + Curar en Fountain + Jefes StarRune
+-- CFly + Noclip + Combate + TP + Auto-cofres + Cristales + Curar (manual/automático) + Jefes StarRune
 -- LocalScript en StarterPlayer > StarterPlayerScripts (reemplaza el anterior)
 
 local Players = game:GetService("Players")
@@ -52,19 +52,26 @@ local CRYSTAL_ATTACK_INTERVAL = 0.1
 local CRYSTAL_TIMEOUT = 15
 local CRYSTAL_SKIP_TIME = 20
 
--- Prompts / Fountain / Jefes
+-- Curación (Fountain)
 local FOUNTAIN_NAME = "Fountain"
-local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5)  -- dónde te paras respecto al prompt
-local PROMPT_NEARBY_RANGE = 15                         -- prompt "suelto" cercano al objeto
+local HEAL_THRESHOLD = 0.2           -- modo automático: se activa al 20% de vida
+local HEAL_DONE = 0.95               -- modo automático: no regresa hasta llegar a 95%
+local HEAL_POLL = 0.2
+local HEAL_RETURN_DIST = 12          -- si te alejas de la fuente, vuelves a ella (automático)
+local HEAL_COOLDOWN = 5
+local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5)
+local PROMPT_NEARBY_RANGE = 15
+
+-- Jefes
 local BOSS_NAME = "StarRune"
 local BOSS_FALLBACK_HEIGHT = 4
 
--- Barra (píldora)
-local PILL_W = 190
-local PILL_H = 38
+-- Barra rectangular
+local BAR_W = 240
+local BAR_H = 34
 
--- Burbuja de minimizar
-local MENU_SIZE = 40
+-- Burbuja/botón de minimizar (pequeño)
+local MENU_SIZE = 36
 
 ---------------------------------------------------------------------
 -- ESTADO
@@ -78,7 +85,12 @@ local chestsCollected, crystalsCollected = 0, 0
 local combatMode = "melee"
 local moveButtonsEnabled = false
 
-local savedHealCF = nil          -- posición guardada antes de ir a curarse
+local healMode = "off"               -- "off" | "manual" | "auto"
+local healBusy = false
+local healToken = 0
+local savedHealCF = nil              -- posición guardada antes de ir a Fountain
+local atFountain = false
+
 local bossEntries, bossButtons = {}, {}
 
 local currentTarget
@@ -93,14 +105,14 @@ local noclipConn
 local originalCollide = {}
 local allConnections = {}
 
-local pill, healBtn, flyBtn, menuBubble, panel, panelW, panelFullH
-local setFlyRow, toggleFly, setFlyVisual, setHealVisual
+local bar, healBtn, flyBtn, menuBubble, panel, panelW, panelFullH
+local setFlyRow, toggleFly, setFlyVisual, setHealVisual, setHealModeVisual
 local chestSub, crystalSub, statusLabel
 local refreshBosses
-local running_ = true
+local healModeButtons = {}
 
 local function isBusy()
-	return chestBusy or crystalBusy
+	return chestBusy or crystalBusy or healBusy
 end
 
 local function setStatus(text)
@@ -599,7 +611,7 @@ local function startChestLoop()
 		local lastReset = os.clock()
 		while running and autoChest and token == chestToken do
 			local hum, root = getParts()
-			if hum and root and hum.Health > 0 and not crystalBusy then
+			if hum and root and hum.Health > 0 and not crystalBusy and not healBusy then
 				local best, bestD
 				for _, p in ipairs(getChestPrompts()) do
 					if (chestAttempts[p] or 0) < CHEST_MAX_TRIES then
@@ -686,7 +698,7 @@ local function farmCrystal(model)
 	local startT = os.clock()
 	while running and crystalFarm and crystalAlive(model) and os.clock() - startT < CRYSTAL_TIMEOUT do
 		local hum, root = getParts()
-		if hum and root and hum.Health > 0 then
+		if hum and root and hum.Health > 0 and not healBusy then
 			teleportNearCrystal(model)
 			fireAttack()
 		end
@@ -706,7 +718,7 @@ local function startCrystalLoop()
 	task.spawn(function()
 		while running and crystalFarm and token == crystalToken do
 			local hum, root = getParts()
-			if hum and root and hum.Health > 0 then
+			if hum and root and hum.Health > 0 and not healBusy then
 				local best, bestD
 				local now = os.clock()
 				for _, m in ipairs(getCrystalModels()) do
@@ -752,10 +764,7 @@ local function setCrystalFarm(state)
 end
 
 ---------------------------------------------------------------------
--- CURAR EN FOUNTAIN (manual)
--- 1ª pulsación: guarda tu posición y te teletransporta junto al prompt.
--- 2ª pulsación: te regresa a la posición guardada.
--- Tú activas el ProximityPrompt manualmente.
+-- CURACIÓN EN FOUNTAIN (manual y automática)
 ---------------------------------------------------------------------
 local function findFountain()
 	local found
@@ -790,63 +799,160 @@ local function findFountain()
 	return nil, nil
 end
 
-local function goToFountain()
+-- Lleva al personaje a la fuente y guarda su posición anterior
+local function moveToFountain()
 	local _, root = getParts()
-	if not root then return end
+	if not root then return false end
 
 	local fountain, prompt = findFountain()
 	if not fountain then
 		setStatus("No encontré Fountain")
-		return
+		return false
 	end
 
-	local cf, pos
+	local cf
 	if prompt then
-		cf, pos = standCFrameFor(prompt)
+		cf = standCFrameFor(prompt)
 	end
 	if not cf then
-		pos = getPosition(fountain)
+		local pos = getPosition(fountain)
 		if not pos then
 			setStatus("Fountain no tiene posición")
-			return
+			return false
 		end
 		cf = CFrame.new(pos + PROMPT_STAND_OFFSET)
 	end
 
-	savedHealCF = root.CFrame
-	teleportCharacter(cf)
-	setHealVisual(true)
-
-	if prompt then
-		pcall(function()
-			prompt.RequiresLineOfSight = false
-		end)
-		setStatus("En Fountain. Activa el prompt; con ↩ Volver regresas.")
-	else
-		setStatus("En Fountain, pero no encontré prompt cercano.")
+	if not atFountain then
+		savedHealCF = root.CFrame
 	end
+	teleportCharacter(cf)
+	atFountain = true
+	return true, fountain, prompt
 end
 
 local function returnFromFountain()
 	if savedHealCF then
 		teleportCharacter(savedHealCF)
 		savedHealCF = nil
-		setStatus("Regresaste a tu posición guardada.")
 	end
+	atFountain = false
 	setHealVisual(false)
 end
 
-local function onHealTap()
-	if savedHealCF then
+-- Botón manual: 1ª vez va a Fountain, 2ª vez vuelve
+local function onManualHealTap()
+	if atFountain then
 		returnFromFountain()
+		setStatus("Regresaste a tu posición guardada.")
 	else
-		goToFountain()
+		local ok = moveToFountain()
+		if ok then
+			setHealVisual(true)
+			setStatus("En Fountain. Activa el prompt; con ↩ Volver regresas.")
+		end
 	end
+end
+
+-- Automático: al bajar del 20% va a la fuente, espera a 95% y regresa
+local function runAutoHeal()
+	if healBusy or atFountain then return end
+	local hum, root = getParts()
+	if not hum or not root or hum.Health <= 0 then return end
+
+	local ok, fountain, prompt = moveToFountain()
+	if not ok then return end
+
+	healBusy = true
+	healToken += 1
+	local token = healToken
+	setHealVisual(true)
+	setStatus("Curando automáticamente...")
+
+	local fpos = getPosition(fountain)
+	if prompt then fpos = promptPosition(prompt) or fpos end
+
+	while running and healMode == "auto" and token == healToken do
+		local h, r = getParts()
+		if not h or not r or h.Health <= 0 then break end
+		if h.Health >= h.MaxHealth * HEAL_DONE then break end
+
+		-- Si te devolvieron sin curarte, vuelves a la fuente
+		if fpos and (r.Position - fpos).Magnitude > HEAL_RETURN_DIST then
+			local cf = prompt and standCFrameFor(prompt)
+			teleportCharacter(cf or CFrame.new(fpos + PROMPT_STAND_OFFSET))
+		end
+
+		if prompt and prompt.Parent and prompt.Enabled then
+			pcall(function() prompt.RequiresLineOfSight = false end)
+			if typeof(fireproximityprompt) == "function" then
+				pcall(fireproximityprompt, prompt)
+			else
+				pcall(function() prompt:InputHoldBegin() end)
+				task.wait(math.max(prompt.HoldDuration, 0) + 0.3)
+				pcall(function() prompt:InputHoldEnd() end)
+			end
+		end
+		task.wait(HEAL_POLL)
+	end
+
+	if token == healToken then
+		local h, r = getParts()
+		if healMode == "auto" and h and r and h.Health > 0 and h.Health >= h.MaxHealth * HEAL_DONE then
+			returnFromFountain()
+			setStatus("Curado. Regresaste a tu posición.")
+		elseif not (h and h.Health > 0) then
+			savedHealCF = nil
+			atFountain = false
+		end
+		healBusy = false
+	end
+end
+
+local autoWatcherRunning = false
+local function startAutoWatcher()
+	if autoWatcherRunning then return end
+	autoWatcherRunning = true
+	task.spawn(function()
+		while running do
+			if healMode == "auto" and not healBusy and not atFountain then
+				local hum = getParts()
+				if hum and hum.Health > 0 and hum.Health <= hum.MaxHealth * HEAL_THRESHOLD then
+					runAutoHeal()
+					task.wait(HEAL_COOLDOWN)
+				end
+			end
+			task.wait(0.2)
+		end
+		autoWatcherRunning = false
+	end)
+end
+
+-- Cambia el modo: "manual", "auto" o "off"
+local function setHealModeOption(mode)
+	if healMode == mode then return end
+	healMode = mode
+
+	for key, b in pairs(healModeButtons) do
+		local active = key == mode
+		tween(b, { BackgroundColor3 = active and COLORS.accentA or COLORS.off })
+		b.TextColor3 = active and Color3.new(1, 1, 1) or COLORS.subtext
+	end
+
+	if mode == "off" then
+		-- Si estaba en Fountain, regresa
+		if atFountain and savedHealCF then
+			returnFromFountain()
+		end
+		healBusy = false
+		healToken += 1
+	end
+	setHealModeVisual()
+	startAutoWatcher()
 end
 
 ---------------------------------------------------------------------
 -- JEFES (StarRune)
--- Solo te teletransportas junto al jefe. Activas el prompt manualmente.
 ---------------------------------------------------------------------
 local function normalizeName(s)
 	return string.lower((string.gsub(s, "%s+", "")))
@@ -899,9 +1005,6 @@ local function fightBoss(index)
 		end
 	end
 
-	local _, root = getParts()
-	if not root then return end
-
 	local prompt = findPromptFor(inst)
 	if prompt then
 		local cf = standCFrameFor(prompt)
@@ -925,13 +1028,26 @@ end
 -- VUELO (CFLY)
 ---------------------------------------------------------------------
 setFlyVisual = function(on)
-	flyBtn.Text = on and "✈ FLY ON" or "✈ FLY OFF"
-	tween(flyBtn, { BackgroundColor3 = on and COLORS.flyOn or COLORS.flyOff })
+	if flyBtn then
+		flyBtn.Text = on and "✈ FLY ON" or "✈ FLY OFF"
+		tween(flyBtn, { BackgroundColor3 = on and COLORS.flyOn or COLORS.flyOff })
+	end
 end
 
-setHealVisual = function(atFountain)
-	healBtn.Text = atFountain and "↩ Volver" or "🏥 Curar"
-	tween(healBtn, { BackgroundColor3 = atFountain and COLORS.healBack or COLORS.heal })
+setHealVisual = function(atF)
+	if healBtn then
+		healBtn.Text = atF and "↩ Volver" or "🏥 Curar"
+		tween(healBtn, { BackgroundColor3 = atF and COLORS.healBack or COLORS.heal })
+	end
+end
+
+-- Con modo manual: barra dividida (Curar | FLY). Con automático: solo FLY.
+setHealModeVisual = function()
+	if not healBtn then return end
+	local manual = healMode == "manual"
+	healBtn.Visible = manual
+	flyBtn.Size = manual and UDim2.new(0.5, -6, 1, -6) or UDim2.new(1, -6, 1, -6)
+	flyBtn.Position = manual and UDim2.new(0.5, 3, 0, 3) or UDim2.new(0, 3, 0, 3)
 end
 
 local function stopFly()
@@ -1086,11 +1202,14 @@ local function shutdown()
 	running = false
 	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
 	autoChest, crystalFarm = false, false
-	chestBusy, crystalBusy = false, false
+	chestBusy, crystalBusy, healBusy = false, false, false
+	healMode = "off"
 	savedHealCF = nil
+	atFountain = false
 	attackToken += 1
 	chestToken += 1
 	crystalToken += 1
+	healToken += 1
 
 	stopFly()
 	setNoclip(false)
@@ -1112,31 +1231,29 @@ local function shutdown()
 end
 
 ---------------------------------------------------------------------
--- PÍLDORA (Curar | FLY)
+-- BARRA RECTANGULAR (Curar | FLY)
 ---------------------------------------------------------------------
-pill = Instance.new("Frame")
-pill.Name = "CFlyPill"
-pill.Size = UDim2.fromOffset(PILL_W, PILL_H)
-pill.Position = UDim2.new(0.5, -PILL_W / 2, 0, 46)
-pill.BackgroundColor3 = COLORS.panel
-pill.BorderSizePixel = 0
-pill.Parent = gui
-corner(pill, UDim.new(0, PILL_H / 2))
+bar = Instance.new("Frame")
+bar.Name = "CFlyBar"
+bar.Size = UDim2.fromOffset(BAR_W, BAR_H)
+bar.Position = UDim2.new(0.5, -BAR_W / 2, 0, 46)
+bar.BackgroundColor3 = COLORS.panel
+bar.BorderSizePixel = 0
+bar.Parent = gui
+corner(bar, UDim.new(0, 8))
 
-local pillStroke = Instance.new("UIStroke")
-pillStroke.Thickness = 1.5
-pillStroke.Color = Color3.new(1, 1, 1)
-pillStroke.Parent = pill
+local barStroke = Instance.new("UIStroke")
+barStroke.Thickness = 1.5
+barStroke.Color = Color3.new(1, 1, 1)
+barStroke.Parent = bar
 
-local pillGrad = Instance.new("UIGradient")
-pillGrad.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
-pillGrad.Rotation = 45
-pillGrad.Parent = pillStroke
+local barGrad = Instance.new("UIGradient")
+barGrad.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+barGrad.Rotation = 45
+barGrad.Parent = barStroke
 
-local function makePillButton(xPos, width, text, color)
+local function makeBarButton(text, color)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(width, -6, 1, -6)
-	b.Position = xPos
 	b.BackgroundColor3 = color
 	b.BorderSizePixel = 0
 	b.Text = text
@@ -1144,19 +1261,26 @@ local function makePillButton(xPos, width, text, color)
 	b.Font = Enum.Font.GothamBold
 	b.TextSize = 12
 	b.AutoButtonColor = false
-	b.Parent = pill
-	corner(b, UDim.new(1, 0))
+	b.Parent = bar
+	corner(b, UDim.new(0, 6))
 	return b
 end
 
-healBtn = makePillButton(UDim2.new(0, 3, 0, 3), 0.5, "🏥 Curar", COLORS.heal)
-flyBtn = makePillButton(UDim2.new(0.5, 3, 0, 3), 0.5, "✈ FLY OFF", COLORS.flyOff)
+healBtn = makeBarButton("🏥 Curar", COLORS.heal)
+healBtn.Size = UDim2.new(0.5, -6, 1, -6)
+healBtn.Position = UDim2.new(0, 3, 0, 3)
 
-makeDraggable(healBtn, pill, onHealTap)
-makeDraggable(flyBtn, pill, function() toggleFly() end)
+flyBtn = makeBarButton("✈ FLY OFF", COLORS.flyOff)
+
+makeDraggable(healBtn, bar, function()
+	if healMode == "manual" then
+		onManualHealTap()
+	end
+end)
+makeDraggable(flyBtn, bar, function() toggleFly() end)
 
 ---------------------------------------------------------------------
--- BURBUJA DE MINIMIZAR (pequeña)
+-- BURBUJA DE MINIMIZAR (pequeña, cuadrada)
 ---------------------------------------------------------------------
 menuBubble = Instance.new("TextButton")
 menuBubble.Name = "MenuBubble"
@@ -1165,12 +1289,12 @@ menuBubble.Position = UDim2.fromOffset(20, 120)
 menuBubble.BackgroundColor3 = COLORS.accentA
 menuBubble.Text = "☰"
 menuBubble.TextColor3 = Color3.new(1, 1, 1)
-menuBubble.TextSize = 18
+menuBubble.TextSize = 16
 menuBubble.Font = Enum.Font.GothamBold
 menuBubble.AutoButtonColor = false
 menuBubble.Visible = false
 menuBubble.Parent = gui
-corner(menuBubble, UDim.new(1, 0))
+corner(menuBubble, UDim.new(0, 8))
 
 local menuStroke = Instance.new("UIStroke")
 menuStroke.Thickness = 1.5
@@ -1419,6 +1543,41 @@ local function createButtonRow(page, order, titleText, color, callback)
 	return btn
 end
 
+-- Selector de modo de curación: Manual / Automático / Off
+local function createHealModeSelector(page, order)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 48)
+	row.BackgroundColor3 = COLORS.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = page
+	corner(row, UDim.new(0, 14))
+
+	local function makeButton(mode, text, xScale)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1 / 3, -10, 0, 34)
+		b.Position = UDim2.new(xScale, 5, 0.5, -17)
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 11
+		b.AutoButtonColor = false
+		b.BorderSizePixel = 0
+		b.BackgroundColor3 = COLORS.off
+		b.TextColor3 = COLORS.subtext
+		b.Parent = row
+		corner(b, UDim.new(0, 10))
+		b.Activated:Connect(function()
+			setHealModeOption(mode)
+		end)
+		healModeButtons[mode] = b
+	end
+
+	makeButton("off", "Apagado", 0)
+	makeButton("manual", "Manual", 1 / 3)
+	makeButton("auto", "Automático", 2 / 3)
+	return row
+end
+
 -- Selector: cuerpo a cuerpo / a distancia
 local function createModeSelector(page, order)
 	local row = Instance.new("Frame")
@@ -1471,7 +1630,7 @@ makeTab("settings", "⚙ Ajustes", 4)
 -- Página: Movimiento
 local movePage = pages.move
 createRow(movePage, 1, "Barra Curar / FLY", "Muestra u oculta la barra superior", true, function(value)
-	pill.Visible = value
+	bar.Visible = value
 end)
 setFlyRow = createRow(movePage, 2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
 	if value ~= flying then
@@ -1492,6 +1651,7 @@ createRow(combatPage, 5, "Mantener distancia", "Esquiva rápido (modo a distanci
 
 -- Página: Farm
 local farmPage = pages.farm
+createHealModeSelector(farmPage, 0)
 local _, chestLabel = createRow(farmPage, 1, "Auto-cofres", "Cofres recogidos: 0", false, setAutoChest)
 chestSub = chestLabel
 local _, crystalLabel = createRow(farmPage, 2, "Auto-cristales", "Cristales rotos: 0", false, setCrystalFarm)
@@ -1551,6 +1711,7 @@ end)
 createButtonRow(settingsPage, 2, "Cerrar script", COLORS.red, shutdown)
 
 showTab("move")
+setHealModeVisual()
 
 ---------------------------------------------------------------------
 -- MINIMIZAR / RESTAURAR
@@ -1596,7 +1757,7 @@ gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
 	fitPanel()
 	if panel.Visible then clampToScreen(panel) end
 	if menuBubble.Visible then clampToScreen(menuBubble) end
-	clampToScreen(pill)
+	clampToScreen(bar)
 end)
 
 panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
@@ -1607,7 +1768,7 @@ fitPanel()
 task.defer(function()
 	fitPanel()
 	clampToScreen(panel)
-	clampToScreen(pill)
+	clampToScreen(bar)
 end)
 
 -- Tecla F: volar on/off
@@ -1624,6 +1785,9 @@ track(player.CharacterAdded:Connect(function()
 	originalCollide = {}
 	chestBusy = false
 	crystalBusy = false
+	healBusy = false
 	savedHealCF = nil
+	atFountain = false
+	healToken += 1
 	setHealVisual(false)
 end))
