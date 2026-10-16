@@ -1,4 +1,4 @@
--- CFly + Noclip + Combate + TP + Auto-cofres + Cristales + Auto-curar Fountain + Jefes StarRune
+-- CFly + Noclip + Combate + TP + Auto-cofres + Cristales + Curar en Fountain + Jefes StarRune
 -- LocalScript en StarterPlayer > StarterPlayerScripts (reemplaza el anterior)
 
 local Players = game:GetService("Players")
@@ -6,6 +6,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -45,30 +46,25 @@ local CHEST_TP_DELAY = 0.15
 local CHEST_MAX_TRIES = 3
 
 -- Cristales
-local CRYSTAL_NAME = "Crystals"       -- nombre del Model del cristal
-local CRYSTAL_TP_DISTANCE = 5         -- distancia a la que te pones del cristal
-local CRYSTAL_ATTACK_INTERVAL = 0.1   -- segundos entre disparos
-local CRYSTAL_TIMEOUT = 15            -- si no se rompe en estos segundos, pasa al siguiente
-local CRYSTAL_SKIP_TIME = 20          -- tiempo que se salta un cristal que no se rompió
+local CRYSTAL_NAME = "Crystals"
+local CRYSTAL_TP_DISTANCE = 5
+local CRYSTAL_ATTACK_INTERVAL = 0.1
+local CRYSTAL_TIMEOUT = 15
+local CRYSTAL_SKIP_TIME = 20
 
--- Prompts (Fountain y jefes)
-local PROMPT_WAIT = 3                 -- segundos máximos esperando a que el prompt esté al alcance
-local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5) -- dónde te paras respecto al prompt
-local PROMPT_NEARBY_RANGE = 15        -- si el jefe no tiene prompt dentro, busca uno a esta distancia
+-- Prompts / Fountain / Jefes
+local FOUNTAIN_NAME = "Fountain"
+local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5)  -- dónde te paras respecto al prompt
+local PROMPT_NEARBY_RANGE = 15                         -- prompt "suelto" cercano al objeto
+local BOSS_NAME = "StarRune"
+local BOSS_FALLBACK_HEIGHT = 4
 
--- Auto-curar en Fountain
-local FOUNTAIN_NAME = "Fountain"      -- nombre de la Part o Model de la fuente
-local HEAL_THRESHOLD = 0.2            -- se activa al 20% de vida
-local HEAL_DONE = 0.95                -- no se sale hasta llegar a este porcentaje
-local HEAL_TP_DELAY = 0.2             -- espera tras teletransportarte
-local HEAL_COOLDOWN = 5               -- segundos de espera antes de volver a intentarlo
-local HEAL_RETURN_DIST = 12           -- si te alejas más de esto de la fuente, vuelves a ella
-local HEAL_POLL = 0.1                 -- frecuencia de revisión durante la curación
+-- Barra (píldora)
+local PILL_W = 190
+local PILL_H = 38
 
--- Jefes (StarRune)
-local BOSS_NAME = "StarRune"          -- se reconoce con cualquier clase y con números: StarRune, StarRune1, StarRune 2...
-local BOSS_TP_DELAY = 0.2             -- espera tras teletransportarte antes de interactuar
-local BOSS_FALLBACK_HEIGHT = 4        -- altura si el jefe no tiene prompt y solo te teletransportas
+-- Burbuja de minimizar
+local MENU_SIZE = 40
 
 ---------------------------------------------------------------------
 -- ESTADO
@@ -78,16 +74,12 @@ local flying, noclip = false, false
 local autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
 local autoChest, chestBusy = false, false
 local crystalFarm, crystalBusy = false, false
-local autoHeal, healBusy = false, false
-local healToken, healLoopToken = 0, 0
-local bossBusy = false
-local bossEntries, bossButtons = {}, {}
-local refreshBosses                  -- se define más abajo
-local bossStatus                     -- etiqueta de estado en Farm
 local chestsCollected, crystalsCollected = 0, 0
 local combatMode = "melee"
 local moveButtonsEnabled = false
-local minimized = false
+
+local savedHealCF = nil          -- posición guardada antes de ir a curarse
+local bossEntries, bossButtons = {}, {}
 
 local currentTarget
 local attackToken, chestToken, crystalToken = 0, 0, 0
@@ -101,13 +93,20 @@ local noclipConn
 local originalCollide = {}
 local allConnections = {}
 
-local flyBubble, menuBubble, panel
-local setFlyRow, toggleFly
-local chestSub, crystalSub
-local farmPage
+local pill, healBtn, flyBtn, menuBubble, panel, panelW, panelFullH
+local setFlyRow, toggleFly, setFlyVisual, setHealVisual
+local chestSub, crystalSub, statusLabel
+local refreshBosses
+local running_ = true
 
 local function isBusy()
-	return chestBusy or crystalBusy or healBusy or bossBusy
+	return chestBusy or crystalBusy
+end
+
+local function setStatus(text)
+	if statusLabel then
+		statusLabel.Text = text
+	end
 end
 
 ---------------------------------------------------------------------
@@ -125,8 +124,10 @@ local COLORS = {
 	accentB = Color3.fromRGB(60, 190, 255),
 	red = Color3.fromRGB(255, 95, 110),
 	yellow = Color3.fromRGB(255, 200, 70),
-	bubbleOff = Color3.fromRGB(200, 50, 50),
-	bubbleOn = Color3.fromRGB(50, 200, 90),
+	flyOff = Color3.fromRGB(200, 60, 80),
+	flyOn = Color3.fromRGB(50, 200, 110),
+	heal = Color3.fromRGB(60, 150, 255),
+	healBack = Color3.fromRGB(255, 170, 60),
 }
 
 local function corner(obj, radius)
@@ -188,7 +189,7 @@ local function clampToScreen(obj)
 	placeAt(obj, p.X, p.Y)
 end
 
--- Arrastrar solo si "Mover botones" está activado. Si no, un toque sigue funcionando.
+-- Arrastra "target" desde "handle". Si no hay movimiento, cuenta como toque.
 local function makeDraggable(handle, target, onTap)
 	local dragging, moved = false, false
 	local dragStart, startAbs, activeInput
@@ -230,58 +231,6 @@ local function makeDraggable(handle, target, onTap)
 end
 
 ---------------------------------------------------------------------
--- BURBUJAS (CFly y menú minimizado)
----------------------------------------------------------------------
-flyBubble = Instance.new("TextButton")
-flyBubble.Name = "FlyBubble"
-flyBubble.Size = UDim2.fromOffset(64, 64)
-flyBubble.Position = UDim2.new(1, -90, 0.5, 0)
-flyBubble.BackgroundColor3 = COLORS.bubbleOff
-flyBubble.Text = "FLY\nOFF"
-flyBubble.TextColor3 = Color3.new(1, 1, 1)
-flyBubble.TextScaled = true
-flyBubble.Font = Enum.Font.GothamBold
-flyBubble.AutoButtonColor = false
-flyBubble.Parent = gui
-corner(flyBubble, UDim.new(1, 0))
-
-local flyStroke = Instance.new("UIStroke")
-flyStroke.Thickness = 3
-flyStroke.Color = Color3.new(1, 1, 1)
-flyStroke.Parent = flyBubble
-
-local flyPad = Instance.new("UIPadding")
-flyPad.PaddingTop = UDim.new(0, 12)
-flyPad.PaddingBottom = UDim.new(0, 12)
-flyPad.PaddingLeft = UDim.new(0, 10)
-flyPad.PaddingRight = UDim.new(0, 10)
-flyPad.Parent = flyBubble
-
-makeDraggable(flyBubble, flyBubble, function()
-	toggleFly()
-end)
-
--- Burbuja pequeña que aparece cuando el panel está minimizado
-menuBubble = Instance.new("TextButton")
-menuBubble.Name = "MenuBubble"
-menuBubble.Size = UDim2.fromOffset(52, 52)
-menuBubble.Position = UDim2.fromOffset(20, 120)
-menuBubble.BackgroundColor3 = COLORS.accentA
-menuBubble.Text = "☰"
-menuBubble.TextColor3 = Color3.new(1, 1, 1)
-menuBubble.TextSize = 24
-menuBubble.Font = Enum.Font.GothamBold
-menuBubble.AutoButtonColor = false
-menuBubble.Visible = false
-menuBubble.Parent = gui
-corner(menuBubble, UDim.new(1, 0))
-
-local menuStroke = Instance.new("UIStroke")
-menuStroke.Thickness = 2
-menuStroke.Color = Color3.new(1, 1, 1)
-menuStroke.Parent = menuBubble
-
----------------------------------------------------------------------
 -- PERSONAJE
 ---------------------------------------------------------------------
 local function getParts()
@@ -290,6 +239,19 @@ local function getParts()
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	local root = char:FindFirstChild("HumanoidRootPart")
 	return hum, root
+end
+
+-- Mueve TODO el modelo del personaje (no solo la raíz) y frena las velocidades
+local function teleportCharacter(cf)
+	local char = player.Character
+	if not char then return end
+	char:PivotTo(cf)
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.AssemblyLinearVelocity = Vector3.zero
+			p.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
 end
 
 ---------------------------------------------------------------------
@@ -526,9 +488,8 @@ local function setKeepDistance(state)
 end
 
 ---------------------------------------------------------------------
--- PROMPTS (helpers compartidos: cofres, Fountain y jefes)
+-- PROMPTS (helpers compartidos)
 ---------------------------------------------------------------------
--- Posición real del ProximityPrompt según su padre
 local function promptPosition(prompt)
 	local par = prompt.Parent
 	if not par then return nil end
@@ -543,51 +504,51 @@ local function promptPosition(prompt)
 	return m and m:GetPivot().Position or nil
 end
 
--- Espera a que el prompt esté habilitado y tu personaje esté dentro de su alcance
-local function waitPromptReady(prompt, root)
-	local t0 = os.clock()
-	while running and os.clock() - t0 < PROMPT_WAIT do
-		if prompt.Parent and prompt.Enabled and root and root.Parent then
-			local pos = promptPosition(prompt)
-			if pos and (root.Position - pos).Magnitude <= prompt.MaxActivationDistance then
-				return true
+local function getPosition(obj)
+	if obj:IsA("BasePart") then
+		return obj.Position
+	elseif obj:IsA("Model") then
+		return obj:GetPivot().Position
+	elseif obj:IsA("Attachment") then
+		return obj.WorldPosition
+	end
+	local part = obj:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function findPromptIn(inst)
+	if inst:IsA("ProximityPrompt") then return inst end
+	return inst:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+-- Prompt dentro del objeto o, si no hay, el más cercano dentro del rango
+local function findPromptFor(inst)
+	local inside = findPromptIn(inst)
+	if inside then return inside end
+
+	local pos = getPosition(inst)
+	if not pos then return nil end
+	local closest, closestD
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			local pp = promptPosition(d)
+			if pp then
+				local dist = (pp - pos).Magnitude
+				if dist <= PROMPT_NEARBY_RANGE and (not closestD or dist < closestD) then
+					closest, closestD = d, dist
+				end
 			end
 		end
-		task.wait(0.1)
 	end
-	return false
+	return closest
 end
 
--- Activa el prompt: usa fireproximityprompt si el executor lo tiene; si no, mantiene el hold
-local function usePrompt(prompt)
-	if not prompt or not prompt.Parent or not prompt.Enabled then return false end
-
-	pcall(function()
-		prompt.RequiresLineOfSight = false
-		if prompt.MaxActivationDistance < 12 then
-			prompt.MaxActivationDistance = 12
-		end
-	end)
-
-	if typeof(fireproximityprompt) == "function" then
-		pcall(fireproximityprompt, prompt)
-		return true
-	end
-
-	pcall(function() prompt:InputHoldBegin() end)
-	task.wait(math.max(prompt.HoldDuration, 0) + 0.3)
-	pcall(function() prompt:InputHoldEnd() end)
-	return true
-end
-
--- Teletransporta al personaje junto al prompt
-local function standNearPrompt(prompt, root)
+-- CFrame desde el que el jugador puede usar el prompt
+local function standCFrameFor(prompt)
 	local pos = promptPosition(prompt)
-	if not pos or not root then return nil end
+	if not pos then return nil end
 	local dest = pos + PROMPT_STAND_OFFSET
-	root.CFrame = CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z))
-	root.AssemblyLinearVelocity = Vector3.zero
-	return pos
+	return CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z)), pos
 end
 
 ---------------------------------------------------------------------
@@ -621,13 +582,7 @@ local function collectChest(prompt)
 		end
 	end)
 
-	local wasAnchored = root.Anchored
-	root.CFrame = CFrame.new(pos + Vector3.new(0, CHEST_OFFSET_Y, 0))
-	root.AssemblyLinearVelocity = Vector3.zero
-	if not flying then
-		root.Anchored = true
-	end
-
+	teleportCharacter(CFrame.new(pos + Vector3.new(0, CHEST_OFFSET_Y, 0)))
 	task.wait(CHEST_TP_DELAY)
 
 	if prompt.Parent and prompt.Enabled then
@@ -635,8 +590,6 @@ local function collectChest(prompt)
 		task.wait(math.max(prompt.HoldDuration, 0) + 0.2)
 		pcall(function() prompt:InputHoldEnd() end)
 	end
-
-	root.Anchored = wasAnchored
 end
 
 local function startChestLoop()
@@ -646,7 +599,7 @@ local function startChestLoop()
 		local lastReset = os.clock()
 		while running and autoChest and token == chestToken do
 			local hum, root = getParts()
-			if hum and root and hum.Health > 0 and not crystalBusy and not healBusy and not bossBusy then
+			if hum and root and hum.Health > 0 and not crystalBusy then
 				local best, bestD
 				for _, p in ipairs(getChestPrompts()) do
 					if (chestAttempts[p] or 0) < CHEST_MAX_TRIES then
@@ -699,7 +652,7 @@ local function setAutoChest(state)
 end
 
 ---------------------------------------------------------------------
--- CRISTALES (Model "Crystals": TP cerca, disparar, siguiente)
+-- CRISTALES
 ---------------------------------------------------------------------
 local function getCrystalModels()
 	local list = {}
@@ -726,16 +679,14 @@ local function teleportNearCrystal(model)
 	local flat = Vector3.new(offset.X, 0, offset.Z)
 	local away = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
 	local dest = pos + away * CRYSTAL_TP_DISTANCE + Vector3.new(0, 1.5, 0)
-	root.CFrame = CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z))
-	root.AssemblyLinearVelocity = Vector3.zero
+	teleportCharacter(CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z)))
 end
 
--- Dispara al cristal hasta romperlo, o hasta el tiempo límite
 local function farmCrystal(model)
 	local startT = os.clock()
 	while running and crystalFarm and crystalAlive(model) and os.clock() - startT < CRYSTAL_TIMEOUT do
 		local hum, root = getParts()
-		if hum and root and hum.Health > 0 and not healBusy and not bossBusy then
+		if hum and root and hum.Health > 0 then
 			teleportNearCrystal(model)
 			fireAttack()
 		end
@@ -755,7 +706,7 @@ local function startCrystalLoop()
 	task.spawn(function()
 		while running and crystalFarm and token == crystalToken do
 			local hum, root = getParts()
-			if hum and root and hum.Health > 0 and not healBusy and not bossBusy then
+			if hum and root and hum.Health > 0 then
 				local best, bestD
 				local now = os.clock()
 				for _, m in ipairs(getCrystalModels()) do
@@ -801,43 +752,33 @@ local function setCrystalFarm(state)
 end
 
 ---------------------------------------------------------------------
--- AUTO-CURAR EN FOUNTAIN
--- Al 20% de vida: guarda posición, va al prompt de Fountain y se queda
--- hasta llegar al 95%. Si lo devuelven sin curar, vuelve. Al final regresa.
+-- CURAR EN FOUNTAIN (manual)
+-- 1ª pulsación: guarda tu posición y te teletransporta junto al prompt.
+-- 2ª pulsación: te regresa a la posición guardada.
+-- Tú activas el ProximityPrompt manualmente.
 ---------------------------------------------------------------------
-local function getPosition(obj)
-	if obj:IsA("BasePart") then
-		return obj.Position
-	elseif obj:IsA("Model") then
-		return obj:GetPivot().Position
-	end
-	return nil
-end
-
--- Busca la Part/Model "Fountain" y su ProximityPrompt
 local function findFountain()
 	local found
 	for _, d in ipairs(workspace:GetDescendants()) do
 		if d.Name == FOUNTAIN_NAME and (d:IsA("BasePart") or d:IsA("Model")) then
-			local prompt = d:FindFirstChildWhichIsA("ProximityPrompt", true)
-			if prompt and prompt.Enabled then
+			local prompt = findPromptIn(d)
+			if prompt then
 				return d, prompt
 			end
 			found = found or d
 		end
 	end
 
-	-- Si el prompt no está dentro de Fountain, busca uno cercano
 	if found then
 		local pos = getPosition(found)
 		local closest, closestD
 		if pos then
 			for _, p in ipairs(workspace:GetDescendants()) do
-				if p:IsA("ProximityPrompt") and p.Enabled then
+				if p:IsA("ProximityPrompt") then
 					local pp = promptPosition(p)
 					if pp then
 						local dist = (pp - pos).Magnitude
-						if dist < 15 and (not closestD or dist < closestD) then
+						if dist < PROMPT_NEARBY_RANGE and (not closestD or dist < closestD) then
 							closest, closestD = p, dist
 						end
 					end
@@ -846,96 +787,66 @@ local function findFountain()
 		end
 		return found, closest
 	end
-
 	return nil, nil
 end
 
-local function healAtFountain()
-	local hum, root = getParts()
-	if not hum or not root or hum.Health <= 0 then return false end
+local function goToFountain()
+	local _, root = getParts()
+	if not root then return end
 
 	local fountain, prompt = findFountain()
-	if not fountain or not prompt then
-		warnOnce("fountain", "No encontré Fountain con ProximityPrompt")
-		return false
+	if not fountain then
+		setStatus("No encontré Fountain")
+		return
 	end
 
-	local fpos = promptPosition(prompt) or getPosition(fountain)
-	if not fpos then return false end
-
-	healToken += 1
-	local token = healToken
-	healBusy = true
-
-	local savedCF = root.CFrame
-	local wasAnchored = root.Anchored
-
-	if not flying then
-		root.Anchored = true
+	local cf, pos
+	if prompt then
+		cf, pos = standCFrameFor(prompt)
 	end
-
-	-- Ir junto al prompt
-	standNearPrompt(prompt, root)
-	task.wait(HEAL_TP_DELAY)
-	waitPromptReady(prompt, root)
-
-	-- Quedarse en la fuente hasta curarse
-	while running and autoHeal and token == healToken do
-		local h, r = getParts()
-		if not h or not r or h.Health <= 0 then break end
-		if h.Health >= h.MaxHealth * HEAL_DONE then break end
-
-		-- Si te devolvieron a otro lugar sin curarte, vuelves al prompt
-		if (r.Position - fpos).Magnitude > HEAL_RETURN_DIST then
-			standNearPrompt(prompt, r)
-			task.wait(HEAL_TP_DELAY)
-			waitPromptReady(prompt, r)
+	if not cf then
+		pos = getPosition(fountain)
+		if not pos then
+			setStatus("Fountain no tiene posición")
+			return
 		end
-
-		usePrompt(prompt)
-		task.wait(HEAL_POLL)
+		cf = CFrame.new(pos + PROMPT_STAND_OFFSET)
 	end
 
-	-- Solo regresa a la posición original si ya se curó
-	local h, r = getParts()
-	if token == healToken then
-		if h and r and h.Health > 0 and h.Health >= h.MaxHealth * HEAL_DONE then
-			r.CFrame = savedCF
-			r.AssemblyLinearVelocity = Vector3.zero
-		end
-		if r and r.Parent then
-			r.Anchored = wasAnchored
-		end
-		healBusy = false
-	end
+	savedHealCF = root.CFrame
+	teleportCharacter(cf)
+	setHealVisual(true)
 
-	return true
+	if prompt then
+		pcall(function()
+			prompt.RequiresLineOfSight = false
+		end)
+		setStatus("En Fountain. Activa el prompt; con ↩ Volver regresas.")
+	else
+		setStatus("En Fountain, pero no encontré prompt cercano.")
+	end
 end
 
-local function setAutoHeal(state)
-	autoHeal = state
-	healLoopToken += 1
-	if state then
-		local token = healLoopToken
-		task.spawn(function()
-			while running and autoHeal and token == healLoopToken do
-				local hum = getParts()
-				if hum and hum.Health > 0
-					and hum.Health <= hum.MaxHealth * HEAL_THRESHOLD
-					and not isBusy() then
-					pcall(healAtFountain)
-					task.wait(HEAL_COOLDOWN)
-				end
-				task.wait(0.2)
-			end
-		end)
+local function returnFromFountain()
+	if savedHealCF then
+		teleportCharacter(savedHealCF)
+		savedHealCF = nil
+		setStatus("Regresaste a tu posición guardada.")
+	end
+	setHealVisual(false)
+end
+
+local function onHealTap()
+	if savedHealCF then
+		returnFromFountain()
+	else
+		goToFountain()
 	end
 end
 
 ---------------------------------------------------------------------
 -- JEFES (StarRune)
--- Busca en todo el juego, sin importar la clase ni el número del nombre.
--- El orden de aparición define Jefe 1, Jefe 2, etc.
+-- Solo te teletransportas junto al jefe. Activas el prompt manualmente.
 ---------------------------------------------------------------------
 local function normalizeName(s)
 	return string.lower((string.gsub(s, "%s+", "")))
@@ -946,13 +857,6 @@ local function isBossName(name)
 	return string.match(normalizeName(name), pattern) ~= nil
 end
 
-local function setBossStatus(text)
-	if bossStatus then
-		bossStatus.Text = text
-	end
-end
-
--- Escanea workspace y, si no hay nada, ReplicatedStorage y Lighting
 local function getStarRunes()
 	local found, seen = {}, {}
 
@@ -960,7 +864,6 @@ local function getStarRunes()
 		for _, d in ipairs(root:GetDescendants()) do
 			if not seen[d] and isBossName(d.Name) then
 				seen[d] = true
-				-- Evita contar un StarRune que esté dentro de otro ya contado
 				local nested = false
 				local anc = d.Parent
 				while anc and anc ~= game do
@@ -980,105 +883,57 @@ local function getStarRunes()
 	scan(workspace)
 	if #found == 0 then
 		scan(ReplicatedStorage)
-		scan(game:GetService("Lighting"))
+		scan(Lighting)
 	end
 	return found
 end
 
--- Posición del StarRune, sea de la clase que sea
-local function getBossPosition(inst)
-	if inst:IsA("BasePart") then
-		return inst.Position
-	elseif inst:IsA("Attachment") then
-		return inst.WorldPosition
-	elseif inst:IsA("Model") then
-		return inst:GetPivot().Position
-	end
-	local part = inst:FindFirstChildWhichIsA("BasePart", true)
-	if part then return part.Position end
-	local att = inst:FindFirstChildWhichIsA("Attachment", true)
-	if att then return att.WorldPosition end
-	return nil
-end
-
--- ProximityPrompt del jefe: dentro del objeto o, si no hay, el más cercano
-local function findBossPrompt(inst)
-	if inst:IsA("ProximityPrompt") then return inst end
-	local inside = inst:FindFirstChildWhichIsA("ProximityPrompt", true)
-	if inside then return inside end
-
-	local pos = getBossPosition(inst)
-	if not pos then return nil end
-	local closest, closestD
-	for _, d in ipairs(workspace:GetDescendants()) do
-		if d:IsA("ProximityPrompt") then
-			local pp = promptPosition(d)
-			if pp then
-				local dist = (pp - pos).Magnitude
-				if dist <= PROMPT_NEARBY_RANGE and (not closestD or dist < closestD) then
-					closest, closestD = d, dist
-				end
-			end
-		end
-	end
-	return closest
-end
-
 local function fightBoss(index)
-	if bossBusy or healBusy then return end
-
 	local inst = bossEntries[index]
 	if not inst or not inst.Parent then
 		refreshBosses()
 		inst = bossEntries[index]
 		if not inst then
-			setBossStatus("Jefe " .. index .. " no encontrado. Pulsa Buscar jefes.")
+			setStatus("Jefe " .. index .. " no encontrado. Pulsa Buscar jefes.")
 			return
 		end
 	end
 
-	local hum, root = getParts()
-	if not hum or not root or hum.Health <= 0 then return end
+	local _, root = getParts()
+	if not root then return end
 
-	local prompt = findBossPrompt(inst)
-	local pos = getBossPosition(inst)
-	if not prompt and not pos then
-		setBossStatus("Jefe " .. index .. " no tiene posición ni prompt")
+	local prompt = findPromptFor(inst)
+	if prompt then
+		local cf = standCFrameFor(prompt)
+		if cf then
+			teleportCharacter(cf)
+			setStatus("Jefe " .. index .. ": activa su prompt manualmente.")
+			return
+		end
+	end
+
+	local pos = getPosition(inst)
+	if not pos then
+		setStatus("Jefe " .. index .. " no tiene posición")
 		return
 	end
-
-	bossBusy = true
-	local ok, err = pcall(function()
-		local wasAnchored = root.Anchored
-		if not flying then
-			root.Anchored = true
-		end
-
-		if prompt then
-			standNearPrompt(prompt, root)
-			task.wait(BOSS_TP_DELAY)
-			waitPromptReady(prompt, root)
-			usePrompt(prompt)
-		else
-			root.CFrame = CFrame.new(pos + Vector3.new(0, BOSS_FALLBACK_HEIGHT, 0))
-			root.AssemblyLinearVelocity = Vector3.zero
-			task.wait(BOSS_TP_DELAY)
-		end
-
-		if root.Parent then
-			root.Anchored = wasAnchored
-		end
-	end)
-	bossBusy = false
-
-	if not ok then
-		warn("[CFly] Error en Jefe " .. index .. ": " .. tostring(err))
-	end
+	teleportCharacter(CFrame.new(pos + Vector3.new(0, BOSS_FALLBACK_HEIGHT, 0)))
+	setStatus("Jefe " .. index .. ": llegaste (sin prompt cercano).")
 end
 
 ---------------------------------------------------------------------
 -- VUELO (CFLY)
 ---------------------------------------------------------------------
+setFlyVisual = function(on)
+	flyBtn.Text = on and "✈ FLY ON" or "✈ FLY OFF"
+	tween(flyBtn, { BackgroundColor3 = on and COLORS.flyOn or COLORS.flyOff })
+end
+
+setHealVisual = function(atFountain)
+	healBtn.Text = atFountain and "↩ Volver" or "🏥 Curar"
+	tween(healBtn, { BackgroundColor3 = atFountain and COLORS.healBack or COLORS.heal })
+end
+
 local function stopFly()
 	flying = false
 	if connection then
@@ -1097,8 +952,7 @@ local function stopFly()
 	if hum then
 		hum.PlatformStand = false
 	end
-	flyBubble.Text = "FLY\nOFF"
-	tween(flyBubble, { BackgroundColor3 = COLORS.bubbleOff })
+	setFlyVisual(false)
 	if setFlyRow then setFlyRow(false, true) end
 end
 
@@ -1121,15 +975,13 @@ local function startFly()
 	flyVelocity.VectorVelocity = Vector3.zero
 	flyVelocity.Parent = root
 
-	flyBubble.Text = "FLY\nON"
-	tween(flyBubble, { BackgroundColor3 = COLORS.bubbleOn })
+	setFlyVisual(true)
 	if setFlyRow then setFlyRow(true, true) end
 
 	connection = RunService.RenderStepped:Connect(function(dt)
 		local h, r = getParts()
 		if not h or not r then return end
 
-		-- Mientras se teletransporta a cofres, cristales, fuente o jefes, el vuelo no mueve al personaje
 		if isBusy() then
 			r.AssemblyLinearVelocity = Vector3.zero
 			return
@@ -1228,18 +1080,116 @@ local function setNoclip(state)
 end
 
 ---------------------------------------------------------------------
+-- CERRAR EL SCRIPT
+---------------------------------------------------------------------
+local function shutdown()
+	running = false
+	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
+	autoChest, crystalFarm = false, false
+	chestBusy, crystalBusy = false, false
+	savedHealCF = nil
+	attackToken += 1
+	chestToken += 1
+	crystalToken += 1
+
+	stopFly()
+	setNoclip(false)
+
+	pcall(function() RunService:UnbindFromRenderStep("CFlyCombat") end)
+	pcall(function() RunService:UnbindFromRenderStep("CFlyTeleport") end)
+
+	for _, c in ipairs(allConnections) do
+		c:Disconnect()
+	end
+	table.clear(allConnections)
+
+	local hum = getParts()
+	if hum then
+		hum.AutoRotate = true
+	end
+
+	gui:Destroy()
+end
+
+---------------------------------------------------------------------
+-- PÍLDORA (Curar | FLY)
+---------------------------------------------------------------------
+pill = Instance.new("Frame")
+pill.Name = "CFlyPill"
+pill.Size = UDim2.fromOffset(PILL_W, PILL_H)
+pill.Position = UDim2.new(0.5, -PILL_W / 2, 0, 46)
+pill.BackgroundColor3 = COLORS.panel
+pill.BorderSizePixel = 0
+pill.Parent = gui
+corner(pill, UDim.new(0, PILL_H / 2))
+
+local pillStroke = Instance.new("UIStroke")
+pillStroke.Thickness = 1.5
+pillStroke.Color = Color3.new(1, 1, 1)
+pillStroke.Parent = pill
+
+local pillGrad = Instance.new("UIGradient")
+pillGrad.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+pillGrad.Rotation = 45
+pillGrad.Parent = pillStroke
+
+local function makePillButton(xPos, width, text, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(width, -6, 1, -6)
+	b.Position = xPos
+	b.BackgroundColor3 = color
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.AutoButtonColor = false
+	b.Parent = pill
+	corner(b, UDim.new(1, 0))
+	return b
+end
+
+healBtn = makePillButton(UDim2.new(0, 3, 0, 3), 0.5, "🏥 Curar", COLORS.heal)
+flyBtn = makePillButton(UDim2.new(0.5, 3, 0, 3), 0.5, "✈ FLY OFF", COLORS.flyOff)
+
+makeDraggable(healBtn, pill, onHealTap)
+makeDraggable(flyBtn, pill, function() toggleFly() end)
+
+---------------------------------------------------------------------
+-- BURBUJA DE MINIMIZAR (pequeña)
+---------------------------------------------------------------------
+menuBubble = Instance.new("TextButton")
+menuBubble.Name = "MenuBubble"
+menuBubble.Size = UDim2.fromOffset(MENU_SIZE, MENU_SIZE)
+menuBubble.Position = UDim2.fromOffset(20, 120)
+menuBubble.BackgroundColor3 = COLORS.accentA
+menuBubble.Text = "☰"
+menuBubble.TextColor3 = Color3.new(1, 1, 1)
+menuBubble.TextSize = 18
+menuBubble.Font = Enum.Font.GothamBold
+menuBubble.AutoButtonColor = false
+menuBubble.Visible = false
+menuBubble.Parent = gui
+corner(menuBubble, UDim.new(1, 0))
+
+local menuStroke = Instance.new("UIStroke")
+menuStroke.Thickness = 1.5
+menuStroke.Color = Color3.new(1, 1, 1)
+menuStroke.Parent = menuBubble
+
+---------------------------------------------------------------------
 -- PANEL
 ---------------------------------------------------------------------
 local PANEL_W = 300
 local TITLE_H = 50
 local TAB_H = 34
-local FULL_H = 400
-local panelW, panelFullH = PANEL_W, FULL_H
+local FULL_H = 380
+panelW, panelFullH = PANEL_W, FULL_H
 
 panel = Instance.new("Frame")
 panel.Name = "Panel"
 panel.AnchorPoint = Vector2.new(0.5, 0)
-panel.Position = UDim2.new(0.5, 0, 0, 60)
+panel.Position = UDim2.new(0.5, 0, 0, 100)
 panel.Size = UDim2.fromOffset(PANEL_W, FULL_H)
 panel.BackgroundColor3 = COLORS.panel
 panel.BorderSizePixel = 0
@@ -1289,21 +1239,21 @@ dividerGradient.Parent = divider
 
 local function makeCircleButton(text, color, xOffset)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.fromOffset(34, 34)
-	b.Position = UDim2.new(1, xOffset, 0, 8)
+	b.Size = UDim2.fromOffset(30, 30)
+	b.Position = UDim2.new(1, xOffset, 0, 10)
 	b.BackgroundColor3 = color
 	b.Text = text
 	b.TextColor3 = Color3.fromRGB(30, 30, 40)
 	b.Font = Enum.Font.GothamBold
-	b.TextSize = 17
+	b.TextSize = 15
 	b.AutoButtonColor = true
 	b.Parent = panel
 	corner(b, UDim.new(1, 0))
 	return b
 end
 
-local minBtn = makeCircleButton("−", COLORS.yellow, -86)
-local closeBtn = makeCircleButton("✕", COLORS.red, -46)
+local minBtn = makeCircleButton("−", COLORS.yellow, -76)
+local closeBtn = makeCircleButton("✕", COLORS.red, -40)
 
 -- Pestañas
 local tabBar = Instance.new("Frame")
@@ -1375,7 +1325,7 @@ local function makeTab(name, text, index)
 	return page
 end
 
--- Fila con interruptor. Devuelve "set" y la etiqueta de subtítulo.
+-- Fila con interruptor
 local function createRow(page, order, titleText, subtitleText, initial, callback)
 	local row = Instance.new("Frame")
 	row.Size = UDim2.new(1, 0, 0, 56)
@@ -1451,7 +1401,7 @@ local function createRow(page, order, titleText, subtitleText, initial, callback
 	return set, s
 end
 
--- Botón de acción (sin interruptor)
+-- Botón de acción
 local function createButtonRow(page, order, titleText, color, callback)
 	local btn = Instance.new("TextButton")
 	btn.Size = UDim2.new(1, 0, 0, 44)
@@ -1513,7 +1463,6 @@ local function createModeSelector(page, order)
 	selectMode(combatMode)
 end
 
--- Crear pestañas
 makeTab("move", "🏃 Mov", 1)
 makeTab("combat", "⚔ Combate", 2)
 makeTab("farm", "💎 Farm", 3)
@@ -1521,8 +1470,8 @@ makeTab("settings", "⚙ Ajustes", 4)
 
 -- Página: Movimiento
 local movePage = pages.move
-createRow(movePage, 1, "Burbuja de vuelo", "Mostrar el botón FLY", true, function(value)
-	flyBubble.Visible = value
+createRow(movePage, 1, "Barra Curar / FLY", "Muestra u oculta la barra superior", true, function(value)
+	pill.Visible = value
 end)
 setFlyRow = createRow(movePage, 2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
 	if value ~= flying then
@@ -1541,28 +1490,26 @@ createRow(combatPage, 3, "TP + Auto-ataque", "Va hasta el enemigo y ataca", fals
 createRow(combatPage, 4, "TP al enemigo", "Te lleva junto al más cercano", false, setTpEnemy)
 createRow(combatPage, 5, "Mantener distancia", "Esquiva rápido (modo a distancia)", false, setKeepDistance)
 
--- Página: Farm (cofres, cristales, curación y jefes)
-farmPage = pages.farm
+-- Página: Farm
+local farmPage = pages.farm
 local _, chestLabel = createRow(farmPage, 1, "Auto-cofres", "Cofres recogidos: 0", false, setAutoChest)
 chestSub = chestLabel
 local _, crystalLabel = createRow(farmPage, 2, "Auto-cristales", "Cristales rotos: 0", false, setCrystalFarm)
 crystalSub = crystalLabel
-createRow(farmPage, 3, "Auto-curar (Fountain)", "Al 20% de vida va a la fuente", false, setAutoHeal)
 
-bossStatus = Instance.new("TextLabel")
-bossStatus.Name = "BossStatus"
-bossStatus.BackgroundTransparency = 1
-bossStatus.Size = UDim2.new(1, 0, 0, 30)
-bossStatus.Text = "Buscando StarRunes..."
-bossStatus.TextColor3 = COLORS.subtext
-bossStatus.Font = Enum.Font.Gotham
-bossStatus.TextSize = 11
-bossStatus.TextWrapped = true
-bossStatus.TextXAlignment = Enum.TextXAlignment.Left
-bossStatus.LayoutOrder = 8
-bossStatus.Parent = farmPage
+statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "StatusLabel"
+statusLabel.BackgroundTransparency = 1
+statusLabel.Size = UDim2.new(1, 0, 0, 30)
+statusLabel.Text = "Buscando StarRunes..."
+statusLabel.TextColor3 = COLORS.subtext
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 11
+statusLabel.TextWrapped = true
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.LayoutOrder = 8
+statusLabel.Parent = farmPage
 
--- Jefes: se llenan con los StarRune encontrados
 refreshBosses = function()
 	bossEntries = getStarRunes()
 	for i = 1, #bossEntries do
@@ -1578,9 +1525,9 @@ refreshBosses = function()
 	end
 
 	if #bossEntries > 0 then
-		setBossStatus("StarRunes encontrados: " .. #bossEntries)
+		setStatus("StarRunes encontrados: " .. #bossEntries)
 	else
-		setBossStatus("No encontré StarRunes. Acércate a la zona y pulsa Buscar jefes.")
+		setStatus("No encontré StarRunes. Acércate a la zona y pulsa Buscar jefes.")
 	end
 end
 
@@ -1588,7 +1535,6 @@ createButtonRow(farmPage, 9, "🔄 Buscar jefes (StarRune)", COLORS.accentA, fun
 	refreshBosses()
 end)
 
--- Reintenta hasta encontrar los StarRune (por si el mapa aún no cargó)
 task.spawn(function()
 	for _ = 1, 15 do
 		refreshBosses()
@@ -1599,12 +1545,10 @@ end)
 
 -- Página: Ajustes
 local settingsPage = pages.settings
-createRow(settingsPage, 1, "Mover botones", "Actívalo para arrastrar burbujas y panel", false, function(value)
+createRow(settingsPage, 1, "Mover botones", "Actívalo para arrastrar la barra y el panel", false, function(value)
 	moveButtonsEnabled = value
 end)
-createButtonRow(settingsPage, 2, "Cerrar script", COLORS.red, function()
-	-- se define más abajo
-end)
+createButtonRow(settingsPage, 2, "Cerrar script", COLORS.red, shutdown)
 
 showTab("move")
 
@@ -1612,11 +1556,10 @@ showTab("move")
 -- MINIMIZAR / RESTAURAR
 ---------------------------------------------------------------------
 local function setMinimized(state)
-	minimized = state
 	if state then
 		local p = panel.AbsolutePosition
 		panel.Visible = false
-		menuBubble.Position = UDim2.fromOffset(p.X + panelW - 52, p.Y)
+		menuBubble.Position = UDim2.fromOffset(p.X + panelW - MENU_SIZE, p.Y)
 		menuBubble.Visible = true
 		clampToScreen(menuBubble)
 	else
@@ -1636,54 +1579,10 @@ minBtn.Activated:Connect(function()
 	setMinimized(true)
 end)
 
----------------------------------------------------------------------
--- CERRAR EL SCRIPT
----------------------------------------------------------------------
-local function shutdown()
-	running = false
-	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
-	autoChest, crystalFarm = false, false
-	autoHeal = false
-	chestBusy, crystalBusy, healBusy, bossBusy = false, false, false, false
-	attackToken += 1
-	chestToken += 1
-	crystalToken += 1
-	healToken += 1
-	healLoopToken += 1
-
-	stopFly()
-	setNoclip(false)
-
-	pcall(function() RunService:UnbindFromRenderStep("CFlyCombat") end)
-	pcall(function() RunService:UnbindFromRenderStep("CFlyTeleport") end)
-
-	for _, c in ipairs(allConnections) do
-		c:Disconnect()
-	end
-	table.clear(allConnections)
-
-	local hum, root = getParts()
-	if hum then
-		hum.AutoRotate = true
-	end
-	if root then
-		root.Anchored = false
-	end
-
-	gui:Destroy()
-end
-
 closeBtn.Activated:Connect(shutdown)
 
--- Conecta el botón "Cerrar script" de Ajustes
-for _, child in ipairs(settingsPage:GetChildren()) do
-	if child:IsA("TextButton") then
-		child.Activated:Connect(shutdown)
-	end
-end
-
 ---------------------------------------------------------------------
--- AJUSTE DE TAMAÑO Y EXTRAS
+-- AJUSTE DE TAMAÑO
 ---------------------------------------------------------------------
 local function fitPanel()
 	local screen = gui.AbsoluteSize
@@ -1697,7 +1596,7 @@ gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
 	fitPanel()
 	if panel.Visible then clampToScreen(panel) end
 	if menuBubble.Visible then clampToScreen(menuBubble) end
-	clampToScreen(flyBubble)
+	clampToScreen(pill)
 end)
 
 panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
@@ -1708,9 +1607,10 @@ fitPanel()
 task.defer(function()
 	fitPanel()
 	clampToScreen(panel)
-	clampToScreen(flyBubble)
+	clampToScreen(pill)
 end)
 
+-- Tecla F: volar on/off
 track(UserInputService.InputBegan:Connect(function(input, processed)
 	if processed then return end
 	if input.KeyCode == TOGGLE_KEY then
@@ -1718,12 +1618,12 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
 	end
 end))
 
+-- Al morir o reaparecer: se limpia el estado de curación y de vuelo
 track(player.CharacterAdded:Connect(function()
 	stopFly()
 	originalCollide = {}
 	chestBusy = false
 	crystalBusy = false
-	healBusy = false
-	bossBusy = false
-	healToken += 1   -- cancela una curación en curso si moriste
+	savedHealCF = nil
+	setHealVisual(false)
 end))
