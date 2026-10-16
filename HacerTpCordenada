@@ -1,4 +1,4 @@
--- LocalScript en StarterPlayer > StarterPlayerScripts
+-- LocalScript en StarterPlayer > StarterPlayerScripts (optimizado para teléfono)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -17,7 +17,6 @@ local COLOR_OK = Color3.fromRGB(110, 230, 150)
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Helpers
 local function crear(clase, propiedades, hijos)
 	local obj = Instance.new(clase)
 	for k, v in pairs(propiedades or {}) do
@@ -37,23 +36,25 @@ end
 local gui = crear("ScreenGui", {
 	Name = "TeleportUI",
 	ResetOnSpawn = false,
-	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 999,
 	Parent = playerGui,
 })
 
+-- Botón flotante: izquierda, a la mitad de la pantalla (lejos de la barra de Roblox)
 local botonAbrir = crear("TextButton", {
 	Name = "AbrirTP",
-	Size = UDim2.fromOffset(48, 48),
-	Position = UDim2.fromOffset(16, 16),
+	Size = UDim2.fromOffset(52, 52),
+	Position = UDim2.new(0, 10, 0.5, 0),
 	BackgroundColor3 = COLOR_PRINCIPAL,
 	Text = "📍",
-	TextSize = 24,
+	TextSize = 26,
 	Font = Enum.Font.GothamBold,
 	TextColor3 = Color3.new(1, 1, 1),
 	Parent = gui,
-}, { redondear(12) })
+}, { redondear(14) })
 
-local PANEL_TAM = UDim2.fromOffset(300, 310)
+-- Panel principal
+local PANEL_TAM = UDim2.fromOffset(300, 330)
 local panel = crear("Frame", {
 	Name = "Panel",
 	Size = PANEL_TAM,
@@ -65,7 +66,25 @@ local panel = crear("Frame", {
 }, {
 	redondear(16),
 	crear("UIStroke", { Color = COLOR_PRINCIPAL, Thickness = 2 }),
+	crear("UIScale"),
 })
+local escala = panel:FindFirstChildOfClass("UIScale")
+
+-- Ajusta el panel al tamaño de la pantalla del teléfono
+local function ajustarEscala()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local v = cam.ViewportSize
+	escala.Scale = math.clamp(math.min((v.X - 24) / 300, (v.Y - 90) / 330), 0.5, 1)
+end
+
+task.spawn(function()
+	while not workspace.CurrentCamera do
+		task.wait()
+	end
+	workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(ajustarEscala)
+	ajustarEscala()
+end)
 
 crear("TextLabel", {
 	Size = UDim2.new(1, -60, 0, 50),
@@ -80,8 +99,8 @@ crear("TextLabel", {
 })
 
 local botonCerrar = crear("TextButton", {
-	Size = UDim2.fromOffset(30, 30),
-	Position = UDim2.new(1, -40, 0, 10),
+	Size = UDim2.fromOffset(34, 34),
+	Position = UDim2.new(1, -44, 0, 8),
 	BackgroundColor3 = COLOR_CAMPO,
 	Text = "✕",
 	TextSize = 16,
@@ -145,13 +164,11 @@ local boton = crear("TextButton", {
 	}),
 })
 
--- Modo copiar ruta
-local modoRuta = false
 local botonModo = crear("TextButton", {
-	Size = UDim2.new(0.9, 0, 0, 36),
-	Position = UDim2.new(0.05, 0, 0, 212),
+	Size = UDim2.new(0.9, 0, 0, 40),
+	Position = UDim2.new(0.05, 0, 0, 214),
 	BackgroundColor3 = COLOR_CAMPO,
-	Text = "Copiar ruta: OFF",
+	Text = "Copiar ruta de un objeto",
 	TextColor3 = Color3.new(1, 1, 1),
 	Font = Enum.Font.GothamMedium,
 	TextSize = 15,
@@ -160,46 +177,94 @@ local botonModo = crear("TextButton", {
 }, { redondear(10) })
 
 local rutaBox = crear("TextBox", {
-	Size = UDim2.new(0.9, 0, 0, 34),
-	Position = UDim2.new(0.05, 0, 0, 258),
+	Size = UDim2.new(0.9, 0, 0, 40),
+	Position = UDim2.new(0.05, 0, 0, 264),
 	BackgroundColor3 = COLOR_CAMPO,
-	PlaceholderText = "Activa el modo y toca un objeto",
+	PlaceholderText = "Aquí aparecerá la ruta",
 	PlaceholderColor3 = Color3.fromRGB(140, 140, 160),
 	Text = "",
 	TextColor3 = COLOR_OK,
 	Font = Enum.Font.Code,
-	TextSize = 13,
+	TextSize = 12,
 	TextXAlignment = Enum.TextXAlignment.Left,
+	TextWrapped = false,
 	ClearTextOnFocus = false,
 	Parent = panel,
 }, { redondear(8) })
 
--- ================= ANIMACIÓN DEL PANEL =================
+-- Aviso superior para el modo ruta
+local banner = crear("Frame", {
+	Name = "BannerRuta",
+	Size = UDim2.fromOffset(290, 48),
+	Position = UDim2.new(0.5, 0, 0, 50),
+	AnchorPoint = Vector3.new(0.5, 0),
+	BackgroundColor3 = COLOR_FONDO,
+	Visible = false,
+	Parent = gui,
+}, {
+	redondear(12),
+	crear("UIStroke", { Color = COLOR_OK, Thickness = 2 }),
+})
+
+crear("TextLabel", {
+	Size = UDim2.new(1, -100, 1, 0),
+	Position = UDim2.fromOffset(12, 0),
+	BackgroundTransparency = 1,
+	Text = "Toca un objeto del mundo",
+	TextColor3 = COLOR_OK,
+	Font = Enum.Font.GothamMedium,
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = banner,
+})
+
+local botonCancelarRuta = crear("TextButton", {
+	Size = UDim2.fromOffset(80, 32),
+	Position = UDim2.new(1, -88, 0.5, -16),
+	BackgroundColor3 = COLOR_CAMPO,
+	Text = "Cancelar",
+	TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+	Parent = banner,
+}, { redondear(8) })
+
+-- ================= ABRIR / CERRAR PANEL =================
 local abierto = false
 
+local function abrirPanel()
+	abierto = true
+	panel.Visible = true
+	escala.Scale = escala.Scale -- mantiene la escala actual
+	panel.Size = UDim2.fromOffset(0, 0)
+	TweenService:Create(panel, TweenInfo.new(0.25, Enum.EasingStyle.Back), {
+		Size = PANEL_TAM,
+	}):Play()
+end
+
+local function cerrarPanel()
+	abierto = false
+	local tween = TweenService:Create(panel, TweenInfo.new(0.2), {
+		Size = UDim2.fromOffset(0, 0),
+	})
+	tween:Play()
+	tween.Completed:Once(function()
+		if not abierto then
+			panel.Visible = false
+		end
+	end)
+end
+
 local function alternarPanel()
-	abierto = not abierto
 	if abierto then
-		panel.Visible = true
-		panel.Size = UDim2.fromOffset(0, 0)
-		TweenService:Create(panel, TweenInfo.new(0.25, Enum.EasingStyle.Back), {
-			Size = PANEL_TAM,
-		}):Play()
+		cerrarPanel()
 	else
-		local tween = TweenService:Create(panel, TweenInfo.new(0.2), {
-			Size = UDim2.fromOffset(0, 0),
-		})
-		tween:Play()
-		tween.Completed:Once(function()
-			if not abierto then
-				panel.Visible = false
-			end
-		end)
+		abrirPanel()
 	end
 end
 
 botonAbrir.Activated:Connect(alternarPanel)
-botonCerrar.Activated:Connect(alternarPanel)
+botonCerrar.Activated:Connect(cerrarPanel)
 
 -- ================= MOVIMIENTO SUAVE =================
 local viajando = false
@@ -222,7 +287,6 @@ local function teleportarSuave(destino)
 
 	if not hrp or not humanoid or humanoid.Health <= 0 then
 		mostrarEstado("No se encontró tu personaje", COLOR_ERROR)
-		warn("[TP] Sin HumanoidRootPart o Humanoid")
 		return
 	end
 
@@ -249,8 +313,7 @@ local function teleportarSuave(destino)
 			return
 		end
 
-		local nuevaPos = hrp.Position + diferencia.Unit * paso
-		hrp.CFrame = CFrame.new(nuevaPos) * rotacion
+		hrp.CFrame = CFrame.new(hrp.Position + diferencia.Unit * paso) * rotacion
 	end)
 end
 
@@ -272,7 +335,7 @@ boton.Activated:Connect(function()
 	teleportarSuave(Vector3.new(x, y, z))
 end)
 
--- ================= COPIAR RUTA =================
+-- ================= COPIAR RUTA (modo táctil) =================
 local function construirRuta(obj)
 	local partes = {}
 	local actual = obj
@@ -292,39 +355,39 @@ local function construirRuta(obj)
 	return ruta
 end
 
-local function mostrarRuta(texto)
-	rutaBox.Text = texto
-	rutaBox:CaptureFocus()
-	rutaBox.SelectionStart = 1
-	rutaBox.CursorPosition = #texto + 1
+local modoRuta = false
+
+local function activarModoRuta(activo)
+	modoRuta = activo
+	banner.Visible = activo
+	if activo then
+		abierto = false
+		panel.Visible = false
+	end
 end
 
 botonModo.Activated:Connect(function()
-	modoRuta = not modoRuta
-	if modoRuta then
-		botonModo.Text = "Copiar ruta: ON"
-		botonModo.BackgroundColor3 = COLOR_OK
-		mostrarEstado("Toca un objeto del mundo", COLOR_OK)
-	else
-		botonModo.Text = "Copiar ruta: OFF"
-		botonModo.BackgroundColor3 = COLOR_CAMPO
-		mostrarEstado("Modo ruta desactivado", COLOR_AVISO)
-	end
+	activarModoRuta(true)
 end)
 
-local mouse = player:GetMouse()
-mouse.Button1Down:Connect(function()
+botonCancelarRuta.Activated:Connect(function()
+	activarModoRuta(false)
+	abrirPanel()
+	mostrarEstado("Modo ruta cancelado", COLOR_AVISO)
+end)
+
+local player_mouse = player:GetMouse()
+player_mouse.Button1Down:Connect(function()
 	if not modoRuta then
 		return
 	end
-	local objetivo = mouse.Target
+	local objetivo = player_mouse.Target
 	if not objetivo then
-		mostrarEstado("No apuntaste a ningún objeto", COLOR_AVISO)
-		return
+		return -- no tocaste un objeto, sigue esperando
 	end
-	mostrarRuta(construirRuta(objetivo))
-	mostrarEstado("Ruta lista: pulsa Ctrl+C para copiar", COLOR_OK)
-end)
 
--- Si tu juego tiene algún script del servidor que mueve tu personaje, avísame
--- qué mensajes salen en View > Output para revisarlo.
+	activarModoRuta(false)
+	rutaBox.Text = construirRuta(objetivo)
+	abrirPanel()
+	mostrarEstado("Ruta lista. Mantén presionado el cuadro y elige Copiar", COLOR_OK)
+end)
