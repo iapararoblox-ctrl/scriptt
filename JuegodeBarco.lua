@@ -1,4 +1,4 @@
--- Recolección de cofres + entrega en barco + apertura con bodega llena (Delta, Móvil)
+-- Recolección de cofres + entrega en barco + apertura con bodega llena (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -11,7 +11,8 @@ local LocalPlayer = Players.LocalPlayer
 local CONFIG = {
     VELOCIDAD_DESLIZAR = 45,
     MODO_INICIAL = "TP",              -- "TP" o "DESLIZAR"
-    AGARRAR_INICIAL = true,           -- llevar cofres al barco
+    AGARRAR_INICIAL = false,          -- desactivado por defecto, lo activas tú en la UI
+    ABRIR_RAPIDO = true,              -- usa FastOpen al vaciar la bodega
     ESPERA_INICIAL_BARCO = 5,
     ESPERA_MAXIMA = 60,
     ESPERA_PROMPT = 0.3,
@@ -168,8 +169,8 @@ end
 
 ---------------------------------------------------------------
 -- ESTADO DE LA BODEGA
--- Busca en el HUD un texto tipo "12/12" dentro del barco.
--- Si no lo detecta, usa el botón manual "Vaciar bodega".
+-- Busca en el HUD un texto tipo "12/12" relacionado con el barco.
+-- Si no lo detecta, usa el botón manual "Vaciar".
 ---------------------------------------------------------------
 local function isHoldFull()
     if holdFullManual then return true end
@@ -194,41 +195,41 @@ local function isHoldFull()
 end
 
 ---------------------------------------------------------------
--- ABRIR COFRES GUARDADOS
+-- ABRIR COFRES GUARDADOS (remotes de la captura)
 ---------------------------------------------------------------
 local function openStoredTreasures()
     statusText = "Bodega llena: abriendo cofres..."
     refreshUI()
 
-    -- Intento 1: botón rápido del HUD si existe
-    local hud = LocalPlayer.PlayerGui:FindFirstChild("HUD")
-    local quick = hud and hud:FindFirstChild("Ship")
-        and hud.Ship:FindFirstChild("QuickOpenCargo")
-    if quick and quick:IsA("GuiButton") and quick.Visible then
-        pcall(firesignal, quick.MouseButton1Click)
-        task.wait(CONFIG.PAUSA_APERTURA)
+    local openRemote = getRemote("Treasure_Open")
+    local settingsRemote = getRemote("Settings_Set")
+
+    if CONFIG.ABRIR_RAPIDO and settingsRemote and settingsRemote:IsA("RemoteEvent") then
+        pcall(function()
+            settingsRemote:FireServer("FastOpen", true)
+        end)
+        task.wait(0.2)
     end
 
-    -- Intento 2: remote de apertura, repetido hasta vaciar la bodega
-    local openRemote = getRemote("Treasure_Open")
     if openRemote and openRemote:IsA("RemoteEvent") then
         for _ = 1, CONFIG.MAX_APERTURAS do
             if closed or not running then break end
-            pcall(function() openRemote:FireServer() end)
+
+            pcall(function()
+                openRemote:FireServer("All", nil, CONFIG.ABRIR_RAPIDO)
+            end)
+
             openedCount += 1
             refreshUI()
             task.wait(CONFIG.PAUSA_APERTURA)
+
             if not isHoldFull() then break end
         end
     end
 
-    -- Reclamar overflow si el juego lo necesita
-    local claim = getRemote("Gear_ClaimOverflow")
-    if claim and claim:IsA("RemoteFunction") then
-        pcall(function() claim:InvokeServer() end)
-    end
-
     holdFullManual = false
+    statusText = "Bodega vacía, volviendo a buscar cofres"
+    refreshUI()
 end
 
 ---------------------------------------------------------------
@@ -426,7 +427,7 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal (tamaño base 260x320, se escala según la pantalla)
+-- Panel principal (base 260x320, se escala según la pantalla)
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
