@@ -1,4 +1,4 @@
--- Recolección de cofres + entrega en barco + apertura con bodega llena (Ser pirata, Móvil)
+-- Recolección de cofres + entrega en barco + apertura + venta al tasador (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -11,16 +11,25 @@ local LocalPlayer = Players.LocalPlayer
 local CONFIG = {
     VELOCIDAD_DESLIZAR = 45,
     MODO_INICIAL = "TP",              -- "TP" o "DESLIZAR"
-    AGARRAR_INICIAL = false,          -- desactivado por defecto, lo activas tú en la UI
+    AGARRAR_INICIAL = false,          -- desactivado por defecto, lo activas en la UI
+    VENDER_INICIAL = true,            -- vender en el tasador después de abrir cofres
     ABRIR_RAPIDO = true,              -- usa FastOpen al vaciar la bodega
     ESPERA_INICIAL_BARCO = 5,
     ESPERA_MAXIMA = 60,
     ESPERA_PROMPT = 0.3,
     ESPERA_ENTRE_RONDAS = 2,
+    ESPERA_VENTA = 1.5,
     NOMBRE_BARCO_MANUAL = "",         -- nombre exacto de tu barco si lo sabes
     NOMBRES_DEPOSITO = { "Deposit", "Store", "Sell", "Guardar", "Vender" },
-    MAX_APERTURAS = 20,               -- tope de intentos al abrir cofres guardados
+    MAX_APERTURAS = 20,
     PAUSA_APERTURA = 0.6,
+
+    -- Tasador / broker
+    POSICION_TASADOR = Vector3.new(-103.35, 8.2, -38.08),
+    RUTA_PROMPT_TASADOR = {
+        "World", "Dynamic", "NPCs", "NPC_StarterPort_Broker",
+        "HumanoidRootPart", "NPCPrompt_1", "NPCPrompt",
+    },
 }
 
 ---------------------------------------------------------------
@@ -38,11 +47,13 @@ local running = true
 local closed = false
 local mode = CONFIG.MODO_INICIAL
 local grabChests = CONFIG.AGARRAR_INICIAL
+local sellChestsEnabled = CONFIG.VENDER_INICIAL
 local waitInBoat = CONFIG.ESPERA_INICIAL_BARCO
 local holdFullManual = false
 local cachedShip = nil
 local collectedCount = 0
 local openedCount = 0
+local soldCount = 0
 local statusText = "Listo"
 
 local refreshUI
@@ -169,8 +180,6 @@ end
 
 ---------------------------------------------------------------
 -- ESTADO DE LA BODEGA
--- Busca en el HUD un texto tipo "12/12" relacionado con el barco.
--- Si no lo detecta, usa el botón manual "Vaciar".
 ---------------------------------------------------------------
 local function isHoldFull()
     if holdFullManual then return true end
@@ -195,7 +204,7 @@ local function isHoldFull()
 end
 
 ---------------------------------------------------------------
--- ABRIR COFRES GUARDADOS (remotes de la captura)
+-- ABRIR COFRES GUARDADOS
 ---------------------------------------------------------------
 local function openStoredTreasures()
     statusText = "Bodega llena: abriendo cofres..."
@@ -228,8 +237,39 @@ local function openStoredTreasures()
     end
 
     holdFullManual = false
-    statusText = "Bodega vacía, volviendo a buscar cofres"
+end
+
+---------------------------------------------------------------
+-- VENDER EN EL TASADOR
+---------------------------------------------------------------
+local function getSellPrompt()
+    local node = Workspace
+    for _, name in ipairs(CONFIG.RUTA_PROMPT_TASADOR) do
+        node = node and node:FindFirstChild(name)
+    end
+    if node and node:IsA("ProximityPrompt") then
+        return node
+    end
+    return nil
+end
+
+local function sellChests()
+    statusText = "Yendo al tasador..."
     refreshUI()
+    moveTo(CONFIG.POSICION_TASADOR + Vector3.new(0, 3, 0))
+
+    local prompt = getSellPrompt()
+    if not prompt then
+        statusText = "No encuentro el tasador"
+        refreshUI()
+        return
+    end
+
+    statusText = "Vendiendo cofres..."
+    refreshUI()
+    pcall(fireproximityprompt, prompt)
+    task.wait(CONFIG.ESPERA_VENTA)
+    soldCount += 1
 end
 
 ---------------------------------------------------------------
@@ -289,7 +329,12 @@ local function goToShipAndOpen()
         refreshUI()
         moveTo(getShipPosition(ship))
     end
+
     openStoredTreasures()
+
+    if sellChestsEnabled and running and not closed then
+        sellChests()
+    end
 end
 
 local function collectRound()
@@ -427,12 +472,11 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal (base 260x320, se escala según la pantalla)
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.new(0, 260, 0, 320)
+main.Size = UDim2.new(0, 260, 0, 330)
 main.BackgroundColor3 = PALETTE.bg
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -505,7 +549,7 @@ makeLabel(statCard, "RECOGIDOS", 10, PALETTE.muted, true, 0, 14).Position = UDim
 local countLabel = Instance.new("TextLabel")
 countLabel.BackgroundTransparency = 1
 countLabel.Position = UDim2.new(0, 12, 0, 20)
-countLabel.Size = UDim2.new(0.5, -12, 0, 26)
+countLabel.Size = UDim2.new(0.33, -12, 0, 26)
 countLabel.Text = "0"
 countLabel.TextSize = 20
 countLabel.TextColor3 = PALETTE.green
@@ -513,17 +557,29 @@ countLabel.Font = Enum.Font.GothamBold
 countLabel.TextXAlignment = Enum.TextXAlignment.Left
 countLabel.Parent = statCard
 
-makeLabel(statCard, "ABIERTOS", 10, PALETTE.muted, true, 0, 14).Position = UDim2.new(0.5, 0, 0, 8)
+makeLabel(statCard, "ABIERTOS", 10, PALETTE.muted, true, 0, 14).Position = UDim2.new(0.33, 0, 0, 8)
 local openedLabel = Instance.new("TextLabel")
 openedLabel.BackgroundTransparency = 1
-openedLabel.Position = UDim2.new(0.5, 0, 0, 20)
-openedLabel.Size = UDim2.new(0.5, -12, 0, 26)
+openedLabel.Position = UDim2.new(0.33, 0, 0, 20)
+openedLabel.Size = UDim2.new(0.33, -12, 0, 26)
 openedLabel.Text = "0"
 openedLabel.TextSize = 20
 openedLabel.TextColor3 = PALETTE.accent
 openedLabel.Font = Enum.Font.GothamBold
 openedLabel.TextXAlignment = Enum.TextXAlignment.Left
 openedLabel.Parent = statCard
+
+makeLabel(statCard, "VENDIDOS", 10, PALETTE.muted, true, 0, 14).Position = UDim2.new(0.66, 0, 0, 8)
+local soldLabel = Instance.new("TextLabel")
+soldLabel.BackgroundTransparency = 1
+soldLabel.Position = UDim2.new(0.66, 0, 0, 20)
+soldLabel.Size = UDim2.new(0.34, -12, 0, 26)
+soldLabel.Text = "0"
+soldLabel.TextSize = 20
+soldLabel.TextColor3 = PALETTE.orange
+soldLabel.Font = Enum.Font.GothamBold
+soldLabel.TextXAlignment = Enum.TextXAlignment.Left
+soldLabel.Parent = statCard
 
 -- Modo de viaje
 local modeRow = Instance.new("Frame")
@@ -540,7 +596,7 @@ modeLayout.Parent = modeRow
 local tpBtn = makeButton(modeRow, "⚡ TP", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 1)
 local glideBtn = makeButton(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 2)
 
--- Opciones: agarrar cofre / vaciar bodega manual
+-- Opciones: agarrar / vaciar / vender
 local optRow = Instance.new("Frame")
 optRow.Size = UDim2.new(1, 0, 0, 36)
 optRow.BackgroundTransparency = 1
@@ -549,11 +605,12 @@ optRow.Parent = body
 
 local optLayout = Instance.new("UIListLayout")
 optLayout.FillDirection = Enum.FillDirection.Horizontal
-optLayout.Padding = UDim.new(0, 6)
+optLayout.Padding = UDim.new(0, 5)
 optLayout.Parent = optRow
 
-local grabBtn = makeButton(optRow, "🎒 Agarrar", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 1)
-local emptyBtn = makeButton(optRow, "📦 Vaciar", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 2)
+local grabBtn = makeButton(optRow, "🎒 Agarrar", UDim2.new(0.333, -4, 1, 0), PALETTE.card, 1)
+local emptyBtn = makeButton(optRow, "📦 Vaciar", UDim2.new(0.333, -4, 1, 0), PALETTE.card, 2)
+local sellBtn = makeButton(optRow, "💰 Vender", UDim2.new(0.333, -4, 1, 0), PALETTE.card, 3)
 
 -- Espera en el barco
 local waitRow = Instance.new("Frame")
@@ -594,7 +651,6 @@ miniScale.Parent = mini
 makeDraggable(header, main)
 makeDraggable(mini, mini)
 
--- Escala según pantalla (vertical u horizontal)
 local camera = Workspace.CurrentCamera
 local function updateScale()
     local vp = camera.ViewportSize
@@ -612,13 +668,14 @@ refreshUI = function()
     subtitleLabel.Text = statusText
     countLabel.Text = tostring(collectedCount)
     openedLabel.Text = tostring(openedCount)
+    soldLabel.Text = tostring(soldCount)
     waitLabel.Text = "Espera barco: " .. waitInBoat .. " s"
 
     tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
     glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
     grabBtn.BackgroundColor3 = grabChests and PALETTE.green or PALETTE.card
-    grabBtn.Text = grabChests and "🎒 Agarrar: ON" or "🎒 Agarrar: OFF"
     emptyBtn.BackgroundColor3 = holdFullManual and PALETTE.orange or PALETTE.card
+    sellBtn.BackgroundColor3 = sellChestsEnabled and PALETTE.green or PALETTE.card
 
     toggleBtn.Text = running and "⏸  Pausar" or "▶  Reanudar"
     toggleBtn.BackgroundColor3 = running and PALETTE.green or PALETTE.orange
@@ -638,6 +695,11 @@ end)
 emptyBtn.Activated:Connect(function()
     holdFullManual = not holdFullManual
     statusText = holdFullManual and "Se vaciará la bodega en el próximo ciclo" or statusText
+    refreshUI()
+end)
+
+sellBtn.Activated:Connect(function()
+    sellChestsEnabled = not sellChestsEnabled
     refreshUI()
 end)
 
