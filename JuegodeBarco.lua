@@ -1,4 +1,4 @@
--- Recolección de cofres + barco + tesorero + isla (Ser pirata, Móvil)
+-- Recolección de cofres + barco + tesorero + isla + filtros (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -74,8 +74,8 @@ local CONFIG = {
     RADIO_ISLA_SIN_CAJA = 250,
     MODO_INICIAL = "TP",
     VELOCIDAD_DESLIZAR = 45,
-    CAPACIDAD_INICIAL = 81,
-    CAPACIDAD_MAX = 81,
+    CAPACIDAD_INICIAL = 5,
+    CAPACIDAD_MAX = 50,
     ESPERA_BARCO_INICIAL = 5,
     ESPERA_BARCO_MAX = 60,
     ESPERA_RECOGER = 0.3,
@@ -87,10 +87,19 @@ local CONFIG = {
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
 
+    -- Filtros por valor y rareza
+    VALOR_FILTRO_INICIAL = false,
+    VALOR_MIN_INICIAL = 10000,
+    VALOR_PASO = 1000,
+    RAREZA_FILTRO_INICIAL = false,
+    RAREZA_MIN_INICIAL = 3,                 -- índice en RAREZAS (3 = Rare)
+    -- Orden de menor a mayor. Edita o agrega nombres según veas en el juego.
+    RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine" },
+
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
-    PANEL_MIN_ANCHO = 100,
-    PANEL_MIN_ALTO = 10,
+    PANEL_MIN_ANCHO = 180,
+    PANEL_MIN_ALTO = 240,
     PANEL_MAX = 3000,
     PANEL_PASOS = { 5, 10, 20, 50 },
     PANEL_PASO_INICIAL = 3,
@@ -99,9 +108,7 @@ local CONFIG = {
     DEBUG = true,
 }
 
--- Diseño base del contenido; todo se escala a partir de este tamaño
 local BASE_W, BASE_H = 300, 470
-
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
 
 ---------------------------------------------------------------
@@ -160,7 +167,7 @@ local function getRemote(name)
 end
 
 local function norm(s)
-    return string.lower((string.gsub(s, "%s", "")))
+    return string.lower((string.gsub(tostring(s), "%s", "")))
 end
 
 local function dbg(...)
@@ -168,9 +175,9 @@ local function dbg(...)
 end
 
 ---------------------------------------------------------------
--- ESTADO (los valores guardados reemplazan los de CONFIG)
+-- ESTADO
 ---------------------------------------------------------------
-local auto = CONFIG.AUTO_INICIAL
+local auto = false
 local returnToSpot = svb("returnToSpot", CONFIG.VOLVER_INICIAL)
 local onlyOthers = svb("onlyOthers", CONFIG.SOLO_OTROS_INICIAL)
 local islandMode = svb("islandMode", CONFIG.ISLA_INICIAL)
@@ -186,6 +193,12 @@ local panelW = svn("panelW", CONFIG.PANEL_ANCHO_INICIAL)
 local panelH = svn("panelH", CONFIG.PANEL_ALTO_INICIAL)
 local panelStepIdx = math.clamp(math.floor(svn("panelStepIdx", CONFIG.PANEL_PASO_INICIAL)), 1, #CONFIG.PANEL_PASOS)
 
+-- Filtros
+local valueFilter = svb("valueFilter", CONFIG.VALOR_FILTRO_INICIAL)
+local valueMin = math.max(0, math.floor(svn("valueMin", CONFIG.VALOR_MIN_INICIAL)))
+local rarityFilter = svb("rarityFilter", CONFIG.RAREZA_FILTRO_INICIAL)
+local rarityMinIdx = math.clamp(math.floor(svn("rarityMinIdx", CONFIG.RAREZA_MIN_INICIAL)), 1, #CONFIG.RAREZAS)
+
 local collectedCount = 0
 local openedCount = 0
 local statusText = "Listo"
@@ -200,7 +213,6 @@ local function markDirty()
     dirty = true
 end
 
--- Guarda solo la configuración (no guarda el estado de recolección automática)
 local function saveConfig()
     if not writefile then return end
     local data = {
@@ -215,6 +227,10 @@ local function saveConfig()
         panelW = panelW,
         panelH = panelH,
         panelStepIdx = panelStepIdx,
+        valueFilter = valueFilter,
+        valueMin = valueMin,
+        rarityFilter = rarityFilter,
+        rarityMinIdx = rarityMinIdx,
     }
     pcall(function()
         writefile(CONFIG.CONFIG_ARCHIVO, HttpService:JSONEncode(data))
@@ -236,18 +252,53 @@ local function currentIslandName()
 end
 
 ---------------------------------------------------------------
--- ESPACIO (CargoSize)
+-- PROPIEDADES DEL COFRE (CargoSize, Value, Rarity)
+-- Se leen como atributo o como objeto hijo (NumberValue, StringValue, etc.)
 ---------------------------------------------------------------
+local function getChestProp(obj, name)
+    local v = obj:GetAttribute(name)
+    if v == nil then
+        local child = obj:FindFirstChild(name)
+        if child and child:IsA("ValueBase") then
+            v = child.Value
+        end
+    end
+    return v
+end
+
 local function getCargoSize(obj)
-    local v = obj:GetAttribute("CargoSize")
-    if v ~= nil then
-        return tonumber(v) or CONFIG.TAMANO_POR_DEFECTO
+    local v = tonumber(getChestProp(obj, "CargoSize"))
+    return v or CONFIG.TAMANO_POR_DEFECTO
+end
+
+---------------------------------------------------------------
+-- FILTROS DE VALOR Y RAREZA
+---------------------------------------------------------------
+local function rarityIndex(r)
+    if r == nil then return nil end
+    local n = norm(r)
+    for i, name in ipairs(CONFIG.RAREZAS) do
+        if norm(name) == n then
+            return i
+        end
     end
-    local child = obj:FindFirstChild("CargoSize")
-    if child and (child:IsA("NumberValue") or child:IsA("IntValue")) then
-        return child.Value
+    return nil
+end
+
+local function passesValueRarity(chest)
+    if valueFilter then
+        local v = tonumber(getChestProp(chest, "Value"))
+        if not v or v < valueMin then
+            return false
+        end
     end
-    return CONFIG.TAMANO_POR_DEFECTO
+    if rarityFilter then
+        local idx = rarityIndex(getChestProp(chest, "Rarity"))
+        if not idx or idx < rarityMinIdx then
+            return false
+        end
+    end
+    return true
 end
 
 ---------------------------------------------------------------
@@ -624,7 +675,11 @@ local function collectCycle()
 
         local inIsland = (not island) or (base ~= nil and isInsideIsland(island, base.Position))
 
-        if base and prompt and prompt:IsA("ProximityPrompt") and inIsland and passesOwnerFilter(item) then
+        if base and prompt and prompt:IsA("ProximityPrompt")
+            and inIsland
+            and passesOwnerFilter(item)
+            and passesValueRarity(item) then
+
             local size = getCargoSize(item)
 
             if size > capacity then
@@ -839,20 +894,22 @@ local function stepperRow(parent, order, getText, onMinus, onPlus)
     return { refresh = function() lbl.Text = getText() end }
 end
 
-local function sizeRow(parent, order, name, getVal, setVal, getStep)
+-- Caja escribible con − y +; sirve para tamaños y para el valor mínimo
+local function numberRow(parent, order, name, getVal, setVal, getStep, boxWidth)
     local row = rowFrame(parent, order)
+    boxWidth = boxWidth or 64
 
     local lbl = label(row, name, 12, PALETTE.text, true)
     lbl.Position = UDim2.new(0, 10, 0, 0)
-    lbl.Size = UDim2.new(0.35, 0, 1, 0)
+    lbl.Size = UDim2.new(1, -(boxWidth + 90), 1, 0)
 
     local minus = button(row, "−", UDim2.fromOffset(30, 28), PALETTE.track)
-    minus.Position = UDim2.new(1, -142, 0.5, -14)
+    minus.Position = UDim2.new(1, -(boxWidth + 76), 0.5, -14)
     minus.TextSize = 16
 
     local box = Instance.new("TextBox")
-    box.Size = UDim2.fromOffset(56, 28)
-    box.Position = UDim2.new(1, -108, 0.5, -14)
+    box.Size = UDim2.fromOffset(boxWidth, 28)
+    box.Position = UDim2.new(1, -(boxWidth + 42), 0.5, -14)
     box.BackgroundColor3 = PALETTE.bg
     box.BorderSizePixel = 0
     box.TextColor3 = PALETTE.text
@@ -864,7 +921,7 @@ local function sizeRow(parent, order, name, getVal, setVal, getStep)
     corner(box, 6)
 
     local plus = button(row, "+", UDim2.fromOffset(30, 28), PALETTE.track)
-    plus.Position = UDim2.new(1, -44, 0.5, -14)
+    plus.Position = UDim2.new(1, -38, 0.5, -14)
     plus.TextSize = 16
 
     minus.Activated:Connect(function()
@@ -929,7 +986,6 @@ main.Parent = gui
 corner(main, 16)
 stroke(main, PALETTE.accent, 1, 0.5)
 
--- Contenido: diseño base que se escala y llena el panel completo
 local content = Instance.new("Frame")
 content.Name = "Content"
 content.Position = UDim2.new(0, 0, 0, 0)
@@ -939,7 +995,6 @@ content.Parent = main
 local contentScale = Instance.new("UIScale")
 contentScale.Parent = content
 
--- Ajusta el panel y el contenido para que no quede espacio vacío
 local function applyPanelSize()
     panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, CONFIG.PANEL_MAX)
     panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, CONFIG.PANEL_MAX)
@@ -947,8 +1002,6 @@ local function applyPanelSize()
 
     local s = math.min(panelW / BASE_W, panelH / BASE_H)
     contentScale.Scale = s
-
-    -- El área de diseño se calcula para que, al escalarse, ocupe el panel entero
     content.Size = UDim2.fromOffset(panelW / s, panelH / s)
 end
 
@@ -1012,23 +1065,24 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 corner(barFill, 3)
 
--- Pestañas
+-- Pestañas (5)
 local tabRow = Instance.new("Frame")
 tabRow.Position = UDim2.new(0, 10, 0, 110)
 tabRow.Size = UDim2.new(1, -20, 0, 30)
 tabRow.BackgroundTransparency = 1
 tabRow.Parent = content
-listLayout(tabRow, 4, true)
+listLayout(tabRow, 3, true)
 
-local tabNames = { "Cofres", "Isla", "Bóveda", "Panel" }
+local tabNames = { "Cofres", "Isla", "Bóveda", "Filtros", "Panel" }
 local tabButtons = {}
 for i, name in ipairs(tabNames) do
-    local b = button(tabRow, name, UDim2.new(0.25, -3, 1, 0), PALETTE.card)
+    local b = button(tabRow, name, UDim2.new(0.2, -3, 1, 0), PALETTE.card)
+    b.TextSize = 11
     b.LayoutOrder = i
     tabButtons[i] = b
 end
 
--- Área de páginas: ocupa todo lo que queda del panel
+-- Área de páginas
 local pageArea = Instance.new("Frame")
 pageArea.Position = UDim2.new(0, 10, 0, 148)
 pageArea.Size = UDim2.new(1, -20, 1, -158)
@@ -1056,6 +1110,7 @@ end
 local pageCofres = newPage()
 local pageIsla = newPage()
 local pageBoveda = newPage()
+local pageFiltros = newPage()
 local pagePanel = newPage()
 
 local function showTab(index)
@@ -1202,6 +1257,56 @@ emptyBtn.Activated:Connect(function()
 end)
 
 ---------------------------------------------------------------
+-- PESTAÑA FILTROS
+---------------------------------------------------------------
+checkRow(pageFiltros, "Filtrar por valor (Value)", 1, valueFilter, function(v)
+    valueFilter = v
+    markDirty()
+    setStatus(v and ("Solo cofres con valor ≥ " .. valueMin) or "Filtro de valor apagado")
+end)
+
+local valueRow = numberRow(pageFiltros, 2, "Valor mín.",
+    function() return valueMin end,
+    function(v)
+        valueMin = math.max(0, v)
+        markDirty()
+        refreshUI()
+    end,
+    function() return CONFIG.VALOR_PASO end,
+    78
+)
+
+checkRow(pageFiltros, "Filtrar por rareza (Rarity)", 3, rarityFilter, function(v)
+    rarityFilter = v
+    markDirty()
+    setStatus(v and ("Solo cofres desde " .. CONFIG.RAREZAS[rarityMinIdx]) or "Filtro de rareza apagado")
+end)
+
+local rarityRow = arrowRow(pageFiltros, 4,
+    function()
+        return "Mínima: " .. CONFIG.RAREZAS[rarityMinIdx] .. " (" .. rarityMinIdx .. "/" .. #CONFIG.RAREZAS .. ")"
+    end,
+    function()
+        rarityMinIdx = rarityMinIdx - 1
+        if rarityMinIdx < 1 then rarityMinIdx = #CONFIG.RAREZAS end
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        rarityMinIdx = rarityMinIdx + 1
+        if rarityMinIdx > #CONFIG.RAREZAS then rarityMinIdx = 1 end
+        markDirty()
+        refreshUI()
+    end
+)
+
+local filterNote = label(pageFiltros, "", 10, PALETTE.muted, false)
+filterNote.LayoutOrder = 5
+filterNote.Size = UDim2.new(1, -4, 0, 44)
+filterNote.TextWrapped = true
+filterNote.TextYAlignment = Enum.TextYAlignment.Top
+
+---------------------------------------------------------------
 -- PESTAÑA PANEL
 ---------------------------------------------------------------
 local function currentStep()
@@ -1222,16 +1327,18 @@ local function setPanelH(v)
     refreshUI()
 end
 
-local widthRow = sizeRow(pagePanel, 1, "Ancho",
+local widthRow = numberRow(pagePanel, 1, "Ancho",
     function() return panelW end,
     setPanelW,
-    currentStep
+    currentStep,
+    64
 )
 
-local heightRow = sizeRow(pagePanel, 2, "Alto",
+local heightRow = numberRow(pagePanel, 2, "Alto",
     function() return panelH end,
     setPanelH,
-    currentStep
+    currentStep,
+    64
 )
 
 local stepSelector = arrowRow(pagePanel, 3,
@@ -1268,7 +1375,7 @@ panelNote.Size = UDim2.new(1, -4, 0, 40)
 panelNote.TextWrapped = true
 panelNote.TextYAlignment = Enum.TextYAlignment.Top
 
--- Minimizado (cuadrado)
+-- Minimizado
 local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
 mini.TextSize = 20
 mini.Visible = false
@@ -1301,6 +1408,13 @@ refreshUI = function()
 
     capStepper.refresh()
     vaultInfo.Text = "Guardados: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
+
+    valueRow.refresh()
+    rarityRow.refresh()
+    filterNote.Text = "Valor: recoge cofres con Value ≥ " .. valueMin
+        .. (valueFilter and " (activo)" or " (apagado)")
+        .. ". Rareza: desde " .. CONFIG.RAREZAS[rarityMinIdx]
+        .. (rarityFilter and " (activo)" or " (apagado)") .. "."
 
     widthRow.refresh()
     heightRow.refresh()
