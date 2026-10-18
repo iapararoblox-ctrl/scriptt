@@ -7,7 +7,6 @@ local LocalPlayer = Players.LocalPlayer
 
 ---------------------------------------------------------------
 -- ISLAS POR DIFICULTAD
--- Cada isla tiene nombres posibles; el primero se muestra
 ---------------------------------------------------------------
 local function I(...) return { ... } end
 
@@ -105,7 +104,6 @@ local function getTreasureFolder()
     return dyn and dyn:FindFirstChild("Treasure")
 end
 
--- Carpetas raíz donde pueden estar las islas
 local function getIslandRoots()
     local roots = {}
     local world = Workspace:FindFirstChild("World")
@@ -228,8 +226,6 @@ local function isModelOrPart(obj)
     return obj and (obj:IsA("Model") or obj:IsA("BasePart"))
 end
 
--- Busca la isla por cualquiera de sus nombres dentro de World.Islands
--- (incluye subcarpetas como Calm, Abyssal, etc.). Si no la encuentra, busca en todo el Workspace.
 local function getIsland(entry)
     local key = entry[1]
     local cached = islandCache[key]
@@ -278,7 +274,6 @@ local function getIsland(entry)
     return found
 end
 
--- true si la posición está dentro de la caja de la isla (con margen)
 local function isInsideIsland(island, pos)
     if island:IsA("Model") then
         local cf, size = island:GetBoundingBox()
@@ -595,7 +590,7 @@ local function collectCycle()
 end
 
 ---------------------------------------------------------------
--- UI
+-- UI (compacta, se ajusta a la pantalla del teléfono)
 ---------------------------------------------------------------
 local PALETTE = {
     bg = Color3.fromRGB(18, 20, 28),
@@ -603,13 +598,13 @@ local PALETTE = {
     track = Color3.fromRGB(46, 50, 68),
     accent = Color3.fromRGB(110, 150, 255),
     green = Color3.fromRGB(80, 200, 130),
-    orange = Color3.fromRGB(245, 160, 60),
     red = Color3.fromRGB(225, 85, 95),
     text = Color3.fromRGB(240, 242, 250),
     muted = Color3.fromRGB(140, 146, 170),
 }
 
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local camera = Workspace.CurrentCamera or Workspace:WaitForChild("CurrentCamera")
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "CofresUI"
@@ -650,23 +645,27 @@ local function button(parent, text, size, color)
     b.BackgroundColor3 = color
     b.Text = text
     b.TextColor3 = PALETTE.text
-    b.TextSize = 13
+    b.TextSize = 12
     b.Font = Enum.Font.GothamBold
     b.AutoButtonColor = true
     b.BorderSizePixel = 0
     b.Parent = parent
-    corner(b, 10)
+    corner(b, 8)
     return b
 end
 
+-- Tarjeta: altura fija si se pasa, si no crece con su contenido
 local function card(parent, order, height)
     local f = Instance.new("Frame")
-    f.Size = UDim2.new(1, 0, 0, height)
+    f.Size = height and UDim2.new(1, 0, 0, height) or UDim2.new(1, 0, 0, 0)
+    if not height then
+        f.AutomaticSize = Enum.AutomaticSize.Y
+    end
     f.BackgroundColor3 = PALETTE.card
     f.BorderSizePixel = 0
     f.LayoutOrder = order
     f.Parent = parent
-    corner(f, 14)
+    corner(f, 12)
     return f
 end
 
@@ -687,27 +686,28 @@ local function listLayout(parent, padding)
     return l
 end
 
+-- Casilla de activado / desactivado
 local function checkRow(parent, text, order, initial, onChange)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, 0, 0, 36)
+    row.Size = UDim2.new(1, 0, 0, 30)
     row.BackgroundTransparency = 1
     row.Text = ""
     row.AutoButtonColor = false
     row.LayoutOrder = order
     row.Parent = parent
 
-    local lbl = label(row, text, 13, PALETTE.text, false)
-    lbl.Size = UDim2.new(1, -40, 1, 0)
+    local lbl = label(row, text, 12, PALETTE.text, false)
+    lbl.Size = UDim2.new(1, -34, 1, 0)
 
     local box = Instance.new("Frame")
-    box.Size = UDim2.new(0, 22, 0, 22)
-    box.Position = UDim2.new(1, -22, 0.5, -11)
+    box.Size = UDim2.new(0, 18, 0, 18)
+    box.Position = UDim2.new(1, -18, 0.5, -9)
     box.BorderSizePixel = 0
     box.Parent = row
-    corner(box, 6)
-    stroke(box, PALETTE.muted, 1.2, 0.2)
+    corner(box, 5)
+    stroke(box, PALETTE.muted, 1, 0.2)
 
-    local tick = label(box, "✓", 15, PALETTE.text, true)
+    local tick = label(box, "✓", 13, PALETTE.text, true)
     tick.Size = UDim2.new(1, 0, 1, 0)
     tick.TextXAlignment = Enum.TextXAlignment.Center
 
@@ -727,25 +727,26 @@ local function checkRow(parent, text, order, initial, onChange)
     return { set = function(v) state = v; paint() end }
 end
 
+-- ◀ texto ▶
 local function arrowRow(parent, order, getText, onPrev, onNext)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 40)
+    row.Size = UDim2.new(1, 0, 0, 32)
     row.BackgroundTransparency = 1
     row.LayoutOrder = order
     row.Parent = parent
 
-    local prev = button(row, "◀", UDim2.new(0, 40, 0, 34), PALETTE.track)
-    prev.Position = UDim2.new(0, 0, 0.5, -17)
-    prev.TextSize = 16
+    local prev = button(row, "◀", UDim2.new(0, 34, 0, 30), PALETTE.track)
+    prev.Position = UDim2.new(0, 0, 0.5, -15)
+    prev.TextSize = 14
 
-    local nxt = button(row, "▶", UDim2.new(0, 40, 0, 34), PALETTE.track)
-    nxt.Position = UDim2.new(1, -40, 0.5, -17)
-    nxt.TextSize = 16
+    local nxt = button(row, "▶", UDim2.new(0, 34, 0, 30), PALETTE.track)
+    nxt.Position = UDim2.new(1, -34, 0.5, -15)
+    nxt.TextSize = 14
 
-    local lbl = label(row, "", 13, PALETTE.text, true)
+    local lbl = label(row, "", 12, PALETTE.text, true)
     lbl.TextXAlignment = Enum.TextXAlignment.Center
-    lbl.Size = UDim2.new(1, -96, 1, 0)
-    lbl.Position = UDim2.new(0, 48, 0, 0)
+    lbl.Size = UDim2.new(1, -76, 1, 0)
+    lbl.Position = UDim2.new(0, 39, 0, 0)
     lbl.TextTruncate = Enum.TextTruncate.AtEnd
 
     prev.Activated:Connect(onPrev)
@@ -754,23 +755,24 @@ local function arrowRow(parent, order, getText, onPrev, onNext)
     return { refresh = function() lbl.Text = getText() end }
 end
 
+-- − valor +
 local function stepperRow(parent, order, getText, onMinus, onPlus)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 40)
+    row.Size = UDim2.new(1, 0, 0, 32)
     row.BackgroundTransparency = 1
     row.LayoutOrder = order
     row.Parent = parent
 
-    local lbl = label(row, "", 13, PALETTE.text, true)
-    lbl.Size = UDim2.new(1, -96, 1, 0)
+    local lbl = label(row, "", 12, PALETTE.text, true)
+    lbl.Size = UDim2.new(1, -76, 1, 0)
 
-    local minus = button(row, "−", UDim2.new(0, 36, 0, 34), PALETTE.track)
-    minus.Position = UDim2.new(1, -84, 0.5, -17)
-    minus.TextSize = 18
+    local minus = button(row, "−", UDim2.new(0, 32, 0, 30), PALETTE.track)
+    minus.Position = UDim2.new(1, -72, 0.5, -15)
+    minus.TextSize = 16
 
-    local plus = button(row, "+", UDim2.new(0, 36, 0, 34), PALETTE.track)
-    plus.Position = UDim2.new(1, -40, 0.5, -17)
-    plus.TextSize = 18
+    local plus = button(row, "+", UDim2.new(0, 32, 0, 30), PALETTE.track)
+    plus.Position = UDim2.new(1, -36, 0.5, -15)
+    plus.TextSize = 16
 
     minus.Activated:Connect(onMinus)
     plus.Activated:Connect(onPlus)
@@ -805,42 +807,51 @@ local function makeDraggable(handle, frame)
     end)
 end
 
+-- Panel principal: se ajusta al tamaño de la pantalla
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.new(0, 280, 0, 470)
+main.Size = UDim2.fromOffset(260, 400)
 main.BackgroundColor3 = PALETTE.bg
 main.BorderSizePixel = 0
 main.Parent = gui
-corner(main, 18)
-stroke(main, PALETTE.accent, 1.2, 0.5)
+corner(main, 16)
+stroke(main, PALETTE.accent, 1, 0.5)
 
-local mainScale = Instance.new("UIScale")
-mainScale.Parent = main
+local function fitToScreen()
+    local vp = camera.ViewportSize
+    local w = math.min(270, vp.X - 20)
+    local h = math.min(440, vp.Y - 30)
+    main.Size = UDim2.fromOffset(math.max(w, 200), math.max(h, 200))
+end
+fitToScreen()
+camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitToScreen)
 
+-- Cabecera
 local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 52)
+header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
 header.Parent = main
 
-local title = label(header, "Cofres", 17, PALETTE.text, true)
-title.Position = UDim2.new(0, 16, 0, 8)
-title.Size = UDim2.new(1, -110, 0, 22)
+local title = label(header, "Cofres", 15, PALETTE.text, true)
+title.Position = UDim2.new(0, 14, 0, 6)
+title.Size = UDim2.new(1, -100, 0, 18)
 
-local subtitle = label(header, statusText, 11, PALETTE.muted, false)
-subtitle.Position = UDim2.new(0, 16, 0, 30)
-subtitle.Size = UDim2.new(1, -110, 0, 14)
+local subtitle = label(header, statusText, 10, PALETTE.muted, false)
+subtitle.Position = UDim2.new(0, 14, 0, 24)
+subtitle.Size = UDim2.new(1, -100, 0, 14)
 subtitle.TextTruncate = Enum.TextTruncate.AtEnd
 
-local minBtn = button(header, "—", UDim2.new(0, 34, 0, 34), PALETTE.card)
-minBtn.Position = UDim2.new(1, -80, 0, 9)
-local closeBtn = button(header, "✕", UDim2.new(0, 34, 0, 34), PALETTE.red)
-closeBtn.Position = UDim2.new(1, -40, 0, 9)
+local minBtn = button(header, "—", UDim2.new(0, 30, 0, 30), PALETTE.card)
+minBtn.Position = UDim2.new(1, -72, 0, 7)
+local closeBtn = button(header, "✕", UDim2.new(0, 30, 0, 30), PALETTE.red)
+closeBtn.Position = UDim2.new(1, -36, 0, 7)
 
+-- Cuerpo desplazable (si algo no cabe, se puede bajar)
 local body = Instance.new("ScrollingFrame")
-body.Position = UDim2.new(0, 0, 0, 52)
-body.Size = UDim2.new(1, 0, 1, -52)
+body.Position = UDim2.new(0, 0, 0, 44)
+body.Size = UDim2.new(1, 0, 1, -44)
 body.BackgroundTransparency = 1
 body.BorderSizePixel = 0
 body.ScrollBarThickness = 3
@@ -849,37 +860,37 @@ body.CanvasSize = UDim2.new(0, 0, 0, 0)
 body.AutomaticCanvasSize = Enum.AutomaticSize.Y
 body.Parent = main
 
-listLayout(body, 10)
+listLayout(body, 8)
 local bodyPad = Instance.new("UIPadding")
-bodyPad.PaddingLeft = UDim.new(0, 14)
-bodyPad.PaddingRight = UDim.new(0, 14)
-bodyPad.PaddingTop = UDim.new(0, 2)
-bodyPad.PaddingBottom = UDim.new(0, 12)
+bodyPad.PaddingLeft = UDim.new(0, 10)
+bodyPad.PaddingRight = UDim.new(0, 10)
+bodyPad.PaddingBottom = UDim.new(0, 10)
 bodyPad.Parent = body
 
-local statCard = card(body, 1, 62)
-local recLbl = label(statCard, "RECOGIDOS", 10, PALETTE.muted, true)
-recLbl.Position = UDim2.new(0, 14, 0, 9)
-recLbl.Size = UDim2.new(0.5, -14, 0, 14)
+-- Estadísticas + barra
+local statCard = card(body, 1, 56)
+local recLbl = label(statCard, "RECOGIDOS", 9, PALETTE.muted, true)
+recLbl.Position = UDim2.new(0, 12, 0, 7)
+recLbl.Size = UDim2.new(0.5, -12, 0, 12)
 
-local countLabel = label(statCard, "0", 20, PALETTE.green, true)
-countLabel.Position = UDim2.new(0, 14, 0, 24)
-countLabel.Size = UDim2.new(0.5, -14, 0, 26)
+local countLabel = label(statCard, "0", 18, PALETTE.green, true)
+countLabel.Position = UDim2.new(0, 12, 0, 19)
+countLabel.Size = UDim2.new(0.5, -12, 0, 24)
 
-local spaceLbl = label(statCard, "ESPACIO", 10, PALETTE.muted, true)
-spaceLbl.Position = UDim2.new(0.5, 0, 0, 9)
-spaceLbl.Size = UDim2.new(0.5, -14, 0, 14)
+local spaceLbl = label(statCard, "ESPACIO", 9, PALETTE.muted, true)
+spaceLbl.Position = UDim2.new(0.5, 0, 0, 7)
+spaceLbl.Size = UDim2.new(0.5, -12, 0, 12)
 
-local vaultLabel = label(statCard, "0/0", 20, PALETTE.accent, true)
-vaultLabel.Position = UDim2.new(0.5, 0, 0, 24)
-vaultLabel.Size = UDim2.new(0.5, -14, 0, 26)
+local vaultLabel = label(statCard, "0/0", 18, PALETTE.accent, true)
+vaultLabel.Position = UDim2.new(0.5, 0, 0, 19)
+vaultLabel.Size = UDim2.new(0.5, -12, 0, 24)
 
 local barTrack = Instance.new("Frame")
-barTrack.Size = UDim2.new(1, 0, 0, 6)
+barTrack.Size = UDim2.new(1, -24, 0, 5)
+barTrack.Position = UDim2.new(0, 12, 1, -10)
 barTrack.BackgroundColor3 = PALETTE.track
 barTrack.BorderSizePixel = 0
-barTrack.LayoutOrder = 2
-barTrack.Parent = body
+barTrack.Parent = statCard
 corner(barTrack, 3)
 
 local barFill = Instance.new("Frame")
@@ -889,9 +900,10 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 corner(barFill, 3)
 
-local optCard = card(body, 3, 176)
-padCard(optCard, 12)
-listLayout(optCard, 2)
+-- Opciones
+local optCard = card(body, 2)
+padCard(optCard, 10)
+listLayout(optCard, 3)
 
 checkRow(optCard, "Recolección automática", 1, auto, function(v)
     auto = v
@@ -913,13 +925,14 @@ checkRow(optCard, "Recolectar por isla", 4, islandMode, function(v)
     setStatus(v and ("Modo isla: " .. currentIslandName()) or "Modo isla apagado")
 end)
 
-local islandCard = card(body, 4, 112)
-padCard(islandCard, 10)
-listLayout(islandCard, 6)
+-- Selector de isla
+local islandCard = card(body, 3)
+padCard(islandCard, 8)
+listLayout(islandCard, 4)
 
 local diffRow = arrowRow(islandCard, 1,
     function()
-        return ISLAND_GROUPS[diffIndex].nombre .. "  (" .. diffIndex .. "/" .. #ISLAND_GROUPS .. ")"
+        return ISLAND_GROUPS[diffIndex].nombre .. " (" .. diffIndex .. "/" .. #ISLAND_GROUPS .. ")"
     end,
     function()
         diffIndex = diffIndex - 1
@@ -938,7 +951,7 @@ local diffRow = arrowRow(islandCard, 1,
 local islandRow = arrowRow(islandCard, 2,
     function()
         local group = ISLAND_GROUPS[diffIndex]
-        return group.islas[islandIndex][1] .. "  (" .. islandIndex .. "/" .. #group.islas .. ")"
+        return group.islas[islandIndex][1] .. " (" .. islandIndex .. "/" .. #group.islas .. ")"
     end,
     function()
         local count = #ISLAND_GROUPS[diffIndex].islas
@@ -954,9 +967,10 @@ local islandRow = arrowRow(islandCard, 2,
     end
 )
 
-local setCard = card(body, 5, 92)
-padCard(setCard, 10)
-listLayout(setCard, 2)
+-- Ajustes
+local setCard = card(body, 4)
+padCard(setCard, 8)
+listLayout(setCard, 4)
 
 local capStepper = stepperRow(setCard, 1,
     function() return "Espacio de bóveda: " .. capacity end,
@@ -982,39 +996,29 @@ local waitStepper = stepperRow(setCard, 2,
     end
 )
 
+-- Modo de viaje
 local modeRow = Instance.new("Frame")
-modeRow.Size = UDim2.new(1, 0, 0, 38)
+modeRow.Size = UDim2.new(1, 0, 0, 32)
 modeRow.BackgroundTransparency = 1
-modeRow.LayoutOrder = 6
+modeRow.LayoutOrder = 5
 modeRow.Parent = body
 
 local modeList = Instance.new("UIListLayout")
 modeList.FillDirection = Enum.FillDirection.Horizontal
-modeList.Padding = UDim.new(0, 8)
+modeList.Padding = UDim.new(0, 6)
 modeList.Parent = modeRow
 
-local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -4, 1, 0), PALETTE.card)
-local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -4, 1, 0), PALETTE.card)
+local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
 
 makeDraggable(header, main)
 
-local mini = button(gui, "🏴‍☠️", UDim2.new(0, 52, 0, 52), PALETTE.card)
-mini.TextSize = 22
+-- Minimizado (cuadrado)
+local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
+mini.TextSize = 20
 mini.Visible = false
-stroke(mini, PALETTE.accent, 1.2, 0.3)
-local miniScale = Instance.new("UIScale")
-miniScale.Parent = mini
+stroke(mini, PALETTE.accent, 1, 0.3)
 makeDraggable(mini, mini)
-
-local camera = Workspace.CurrentCamera
-local function updateScale()
-    local vp = camera.ViewportSize
-    local s = math.clamp(math.min(vp.X / 360, vp.Y / 520), 0.6, 1)
-    mainScale.Scale = s
-    miniScale.Scale = s
-end
-updateScale()
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
 
 refreshUI = function()
     local used = usedSpace()
