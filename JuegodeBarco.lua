@@ -2,6 +2,7 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 
@@ -64,7 +65,6 @@ local ISLAND_GROUPS = {
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
-    AUTO_INICIAL = false,
     VOLVER_INICIAL = false,
     SOLO_OTROS_INICIAL = false,
     ISLA_INICIAL = false,
@@ -87,22 +87,46 @@ local CONFIG = {
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
 
-    -- Panel (tamaño libre: escribe el valor o usa − +)
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
     PANEL_MIN_ANCHO = 180,
     PANEL_MIN_ALTO = 240,
     PANEL_MAX = 3000,
     PANEL_PASOS = { 5, 10, 20, 50 },
-    PANEL_PASO_INICIAL = 3,          -- índice del paso inicial (3 = 20 px)
+    PANEL_PASO_INICIAL = 3,
 
+    CONFIG_ARCHIVO = "CofresConfig.json",
     DEBUG = true,
 }
 
--- Diseño base del contenido. Todo se escala a partir de este tamaño.
+-- Diseño base del contenido; todo se escala a partir de este tamaño
 local BASE_W, BASE_H = 300, 470
 
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
+
+---------------------------------------------------------------
+-- CARGAR CONFIGURACIÓN GUARDADA
+---------------------------------------------------------------
+local saved = {}
+pcall(function()
+    if readfile and isfile and isfile(CONFIG.CONFIG_ARCHIVO) then
+        local data = HttpService:JSONDecode(readfile(CONFIG.CONFIG_ARCHIVO))
+        if type(data) == "table" then
+            saved = data
+        end
+    end
+end)
+
+local function svn(key, default)
+    return tonumber(saved[key]) or default
+end
+
+local function svb(key, default)
+    if type(saved[key]) == "boolean" then
+        return saved[key]
+    end
+    return default
+end
 
 ---------------------------------------------------------------
 -- RUTAS
@@ -144,20 +168,24 @@ local function dbg(...)
 end
 
 ---------------------------------------------------------------
--- ESTADO
+-- ESTADO (los valores guardados reemplazan los de CONFIG)
 ---------------------------------------------------------------
 local auto = CONFIG.AUTO_INICIAL
-local returnToSpot = CONFIG.VOLVER_INICIAL
-local onlyOthers = CONFIG.SOLO_OTROS_INICIAL
-local islandMode = CONFIG.ISLA_INICIAL
-local diffIndex = CONFIG.DIFICULTAD_INICIAL
-local islandIndex = CONFIG.ISLA_INDEX_INICIAL
-local mode = CONFIG.MODO_INICIAL
-local capacity = CONFIG.CAPACIDAD_INICIAL
-local waitOnBoat = CONFIG.ESPERA_BARCO_INICIAL
-local panelW = CONFIG.PANEL_ANCHO_INICIAL
-local panelH = CONFIG.PANEL_ALTO_INICIAL
-local panelStepIdx = CONFIG.PANEL_PASO_INICIAL
+local returnToSpot = svb("returnToSpot", CONFIG.VOLVER_INICIAL)
+local onlyOthers = svb("onlyOthers", CONFIG.SOLO_OTROS_INICIAL)
+local islandMode = svb("islandMode", CONFIG.ISLA_INICIAL)
+local diffIndex = math.clamp(math.floor(svn("diffIndex", CONFIG.DIFICULTAD_INICIAL)), 1, #ISLAND_GROUPS)
+local islandIndex = math.clamp(
+    math.floor(svn("islandIndex", CONFIG.ISLA_INDEX_INICIAL)),
+    1, #ISLAND_GROUPS[diffIndex].islas
+)
+local mode = saved.mode == "DESLIZAR" and "DESLIZAR" or "TP"
+local capacity = math.clamp(math.floor(svn("capacity", CONFIG.CAPACIDAD_INICIAL)), 1, CONFIG.CAPACIDAD_MAX)
+local waitOnBoat = math.clamp(math.floor(svn("waitOnBoat", CONFIG.ESPERA_BARCO_INICIAL)), 0, CONFIG.ESPERA_BARCO_MAX)
+local panelW = svn("panelW", CONFIG.PANEL_ANCHO_INICIAL)
+local panelH = svn("panelH", CONFIG.PANEL_ALTO_INICIAL)
+local panelStepIdx = math.clamp(math.floor(svn("panelStepIdx", CONFIG.PANEL_PASO_INICIAL)), 1, #CONFIG.PANEL_PASOS)
+
 local collectedCount = 0
 local openedCount = 0
 local statusText = "Listo"
@@ -165,7 +193,33 @@ local cachedShip = nil
 local islandCache = {}
 local manualOpenRequested = false
 local closed = false
+local dirty = false
 local refreshUI
+
+local function markDirty()
+    dirty = true
+end
+
+-- Guarda solo la configuración (no guarda el estado de recolección automática)
+local function saveConfig()
+    if not writefile then return end
+    local data = {
+        returnToSpot = returnToSpot,
+        onlyOthers = onlyOthers,
+        islandMode = islandMode,
+        diffIndex = diffIndex,
+        islandIndex = islandIndex,
+        mode = mode,
+        capacity = capacity,
+        waitOnBoat = waitOnBoat,
+        panelW = panelW,
+        panelH = panelH,
+        panelStepIdx = panelStepIdx,
+    }
+    pcall(function()
+        writefile(CONFIG.CONFIG_ARCHIVO, HttpService:JSONEncode(data))
+    end)
+end
 
 local function setStatus(text)
     statusText = text
@@ -863,7 +917,7 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal: tamaño libre en píxeles
+-- Panel principal
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -875,7 +929,7 @@ main.Parent = gui
 corner(main, 16)
 stroke(main, PALETTE.accent, 1, 0.5)
 
--- Contenido: diseño base que se escala completo (texto, botones, espacios)
+-- Contenido: diseño base que se escala y llena el panel completo
 local content = Instance.new("Frame")
 content.Name = "Content"
 content.Position = UDim2.new(0, 0, 0, 0)
@@ -885,17 +939,16 @@ content.Parent = main
 local contentScale = Instance.new("UIScale")
 contentScale.Parent = content
 
--- Ajusta el panel y escala todo lo de adentro según el tamaño
+-- Ajusta el panel y el contenido para que no quede espacio vacío
 local function applyPanelSize()
     panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, CONFIG.PANEL_MAX)
     panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, CONFIG.PANEL_MAX)
     main.Size = UDim2.fromOffset(panelW, panelH)
 
-    -- Escala uniforme: el texto y los controles crecen o se achican con el panel
     local s = math.min(panelW / BASE_W, panelH / BASE_H)
     contentScale.Scale = s
 
-    -- El área de diseño ocupa exactamente el panel después de escalar
+    -- El área de diseño se calcula para que, al escalarse, ocupe el panel entero
     content.Size = UDim2.fromOffset(panelW / s, panelH / s)
 end
 
@@ -975,7 +1028,7 @@ for i, name in ipairs(tabNames) do
     tabButtons[i] = b
 end
 
--- Área de páginas
+-- Área de páginas: ocupa todo lo que queda del panel
 local pageArea = Instance.new("Frame")
 pageArea.Position = UDim2.new(0, 10, 0, 148)
 pageArea.Size = UDim2.new(1, -20, 1, -158)
@@ -1028,11 +1081,13 @@ end)
 
 checkRow(pageCofres, "Ir al barco y volver", 2, returnToSpot, function(v)
     returnToSpot = v
+    markDirty()
     setStatus(v and "Volverá a tu posición tras guardar" or "Se quedará en el barco tras guardar")
 end)
 
 checkRow(pageCofres, "Solo cofres de otros jugadores", 3, onlyOthers, function(v)
     onlyOthers = v
+    markDirty()
     setStatus(v and "Modo: solo cofres de otros" or "Modo: no tomar cofres de otros")
 end)
 
@@ -1050,10 +1105,12 @@ local waitStepper = stepperRow(pageCofres, 5,
     function() return "Espera en barco: " .. waitOnBoat .. " s" end,
     function()
         waitOnBoat = math.max(0, waitOnBoat - 1)
+        markDirty()
         refreshUI()
     end,
     function()
         waitOnBoat = math.min(CONFIG.ESPERA_BARCO_MAX, waitOnBoat + 1)
+        markDirty()
         refreshUI()
     end
 )
@@ -1063,6 +1120,7 @@ local waitStepper = stepperRow(pageCofres, 5,
 ---------------------------------------------------------------
 checkRow(pageIsla, "Recolectar por isla", 1, islandMode, function(v)
     islandMode = v
+    markDirty()
     setStatus(v and ("Modo isla: " .. currentIslandName()) or "Modo isla apagado")
 end)
 
@@ -1074,12 +1132,14 @@ local diffRow = arrowRow(pageIsla, 2,
         diffIndex = diffIndex - 1
         if diffIndex < 1 then diffIndex = #ISLAND_GROUPS end
         islandIndex = 1
+        markDirty()
         refreshUI()
     end,
     function()
         diffIndex = diffIndex + 1
         if diffIndex > #ISLAND_GROUPS then diffIndex = 1 end
         islandIndex = 1
+        markDirty()
         refreshUI()
     end
 )
@@ -1093,12 +1153,14 @@ local islandRow = arrowRow(pageIsla, 3,
         local count = #ISLAND_GROUPS[diffIndex].islas
         islandIndex = islandIndex - 1
         if islandIndex < 1 then islandIndex = count end
+        markDirty()
         refreshUI()
     end,
     function()
         local count = #ISLAND_GROUPS[diffIndex].islas
         islandIndex = islandIndex + 1
         if islandIndex > count then islandIndex = 1 end
+        markDirty()
         refreshUI()
     end
 )
@@ -1116,10 +1178,12 @@ local capStepper = stepperRow(pageBoveda, 1,
     function() return "Espacio de bóveda: " .. capacity end,
     function()
         capacity = math.max(1, capacity - 1)
+        markDirty()
         refreshUI()
     end,
     function()
         capacity = math.min(CONFIG.CAPACIDAD_MAX, capacity + 1)
+        markDirty()
         refreshUI()
     end
 )
@@ -1144,23 +1208,29 @@ local function currentStep()
     return CONFIG.PANEL_PASOS[panelStepIdx]
 end
 
+local function setPanelW(v)
+    panelW = v
+    applyPanelSize()
+    markDirty()
+    refreshUI()
+end
+
+local function setPanelH(v)
+    panelH = v
+    applyPanelSize()
+    markDirty()
+    refreshUI()
+end
+
 local widthRow = sizeRow(pagePanel, 1, "Ancho",
     function() return panelW end,
-    function(v)
-        panelW = v
-        applyPanelSize()
-        refreshUI()
-    end,
+    setPanelW,
     currentStep
 )
 
 local heightRow = sizeRow(pagePanel, 2, "Alto",
     function() return panelH end,
-    function(v)
-        panelH = v
-        applyPanelSize()
-        refreshUI()
-    end,
+    setPanelH,
     currentStep
 )
 
@@ -1169,11 +1239,13 @@ local stepSelector = arrowRow(pagePanel, 3,
     function()
         panelStepIdx = panelStepIdx - 1
         if panelStepIdx < 1 then panelStepIdx = #CONFIG.PANEL_PASOS end
+        markDirty()
         refreshUI()
     end,
     function()
         panelStepIdx = panelStepIdx + 1
         if panelStepIdx > #CONFIG.PANEL_PASOS then panelStepIdx = 1 end
+        markDirty()
         refreshUI()
     end
 )
@@ -1184,11 +1256,12 @@ resetBtn.Activated:Connect(function()
     panelW = CONFIG.PANEL_ANCHO_INICIAL
     panelH = CONFIG.PANEL_ALTO_INICIAL
     applyPanelSize()
+    markDirty()
     refreshUI()
 end)
 
 local panelNote = label(pagePanel,
-    "Escribe el ancho y el alto en la caja, o usa − y +. Todo el contenido se escala con el panel.",
+    "Escribe el ancho y el alto en la caja, o usa − y +. La configuración se guarda sola.",
     10, PALETTE.muted, false)
 panelNote.LayoutOrder = 5
 panelNote.Size = UDim2.new(1, -4, 0, 40)
@@ -1236,11 +1309,13 @@ end
 
 tpBtn.Activated:Connect(function()
     mode = "TP"
+    markDirty()
     refreshUI()
 end)
 
 glideBtn.Activated:Connect(function()
     mode = "DESLIZAR"
+    markDirty()
     refreshUI()
 end)
 
@@ -1258,6 +1333,7 @@ end)
 closeBtn.Activated:Connect(function()
     closed = true
     auto = false
+    saveConfig()
     gui:Destroy()
 end)
 
@@ -1265,6 +1341,11 @@ showTab(1)
 
 task.spawn(function()
     while not closed do
+        if dirty then
+            dirty = false
+            saveConfig()
+        end
+
         if manualOpenRequested then
             manualOpenRequested = false
             pcall(openVault)
