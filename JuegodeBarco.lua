@@ -74,8 +74,8 @@ local CONFIG = {
     RADIO_ISLA_SIN_CAJA = 250,
     MODO_INICIAL = "TP",
     VELOCIDAD_DESLIZAR = 45,
-    CAPACIDAD_INICIAL = 81,
-    CAPACIDAD_MAX = 81,
+    CAPACIDAD_INICIAL = 5,
+    CAPACIDAD_MAX = 50,
     ESPERA_BARCO_INICIAL = 5,
     ESPERA_BARCO_MAX = 60,
     ESPERA_RECOGER = 0.3,
@@ -86,18 +86,20 @@ local CONFIG = {
     NOMBRE_BARCO_MANUAL = "",
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
-    PANEL_ANCHO_INICIAL = 280,     -- ancho inicial del panel (px)
-    PANEL_ALTO_INICIAL = 440,      -- alto inicial del panel (px)
-    PANEL_PASO = 20,               -- cuánto cambia cada toque de − o +
-    PANEL_MIN_ANCHO = 220,
-    PANEL_MIN_ALTO = 300,
+
+    -- Panel (tamaño libre: escribe el valor o usa − +)
+    PANEL_ANCHO_INICIAL = 280,
+    PANEL_ALTO_INICIAL = 440,
+    PANEL_MIN_ANCHO = 180,          -- mínimo que permite el panel
+    PANEL_MIN_ALTO = 240,
+    PANEL_MAX = 3000,               -- máximo (muy alto para no tener límite práctico)
+    PANEL_PASOS = { 5, 10, 20, 50 }, -- pasos que puedes elegir para − y +
+    PANEL_PASO_INICIAL = 3,         -- índice del paso inicial (3 = 20 px)
+
     DEBUG = true,
 }
 
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
-
--- Diseño base del contenido; se escala para llenar el panel
-local BASE_W, BASE_H = 300, 470
 
 ---------------------------------------------------------------
 -- RUTAS
@@ -152,6 +154,7 @@ local capacity = CONFIG.CAPACIDAD_INICIAL
 local waitOnBoat = CONFIG.ESPERA_BARCO_INICIAL
 local panelW = CONFIG.PANEL_ANCHO_INICIAL
 local panelH = CONFIG.PANEL_ALTO_INICIAL
+local panelStepIdx = CONFIG.PANEL_PASO_INICIAL
 local collectedCount = 0
 local openedCount = 0
 local statusText = "Listo"
@@ -685,7 +688,6 @@ local function padding(frame, x, y)
     p.Parent = frame
 end
 
--- Fila tipo tarjeta
 local function rowFrame(parent, order)
     local f = Instance.new("Frame")
     f.Size = UDim2.new(1, -4, 0, 34)
@@ -697,7 +699,6 @@ local function rowFrame(parent, order)
     return f
 end
 
--- Casilla de activado / desactivado
 local function checkRow(parent, text, order, initial, onChange)
     local row = Instance.new("TextButton")
     row.Size = UDim2.new(1, -4, 0, 34)
@@ -783,6 +784,58 @@ local function stepperRow(parent, order, getText, onMinus, onPlus)
     return { refresh = function() lbl.Text = getText() end }
 end
 
+-- Fila para editar un tamaño: nombre, caja para escribir, − y +
+local function sizeRow(parent, order, name, getVal, setVal, getStep)
+    local row = rowFrame(parent, order)
+
+    local lbl = label(row, name, 12, PALETTE.text, true)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.Size = UDim2.new(0.35, 0, 1, 0)
+
+    local minus = button(row, "−", UDim2.fromOffset(30, 28), PALETTE.track)
+    minus.Position = UDim2.new(1, -142, 0.5, -14)
+    minus.TextSize = 16
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.fromOffset(56, 28)
+    box.Position = UDim2.new(1, -108, 0.5, -14)
+    box.BackgroundColor3 = PALETTE.bg
+    box.BorderSizePixel = 0
+    box.TextColor3 = PALETTE.text
+    box.Font = Enum.Font.GothamBold
+    box.TextSize = 12
+    box.ClearTextOnFocus = false
+    box.Text = tostring(getVal())
+    box.Parent = row
+    corner(box, 6)
+
+    local plus = button(row, "+", UDim2.fromOffset(30, 28), PALETTE.track)
+    plus.Position = UDim2.new(1, -44, 0.5, -14)
+    plus.TextSize = 16
+
+    minus.Activated:Connect(function()
+        setVal(getVal() - getStep())
+    end)
+    plus.Activated:Connect(function()
+        setVal(getVal() + getStep())
+    end)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then
+            setVal(math.floor(n + 0.5))
+        end
+        box.Text = tostring(getVal())
+    end)
+
+    return {
+        refresh = function()
+            if not box:IsFocused() then
+                box.Text = tostring(getVal())
+            end
+        end,
+    }
+end
+
 local function makeDraggable(handle, frame)
     local dragging, startInput, startPos = false, nil, nil
     handle.InputBegan:Connect(function(input)
@@ -810,7 +863,7 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal (tamaño en píxeles, editable desde la pestaña Panel)
+-- Panel principal: tamaño libre en píxeles
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -822,26 +875,18 @@ main.Parent = gui
 corner(main, 16)
 stroke(main, PALETTE.accent, 1, 0.5)
 
--- Contenido con diseño base, escalado para llenar el panel
+-- Contenido: llena el panel completo (se estira con el tamaño)
 local content = Instance.new("Frame")
 content.Name = "Content"
-content.AnchorPoint = Vector2.new(0.5, 0.5)
-content.Position = UDim2.new(0.5, 0, 0.5, 0)
-content.Size = UDim2.fromOffset(BASE_W, BASE_H)
+content.Size = UDim2.fromScale(1, 1)
 content.BackgroundTransparency = 1
 content.Parent = main
 
-local contentScale = Instance.new("UIScale")
-contentScale.Parent = content
-
+-- Solo se limita el tamaño mínimo y el máximo; no el de la pantalla
 local function applyPanelSize()
-    local vp = camera.ViewportSize
-    local maxW = math.max(CONFIG.PANEL_MIN_ANCHO, vp.X - 10)
-    local maxH = math.max(CONFIG.PANEL_MIN_ALTO, vp.Y - 10)
-    panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, maxW)
-    panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, maxH)
+    panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, CONFIG.PANEL_MAX)
+    panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, CONFIG.PANEL_MAX)
     main.Size = UDim2.fromOffset(panelW, panelH)
-    contentScale.Scale = math.min(panelW / BASE_W, panelH / BASE_H)
 end
 
 -- Cabecera
@@ -864,10 +909,10 @@ minBtn.Position = UDim2.new(1, -72, 0, 7)
 local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), PALETTE.red)
 closeBtn.Position = UDim2.new(1, -36, 0, 7)
 
--- Tarjeta de resumen
+-- Tarjeta de resumen (ancho según el panel)
 local statCard = Instance.new("Frame")
 statCard.Position = UDim2.new(0, 10, 0, 48)
-statCard.Size = UDim2.new(0, BASE_W - 20, 0, 54)
+statCard.Size = UDim2.new(1, -20, 0, 54)
 statCard.BackgroundColor3 = PALETTE.card
 statCard.BorderSizePixel = 0
 statCard.Parent = content
@@ -907,7 +952,7 @@ corner(barFill, 3)
 -- Pestañas
 local tabRow = Instance.new("Frame")
 tabRow.Position = UDim2.new(0, 10, 0, 110)
-tabRow.Size = UDim2.new(0, BASE_W - 20, 0, 30)
+tabRow.Size = UDim2.new(1, -20, 0, 30)
 tabRow.BackgroundTransparency = 1
 tabRow.Parent = content
 listLayout(tabRow, 4, true)
@@ -920,10 +965,10 @@ for i, name in ipairs(tabNames) do
     tabButtons[i] = b
 end
 
--- Área de páginas
+-- Área de páginas (llena lo que queda del panel)
 local pageArea = Instance.new("Frame")
 pageArea.Position = UDim2.new(0, 10, 0, 148)
-pageArea.Size = UDim2.new(0, BASE_W - 20, 0, BASE_H - 158)
+pageArea.Size = UDim2.new(1, -20, 1, -158)
 pageArea.BackgroundTransparency = 1
 pageArea.Parent = content
 
@@ -1075,7 +1120,7 @@ vaultInfo.Size = UDim2.new(1, -4, 0, 30)
 vaultInfo.TextWrapped = true
 vaultInfo.TextYAlignment = Enum.TextYAlignment.Top
 
-local emptyBtn = button(pageBoveda, "🏦 Vaciar bóveda ahora", UDim2.new(1, -4, 0, 36), PALETTE.orange or PALETTE.accent)
+local emptyBtn = button(pageBoveda, "🏦 Vaciar bóveda ahora", UDim2.new(1, -4, 0, 36), PALETTE.accent)
 emptyBtn.LayoutOrder = 3
 emptyBtn.Activated:Connect(function()
     manualOpenRequested = true
@@ -1083,38 +1128,48 @@ emptyBtn.Activated:Connect(function()
 end)
 
 ---------------------------------------------------------------
--- PESTAÑA PANEL (tamaño editable)
+-- PESTAÑA PANEL (tamaño libre)
 ---------------------------------------------------------------
-local widthStepper = stepperRow(pagePanel, 1,
-    function() return "Ancho del panel: " .. panelW .. " px" end,
-    function()
-        panelW = panelW - CONFIG.PANEL_PASO
+local function currentStep()
+    return CONFIG.PANEL_PASOS[panelStepIdx]
+end
+
+local widthRow = sizeRow(pagePanel, 1, "Ancho",
+    function() return panelW end,
+    function(v)
+        panelW = v
         applyPanelSize()
         refreshUI()
     end,
-    function()
-        panelW = panelW + CONFIG.PANEL_PASO
-        applyPanelSize()
-        refreshUI()
-    end
+    currentStep
 )
 
-local heightStepper = stepperRow(pagePanel, 2,
-    function() return "Alto del panel: " .. panelH .. " px" end,
-    function()
-        panelH = panelH - CONFIG.PANEL_PASO
+local heightRow = sizeRow(pagePanel, 2, "Alto",
+    function() return panelH end,
+    function(v)
+        panelH = v
         applyPanelSize()
         refreshUI()
     end,
+    currentStep
+)
+
+local stepSelector = arrowRow(pagePanel, 3,
+    function() return "Paso de − y +: " .. currentStep() .. " px" end,
     function()
-        panelH = panelH + CONFIG.PANEL_PASO
-        applyPanelSize()
+        panelStepIdx = panelStepIdx - 1
+        if panelStepIdx < 1 then panelStepIdx = #CONFIG.PANEL_PASOS end
+        refreshUI()
+    end,
+    function()
+        panelStepIdx = panelStepIdx + 1
+        if panelStepIdx > #CONFIG.PANEL_PASOS then panelStepIdx = 1 end
         refreshUI()
     end
 )
 
 local resetBtn = button(pagePanel, "↺ Tamaño por defecto", UDim2.new(1, -4, 0, 36), PALETTE.card)
-resetBtn.LayoutOrder = 3
+resetBtn.LayoutOrder = 4
 resetBtn.Activated:Connect(function()
     panelW = CONFIG.PANEL_ANCHO_INICIAL
     panelH = CONFIG.PANEL_ALTO_INICIAL
@@ -1122,8 +1177,10 @@ resetBtn.Activated:Connect(function()
     refreshUI()
 end)
 
-local panelNote = label(pagePanel, "El contenido se ajusta al tamaño del panel. Si el panel tiene una proporción distinta al diseño, sobra espacio a los lados.", 10, PALETTE.muted, false)
-panelNote.LayoutOrder = 4
+local panelNote = label(pagePanel,
+    "Escribe el ancho y el alto en la caja, o usa − y +. El contenido se estira para llenar el panel.",
+    10, PALETTE.muted, false)
+panelNote.LayoutOrder = 5
 panelNote.Size = UDim2.new(1, -4, 0, 40)
 panelNote.TextWrapped = true
 panelNote.TextYAlignment = Enum.TextYAlignment.Top
@@ -1138,7 +1195,6 @@ makeDraggable(mini, mini)
 makeDraggable(header, main)
 
 applyPanelSize()
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(applyPanelSize)
 
 ---------------------------------------------------------------
 -- ACTUALIZAR UI
@@ -1163,8 +1219,9 @@ refreshUI = function()
     capStepper.refresh()
     vaultInfo.Text = "Guardados: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
 
-    widthStepper.refresh()
-    heightStepper.refresh()
+    widthRow.refresh()
+    heightRow.refresh()
+    stepSelector.refresh()
 end
 
 tpBtn.Activated:Connect(function()
