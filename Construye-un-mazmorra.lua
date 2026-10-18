@@ -1,835 +1,1848 @@
--- Recolección de cofres + guardar en el barco + abrir con el tesorero (Ser pirata, Móvil)
+-- CFly + Noclip + Combate + TP + Auto-cofres + Cristales + Curar (manual/automático) + Jefes StarRune
+-- LocalScript en StarterPlayer > StarterPlayerScripts (reemplaza el anterior)
+
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace = game:GetService("Workspace")
-local LocalPlayer = Players.LocalPlayer
+local Lighting = game:GetService("Lighting")
 
----------------------------------------------------------------
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+---------------------------------------------------------------------
 -- CONFIGURACIÓN
----------------------------------------------------------------
-local CONFIG = {
-    AUTO_INICIAL = false,          -- recolección automática encendida al iniciar
-    VOLVER_INICIAL = false,        -- ir al barco y volver a la posición anterior
-    SOLO_OTROS_INICIAL = false,    -- true = solo cofres de otros jugadores
-    MODO_INICIAL = "TP",           -- "TP" o "DESLIZAR"
-    VELOCIDAD_DESLIZAR = 45,
-    CAPACIDAD_INICIAL = 5,         -- espacio total de la bóveda
-    CAPACIDAD_MAX = 50,
-    ESPERA_BARCO_INICIAL = 5,      -- segundos encima del barco antes de continuar
-    ESPERA_BARCO_MAX = 60,
-    ESPERA_RECOGER = 0.3,
-    ESPERA_GUARDADO = 3,           -- máximo esperando que el cofre ocupe espacio
-    ESPERA_TESORERO = 1.5,
-    ESPERA_APERTURA = 0.6,
-    ALTURA = 3,
-    NOMBRE_BARCO_MANUAL = "",      -- nombre exacto de tu barco si no lo detecta
-    ABRIR_RAPIDO = true,           -- Settings_Set("FastOpen", true)
-    TAMANO_POR_DEFECTO = 1,        -- espacio si un cofre no tiene CargoSize
-    DEBUG = true,
+---------------------------------------------------------------------
+local SPEED = 60
+local VERTICAL_SPEED = 50
+local UP_KEY = Enum.KeyCode.Space
+local DOWN_KEY = Enum.KeyCode.LeftShift
+local TOGGLE_KEY = Enum.KeyCode.F
+
+-- Combate
+local ENEMIES_FOLDER = "BADEnemies"
+local DETECT_RANGE = 1000000000
+local MELEE_RANGE = 15
+local SAFE_DISTANCE = 70
+local EVADE_SPEED = 90
+local ATTACK_INTERVAL = 0.1
+local WEAPON_NAME = "Dungeon Blade"
+local USE_TOOL_ACTIVATE = true
+local FIRE_REMOTE = true
+local ATTACK_STEPS = {
+	{ arg = 6, count = 1 },
+	{ arg = 5, count = 1 },
+	{ arg = 7, count = 1 },
+	{ arg = nil, count = 1 },
 }
+local TP_DISTANCE = 6
 
-local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
+-- Cofres
+local CHEST_ROOT = "Labyrinth"
+local CHEST_NAME = "Chest"
+local CHEST_OFFSET_Y = 3
+local CHEST_TP_DELAY = 0.15
+local CHEST_MAX_TRIES = 3
 
----------------------------------------------------------------
--- RUTAS
----------------------------------------------------------------
-local function getDynamic()
-    local world = Workspace:FindFirstChild("World")
-    return world and world:FindFirstChild("Dynamic")
-end
+-- Cristales
+local CRYSTAL_NAME = "Crystals"
+local CRYSTAL_TP_DISTANCE = 5
+local CRYSTAL_ATTACK_INTERVAL = 0.1
+local CRYSTAL_TIMEOUT = 15
+local CRYSTAL_SKIP_TIME = 20
 
-local function getTreasureFolder()
-    local dyn = getDynamic()
-    return dyn and dyn:FindFirstChild("Treasure")
-end
+-- Curación (Fountain)
+local FOUNTAIN_NAME = "Fountain"
+local HEAL_THRESHOLD = 0.2           -- modo automático: se activa al 20% de vida
+local HEAL_DONE = 0.95               -- modo automático: no regresa hasta llegar a 95%
+local HEAL_POLL = 0.2
+local HEAL_RETURN_DIST = 12          -- modo automático: si te alejas, vuelves a la fuente
+local HEAL_COOLDOWN = 5
+local PROMPT_STAND_OFFSET = Vector3.new(0, 2.5, 1.5)
+local PROMPT_NEARBY_RANGE = 15
 
-local function getRemote(name)
-    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    return remotes and remotes:FindFirstChild(name)
-end
+-- Jefes
+local BOSS_NAME = "StarRune"
+local BOSS_FALLBACK_HEIGHT = 4
 
-local function dbg(...)
-    if CONFIG.DEBUG then print("[COFRES]", ...) end
-end
+-- Barra rectangular (más pequeña)
+local BAR_W = 150
+local BAR_H = 26
 
----------------------------------------------------------------
+-- Botón de minimizar (pequeño)
+local MENU_SIZE = 36
+
+---------------------------------------------------------------------
 -- ESTADO
----------------------------------------------------------------
-local auto = CONFIG.AUTO_INICIAL
-local returnToSpot = CONFIG.VOLVER_INICIAL
-local onlyOthers = CONFIG.SOLO_OTROS_INICIAL
-local mode = CONFIG.MODO_INICIAL
-local capacity = CONFIG.CAPACIDAD_INICIAL
-local waitOnBoat = CONFIG.ESPERA_BARCO_INICIAL
-local collectedCount = 0
-local openedCount = 0
-local statusText = "Listo"
-local cachedShip = nil
-local closed = false
-local refreshUI
+---------------------------------------------------------------------
+local running = true
+local flying, noclip = false, false
+local autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
+local autoChest, chestBusy = false, false
+local crystalFarm, crystalBusy = false, false
+local chestsCollected, crystalsCollected = 0, 0
+local combatMode = "melee"
+local moveButtonsEnabled = false
+
+local healMode = "off"               -- "off" | "manual" | "auto"
+local healBusy = false
+local healToken = 0
+local savedHealCF = nil              -- posición guardada antes de ir a Fountain
+local atFountain = false
+local featureSnapshot = nil          -- qué opciones estaban activas antes de curar (manual)
+
+local bossEntries, bossButtons = {}, {}
+local featureToggles = {}            -- opciones de Combate/Farm que se apagan al curarse
+
+local currentTarget
+local attackToken, chestToken, crystalToken = 0, 0, 0
+local wasAiming = false
+local enemyCache = {}
+local chestAttempts = {}
+local crystalSkip = {}
+
+local connection, flyAttachment, flyVelocity
+local noclipConn
+local originalCollide = {}
+local allConnections = {}
+
+local bar, healBtn, flyBtn, menuBubble, panel, panelW, panelFullH
+local setFlyRow, toggleFly, setFlyVisual, setHealVisual, setHealModeVisual
+local chestSub, crystalSub, statusLabel
+local refreshBosses
+local healModeButtons = {}
+
+local function isBusy()
+	return chestBusy or crystalBusy or healBusy
+end
 
 local function setStatus(text)
-    statusText = text
-    dbg(text)
-    if refreshUI then refreshUI() end
+	if statusLabel then
+		statusLabel.Text = text
+	end
 end
 
----------------------------------------------------------------
--- ESPACIO (CargoSize)
----------------------------------------------------------------
-local function getCargoSize(obj)
-    local v = obj:GetAttribute("CargoSize")
-    if v ~= nil then
-        return tonumber(v) or CONFIG.TAMANO_POR_DEFECTO
-    end
-    local child = obj:FindFirstChild("CargoSize")
-    if child and (child:IsA("NumberValue") or child:IsA("IntValue")) then
-        return child.Value
-    end
-    return CONFIG.TAMANO_POR_DEFECTO
-end
-
----------------------------------------------------------------
--- DUEÑO DE LOS COFRES
----------------------------------------------------------------
-local function isMine(owner)
-    return owner == LocalPlayer.Name
-        or owner == LocalPlayer.DisplayName
-        or owner == tostring(LocalPlayer.UserId)
-end
-
-local function getChestOwner(chest)
-    for _, key in ipairs(OWNER_KEYS) do
-        local v = chest:GetAttribute(key)
-        if v ~= nil then
-            return tostring(v)
-        end
-    end
-    for _, d in ipairs(chest:GetDescendants()) do
-        local n = d.Name:lower()
-        if n:find("owner") or n:find("player") then
-            if d:IsA("ObjectValue") and d.Value then
-                if d.Value:IsA("Player") then
-                    return tostring(d.Value.UserId)
-                end
-                return d.Value.Name
-            elseif d:IsA("StringValue") or d:IsA("IntValue") or d:IsA("NumberValue") then
-                return tostring(d.Value)
-            end
-        end
-    end
-    return nil
-end
-
-local function shouldCollect(chest)
-    local owner = getChestOwner(chest)
-    if onlyOthers then
-        return owner ~= nil and not isMine(owner)
-    end
-    return owner == nil or isMine(owner)
-end
-
----------------------------------------------------------------
--- PERSONAJE
----------------------------------------------------------------
-local function getRoot()
-    local character = LocalPlayer.Character
-    return character and character:FindFirstChild("HumanoidRootPart")
-end
-
-local function teleportTo(pos)
-    local root = getRoot()
-    if not root then return false end
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.CFrame = CFrame.new(pos) * (root.CFrame - root.CFrame.Position)
-    task.wait(0.2)
-    return true
-end
-
-local function teleportToCFrame(cf)
-    local root = getRoot()
-    if not root then return false end
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.CFrame = cf
-    task.wait(0.2)
-    return true
-end
-
-local function glideTo(pos)
-    local root = getRoot()
-    if not root then return end
-    local startPos = root.Position
-    local duration = math.max((pos - startPos).Magnitude / CONFIG.VELOCIDAD_DESLIZAR, 0.05)
-    local t0 = os.clock()
-    local alpha = 0
-    while alpha < 1 and not closed do
-        root = getRoot()
-        if not root then break end
-        alpha = math.min((os.clock() - t0) / duration, 1)
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.CFrame = CFrame.new(startPos:Lerp(pos, alpha)) * (root.CFrame - root.CFrame.Position)
-        task.wait()
-    end
-end
-
-local function moveTo(pos)
-    if mode == "TP" then
-        teleportTo(pos)
-    else
-        glideTo(pos)
-    end
-end
-
----------------------------------------------------------------
--- TU BARCO
----------------------------------------------------------------
-local function isMyShip(ship)
-    local name = LocalPlayer.Name
-    local userId = tostring(LocalPlayer.UserId)
-
-    for _, attr in ipairs({ "Owner", "OwnerName", "OwnerId", "Player", "UserId" }) do
-        local v = ship:GetAttribute(attr)
-        if v ~= nil and (tostring(v) == name or tostring(v) == userId) then
-            return true
-        end
-    end
-    for _, d in ipairs(ship:GetDescendants()) do
-        if d:IsA("ObjectValue") and d.Value == LocalPlayer then
-            return true
-        elseif d:IsA("StringValue") and (d.Value == name or d.Value == userId) then
-            return true
-        end
-    end
-    return ship.Name:find(name, 1, true) ~= nil or ship.Name:find(userId, 1, true) ~= nil
-end
-
-local function getMyShip()
-    if cachedShip and cachedShip.Parent then
-        return cachedShip
-    end
-    cachedShip = nil
-
-    local dyn = getDynamic()
-    local ships = dyn and dyn:FindFirstChild("Ships")
-    if not ships then return nil end
-
-    for _, ship in ipairs(ships:GetChildren()) do
-        local match
-        if CONFIG.NOMBRE_BARCO_MANUAL ~= "" then
-            match = ship.Name == CONFIG.NOMBRE_BARCO_MANUAL
-        else
-            match = isMyShip(ship)
-        end
-        if match then
-            cachedShip = ship
-            return ship
-        end
-    end
-    return nil
-end
-
-local function getShipTop(ship)
-    local center, size
-    if ship:IsA("Model") then
-        center, size = ship:GetBoundingBox()
-    else
-        center, size = ship.CFrame, ship.Size
-    end
-    return Vector3.new(center.Position.X, center.Position.Y + size.Y / 2 + CONFIG.ALTURA, center.Position.Z)
-end
-
----------------------------------------------------------------
--- BÓVEDA: cada Model en CargoVisuals es un cofre; ocupa CargoSize
----------------------------------------------------------------
-local function getStoredChests()
-    local ship = getMyShip()
-    local cargo = ship and ship:FindFirstChild("CargoVisuals")
-    local list = {}
-    if cargo then
-        for _, child in ipairs(cargo:GetChildren()) do
-            if child:IsA("Model") then
-                table.insert(list, child)
-            end
-        end
-    end
-    return list
-end
-
-local function usedSpace()
-    local total = 0
-    for _, chest in ipairs(getStoredChests()) do
-        total += getCargoSize(chest)
-    end
-    return total
-end
-
----------------------------------------------------------------
--- RECOGER, GUARDAR, VOLVER
----------------------------------------------------------------
-local function pickUpChest(base, prompt)
-    teleportTo(base.Position + Vector3.new(0, CONFIG.ALTURA, 0))
-    pcall(fireproximityprompt, prompt)
-    task.wait(CONFIG.ESPERA_RECOGER)
-end
-
-local function storeOnBoat(usedBefore)
-    local ship = getMyShip()
-    if not ship then
-        setStatus("No encuentro tu barco")
-        return false
-    end
-
-    setStatus("Guardando en el barco...")
-    teleportTo(getShipTop(ship))
-
-    local t0 = os.clock()
-    while os.clock() - t0 < CONFIG.ESPERA_GUARDADO do
-        if usedSpace() > usedBefore then
-            return true
-        end
-        task.wait(0.25)
-    end
-    setStatus("El cofre no se guardó: revisa que estés sobre el barco")
-    return false
-end
-
-local function waitOnShip()
-    local endTime = os.clock() + waitOnBoat
-    while os.clock() < endTime and not closed do
-        setStatus(string.format("En el barco: %ds", math.ceil(endTime - os.clock())))
-        task.wait(0.25)
-    end
-end
-
----------------------------------------------------------------
--- TESORERO
----------------------------------------------------------------
-local function openVault()
-    local dyn = getDynamic()
-    local npcs = dyn and dyn:FindFirstChild("NPCs")
-    local npc = npcs and npcs:FindFirstChild("NPC_StarterPort_Broker")
-    local hrp = npc and npc:FindFirstChild("HumanoidRootPart")
-    if not hrp then
-        setStatus("No encuentro al tesorero")
-        return
-    end
-
-    setStatus("Bóveda llena: yendo al tesorero...")
-    teleportTo(hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
-
-    local p1 = hrp:FindFirstChild("NPCPrompt_1")
-    local prompt = p1 and p1:FindFirstChild("NPCPrompt")
-    if prompt and prompt:IsA("ProximityPrompt") then
-        pcall(fireproximityprompt, prompt)
-        task.wait(CONFIG.ESPERA_TESORERO)
-    end
-
-    local openRemote = getRemote("Treasure_Open")
-    local settingsRemote = getRemote("Settings_Set")
-    if not (openRemote and openRemote:IsA("RemoteEvent")) then
-        setStatus("No encuentro el remote Treasure_Open")
-        return
-    end
-
-    if CONFIG.ABRIR_RAPIDO and settingsRemote and settingsRemote:IsA("RemoteEvent") then
-        pcall(function() settingsRemote:FireServer("FastOpen", true) end)
-        task.wait(0.2)
-    end
-
-    for _, chest in ipairs(getStoredChests()) do
-        if closed then return end
-        pcall(function()
-            openRemote:FireServer("One", chest.Name, CONFIG.ABRIR_RAPIDO)
-        end)
-        openedCount += 1
-        setStatus("Abriendo " .. chest.Name)
-        task.wait(CONFIG.ESPERA_APERTURA)
-    end
-
-    setStatus("Bóveda abierta, buscando cofres")
-end
-
----------------------------------------------------------------
--- CICLO
----------------------------------------------------------------
-local function collectCycle()
-    local treasure = getTreasureFolder()
-    if not treasure then
-        setStatus("No encuentro World.Dynamic.Treasure")
-        return
-    end
-
-    if usedSpace() >= capacity then
-        openVault()
-        return
-    end
-
-    for _, item in ipairs(treasure:GetChildren()) do
-        if closed or not auto then return end
-
-        local base = item:FindFirstChild("Base")
-        local attach = base and base:FindFirstChild("PromptAttachment")
-        local prompt = attach and attach:FindFirstChild("TreasurePrompt")
-
-        if base and prompt and prompt:IsA("ProximityPrompt") and shouldCollect(item) then
-            local size = getCargoSize(item)
-
-            if size > capacity then
-                setStatus("Cofre más grande que la bóveda, lo salto")
-            else
-                if usedSpace() + size > capacity then
-                    openVault()
-                    return
-                end
-
-                -- Guardar la posición donde estabas para volver después
-                local root = getRoot()
-                local returnCF = root and root.CFrame
-
-                setStatus("Recogiendo cofre (espacio " .. size .. ")...")
-                local usedBefore = usedSpace()
-                pickUpChest(base, prompt)
-                collectedCount += 1
-
-                if storeOnBoat(usedBefore) then
-                    waitOnShip()
-                end
-
-                if returnToSpot and returnCF then
-                    setStatus("Volviendo a tu posición...")
-                    teleportToCFrame(returnCF)
-                end
-            end
-        end
-    end
-
-    if auto then
-        setStatus("Buscando cofres...")
-    end
-end
-
----------------------------------------------------------------
--- UI
----------------------------------------------------------------
-local PALETTE = {
-    bg = Color3.fromRGB(18, 20, 28),
-    card = Color3.fromRGB(30, 33, 46),
-    cardHover = Color3.fromRGB(40, 44, 60),
-    track = Color3.fromRGB(46, 50, 68),
-    accent = Color3.fromRGB(110, 150, 255),
-    green = Color3.fromRGB(80, 200, 130),
-    orange = Color3.fromRGB(245, 160, 60),
-    red = Color3.fromRGB(225, 85, 95),
-    text = Color3.fromRGB(240, 242, 250),
-    muted = Color3.fromRGB(140, 146, 170),
+---------------------------------------------------------------------
+-- TEMA / HELPERS
+---------------------------------------------------------------------
+local COLORS = {
+	panel = Color3.fromRGB(20, 22, 34),
+	row = Color3.fromRGB(32, 35, 51),
+	rowOn = Color3.fromRGB(32, 52, 58),
+	text = Color3.fromRGB(240, 242, 255),
+	subtext = Color3.fromRGB(150, 155, 180),
+	on = Color3.fromRGB(72, 220, 150),
+	off = Color3.fromRGB(70, 74, 96),
+	accentA = Color3.fromRGB(140, 90, 255),
+	accentB = Color3.fromRGB(60, 190, 255),
+	red = Color3.fromRGB(255, 95, 110),
+	yellow = Color3.fromRGB(255, 200, 70),
+	flyOff = Color3.fromRGB(200, 60, 80),
+	flyOn = Color3.fromRGB(50, 200, 110),
+	heal = Color3.fromRGB(60, 150, 255),
+	healBack = Color3.fromRGB(255, 170, 60),
 }
 
-local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local function corner(obj, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = radius
+	c.Parent = obj
+	return c
+end
 
+local function tween(obj, props, t)
+	TweenService:Create(
+		obj,
+		TweenInfo.new(t or 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		props
+	):Play()
+end
+
+local function track(conn)
+	table.insert(allConnections, conn)
+	return conn
+end
+
+local warned = {}
+local function warnOnce(key, message)
+	if not warned[key] then
+		warned[key] = true
+		warn("[CFly] " .. message)
+	end
+end
+
+-- GUI base
 local gui = Instance.new("ScreenGui")
-gui.Name = "CofresUI"
+gui.Name = "CFlyGui"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
-gui.Parent = playerGui
+gui.DisplayOrder = 10
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
 
-local function corner(parent, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius)
-    c.Parent = parent
+local EDGE = 8
+local TOP_EDGE = 44
+
+local function placeAt(obj, x, y)
+	local screen = gui.AbsoluteSize
+	if screen.X <= 0 or screen.Y <= 0 then return end
+	local size = obj.AbsoluteSize
+	local maxX = math.max(EDGE, screen.X - size.X - EDGE)
+	local maxY = math.max(TOP_EDGE, screen.Y - size.Y - EDGE)
+	x = math.clamp(x, EDGE, maxX)
+	y = math.clamp(y, TOP_EDGE, maxY)
+	obj.Position = UDim2.fromOffset(
+		x + obj.AnchorPoint.X * size.X,
+		y + obj.AnchorPoint.Y * size.Y
+	)
 end
 
-local function stroke(parent, color, thickness, transparency)
-    local s = Instance.new("UIStroke")
-    s.Color = color
-    s.Thickness = thickness or 1
-    s.Transparency = transparency or 0
-    s.Parent = parent
+local function clampToScreen(obj)
+	local p = obj.AbsolutePosition
+	placeAt(obj, p.X, p.Y)
 end
 
-local function label(parent, text, size, color, bold)
-    local l = Instance.new("TextLabel")
-    l.BackgroundTransparency = 1
-    l.Text = text
-    l.TextSize = size
-    l.TextColor3 = color
-    l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.TextYAlignment = Enum.TextYAlignment.Center
-    l.Parent = parent
-    return l
+-- Arrastra "target" desde "handle". Si no hay movimiento, cuenta como toque.
+local function makeDraggable(handle, target, onTap)
+	local dragging, moved = false, false
+	local dragStart, startAbs, activeInput
+
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			moved = false
+			activeInput = input
+			dragStart = input.Position
+			startAbs = target.AbsolutePosition
+		end
+	end)
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		if input == activeInput or input.UserInputType == Enum.UserInputType.MouseMovement then
+			local delta = input.Position - dragStart
+			if moveButtonsEnabled and delta.Magnitude > 8 then
+				moved = true
+			end
+			if moved then
+				placeAt(target, startAbs.X + delta.X, startAbs.Y + delta.Y)
+			end
+		end
+	end))
+
+	track(UserInputService.InputEnded:Connect(function(input)
+		if not dragging then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+			if not moved and onTap then
+				onTap()
+			end
+		end
+	end))
 end
 
-local function button(parent, text, size, color)
-    local b = Instance.new("TextButton")
-    b.Size = size
-    b.BackgroundColor3 = color
-    b.Text = text
-    b.TextColor3 = PALETTE.text
-    b.TextSize = 13
-    b.Font = Enum.Font.GothamBold
-    b.AutoButtonColor = true
-    b.BorderSizePixel = 0
-    b.Parent = parent
-    corner(b, 10)
-    return b
+---------------------------------------------------------------------
+-- PERSONAJE
+---------------------------------------------------------------------
+local function getParts()
+	local char = player.Character
+	if not char then return nil, nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	return hum, root
 end
 
-local function card(parent, order, height)
-    local f = Instance.new("Frame")
-    f.Size = UDim2.new(1, 0, 0, height)
-    f.BackgroundColor3 = PALETTE.card
-    f.BorderSizePixel = 0
-    f.LayoutOrder = order
-    f.Parent = parent
-    corner(f, 14)
-    return f
+-- Mueve TODO el modelo del personaje (no solo la raíz) y frena las velocidades
+local function teleportCharacter(cf)
+	local char = player.Character
+	if not char then return end
+	char:PivotTo(cf)
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.AssemblyLinearVelocity = Vector3.zero
+			p.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
 end
 
-local function padCard(frame, p)
-    local pad = Instance.new("UIPadding")
-    pad.PaddingLeft = UDim.new(0, p)
-    pad.PaddingRight = UDim.new(0, p)
-    pad.PaddingTop = UDim.new(0, p / 2)
-    pad.PaddingBottom = UDim.new(0, p / 2)
-    pad.Parent = frame
+---------------------------------------------------------------------
+-- COMBATE
+---------------------------------------------------------------------
+local function attackOn()
+	return autoAttack or tpAttack
 end
 
-local function listLayout(parent, padding)
-    local l = Instance.new("UIListLayout")
-    l.Padding = UDim.new(0, padding)
-    l.SortOrder = Enum.SortOrder.LayoutOrder
-    l.Parent = parent
-    return l
+local function getEquippedTool()
+	local char = player.Character
+	return char and char:FindFirstChildOfClass("Tool")
 end
 
--- Fila con casilla de activado / desactivado
-local function checkRow(parent, text, order, initial, onChange)
-    local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, 0, 0, 38)
-    row.BackgroundTransparency = 1
-    row.Text = ""
-    row.AutoButtonColor = false
-    row.LayoutOrder = order
-    row.Parent = parent
-
-    local lbl = label(row, text, 13, PALETTE.text, false)
-    lbl.Size = UDim2.new(1, -40, 1, 0)
-
-    local box = Instance.new("Frame")
-    box.Size = UDim2.new(0, 22, 0, 22)
-    box.Position = UDim2.new(1, -22, 0.5, -11)
-    box.BorderSizePixel = 0
-    box.Parent = row
-    corner(box, 6)
-    stroke(box, PALETTE.muted, 1.2, 0.2)
-
-    local tick = label(box, "✓", 15, PALETTE.text, true)
-    tick.Size = UDim2.new(1, 0, 1, 0)
-    tick.TextXAlignment = Enum.TextXAlignment.Center
-
-    local state = initial
-    local function paint()
-        box.BackgroundColor3 = state and PALETTE.green or PALETTE.track
-        tick.Visible = state
-    end
-
-    row.Activated:Connect(function()
-        state = not state
-        paint()
-        onChange(state)
-    end)
-
-    paint()
-    return {
-        set = function(v) state = v; paint() end,
-    }
+local function getAttackRemote()
+	local bad = ReplicatedStorage:FindFirstChild("BAD")
+	local remotes = bad and bad:FindFirstChild("Remotes")
+	return remotes and remotes:FindFirstChild("Action")
 end
 
--- Fila con − valor +
-local function stepperRow(parent, order, getText, onMinus, onPlus)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 40)
-    row.BackgroundTransparency = 1
-    row.LayoutOrder = order
-    row.Parent = parent
+local function equipWeapon()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return nil end
 
-    local lbl = label(row, "", 13, PALETTE.text, true)
-    lbl.Size = UDim2.new(1, -96, 1, 0)
+	local tool = char:FindFirstChild(WEAPON_NAME)
+	if tool and tool:IsA("Tool") then
+		return tool
+	end
 
-    local minus = button(row, "−", UDim2.new(0, 36, 0, 32), PALETTE.track)
-    minus.Position = UDim2.new(1, -84, 0.5, -16)
-    minus.TextSize = 18
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	local inBackpack = backpack and backpack:FindFirstChild(WEAPON_NAME)
+	if inBackpack and inBackpack:IsA("Tool") then
+		hum:EquipTool(inBackpack)
+		return inBackpack
+	end
 
-    local plus = button(row, "+", UDim2.new(0, 36, 0, 32), PALETTE.track)
-    plus.Position = UDim2.new(1, -40, 0.5, -16)
-    plus.TextSize = 18
-
-    minus.Activated:Connect(onMinus)
-    plus.Activated:Connect(onPlus)
-
-    return {
-        refresh = function() lbl.Text = getText() end,
-    }
+	return getEquippedTool()
 end
 
-local function makeDraggable(handle, frame)
-    local dragging, startInput, startPos = false, nil, nil
-    handle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            startInput = input.Position
-            startPos = frame.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local d = input.Position - startInput
-            frame.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y
-            )
-        end
-    end)
+local function fireAttack()
+	local tool = equipWeapon()
+
+	if USE_TOOL_ACTIVATE and tool and tool.Parent == player.Character then
+		tool:Activate()
+	end
+
+	if FIRE_REMOTE then
+		local remote = getAttackRemote()
+		if not remote then
+			warnOnce("remote", "No encontré ReplicatedStorage.BAD.Remotes.Action")
+			return
+		end
+		for _, step in ipairs(ATTACK_STEPS) do
+			for _ = 1, step.count do
+				remote:FireServer("attack", step.arg)
+			end
+		end
+	end
 end
 
--- Panel principal
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.AnchorPoint = Vector2.new(0.5, 0.5)
-main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.new(0, 280, 0, 430)
-main.BackgroundColor3 = PALETTE.bg
-main.BorderSizePixel = 0
-main.Parent = gui
-corner(main, 18)
-stroke(main, PALETTE.accent, 1.2, 0.5)
+local function refreshEnemies()
+	local folder = workspace:FindFirstChild(ENEMIES_FOLDER)
+	if not folder then
+		warnOnce("folder", "No encontré workspace." .. ENEMIES_FOLDER)
+		enemyCache = {}
+		return
+	end
+	local list = {}
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("Humanoid") then
+			table.insert(list, d)
+		end
+	end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") and not model:FindFirstChildOfClass("Humanoid") then
+			table.insert(list, model)
+		end
+	end
+	enemyCache = list
+end
 
-local mainScale = Instance.new("UIScale")
-mainScale.Parent = main
+local function getEnemyPart(entry)
+	if not entry or not entry.Parent then return nil end
+	local model = entry
+	if entry:IsA("Humanoid") then
+		if entry.Health <= 0 then return nil end
+		model = entry.Parent
+	end
+	if not model or not model.Parent then return nil end
+	return model:FindFirstChild("HumanoidRootPart")
+		or (model:IsA("Model") and model.PrimaryPart)
+		or model:FindFirstChildWhichIsA("BasePart", true)
+end
 
--- Cabecera
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 52)
-header.BackgroundTransparency = 1
-header.Parent = main
+local function findNearestEnemy()
+	local _, root = getParts()
+	if not root then return nil end
 
-local title = label(header, "Cofres", 17, PALETTE.text, true)
-title.Position = UDim2.new(0, 16, 0, 8)
-title.Size = UDim2.new(1, -110, 0, 22)
+	local best, bestDist = nil, DETECT_RANGE
+	for _, entry in ipairs(enemyCache) do
+		local part = getEnemyPart(entry)
+		if part then
+			local d = (part.Position - root.Position).Magnitude
+			if d < bestDist then
+				best, bestDist = part, d
+			end
+		end
+	end
+	return best
+end
 
-local subtitle = label(header, statusText, 11, PALETTE.muted, false)
-subtitle.Position = UDim2.new(0, 16, 0, 30)
-subtitle.Size = UDim2.new(1, -110, 0, 14)
-subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+local function getEvadeVector()
+	if not keepDistance or combatMode ~= "ranged" or isBusy() then return nil end
+	local _, root = getParts()
+	if not root then return nil end
 
-local minBtn = button(header, "—", UDim2.new(0, 34, 0, 34), PALETTE.card)
-minBtn.Position = UDim2.new(1, -80, 0, 9)
-local closeBtn = button(header, "✕", UDim2.new(0, 34, 0, 34), PALETTE.red)
-closeBtn.Position = UDim2.new(1, -40, 0, 9)
+	local sum = Vector3.zero
+	for _, entry in ipairs(enemyCache) do
+		local part = getEnemyPart(entry)
+		if part then
+			local offset = root.Position - part.Position
+			local flat = Vector3.new(offset.X, 0, offset.Z)
+			local d = flat.Magnitude
+			if d < SAFE_DISTANCE then
+				local dir = d > 0.01 and flat.Unit or Vector3.new(0, 0, 1)
+				local weight = 0.35 + 0.65 * (1 - d / SAFE_DISTANCE)
+				sum = sum + dir * weight
+			end
+		end
+	end
+	if sum.Magnitude < 0.01 then return nil end
+	return sum.Unit
+end
 
--- Cuerpo
-local body = Instance.new("Frame")
-body.Position = UDim2.new(0, 0, 0, 52)
-body.Size = UDim2.new(1, 0, 1, -52)
-body.BackgroundTransparency = 1
-body.Parent = main
-
-local bodyLayout = listLayout(body, 10)
-local bodyPad = Instance.new("UIPadding")
-bodyPad.PaddingLeft = UDim.new(0, 14)
-bodyPad.PaddingRight = UDim.new(0, 14)
-bodyPad.PaddingTop = UDim.new(0, 2)
-bodyPad.Parent = body
-
--- Estadísticas
-local statCard = card(body, 1, 62)
-local recLbl = label(statCard, "RECOGIDOS", 10, PALETTE.muted, true)
-recLbl.Position = UDim2.new(0, 14, 0, 9)
-recLbl.Size = UDim2.new(0.5, -14, 0, 14)
-
-local countLabel = label(statCard, "0", 20, PALETTE.green, true)
-countLabel.Position = UDim2.new(0, 14, 0, 24)
-countLabel.Size = UDim2.new(0.5, -14, 0, 26)
-
-local spaceLbl = label(statCard, "ESPACIO", 10, PALETTE.muted, true)
-spaceLbl.Position = UDim2.new(0.5, 0, 0, 9)
-spaceLbl.Size = UDim2.new(0.5, -14, 0, 14)
-
-local vaultLabel = label(statCard, "0/0", 20, PALETTE.accent, true)
-vaultLabel.Position = UDim2.new(0.5, 0, 0, 24)
-vaultLabel.Size = UDim2.new(0.5, -14, 0, 26)
-
--- Barra de espacio
-local barTrack = Instance.new("Frame")
-barTrack.Size = UDim2.new(1, 0, 0, 6)
-barTrack.BackgroundColor3 = PALETTE.track
-barTrack.BorderSizePixel = 0
-barTrack.LayoutOrder = 2
-barTrack.Parent = body
-corner(barTrack, 3)
-
-local barFill = Instance.new("Frame")
-barFill.Size = UDim2.new(0, 0, 1, 0)
-barFill.BackgroundColor3 = PALETTE.accent
-barFill.BorderSizePixel = 0
-barFill.Parent = barTrack
-corner(barFill, 3)
-
--- Opciones con casillas
-local optCard = card(body, 3, 128)
-padCard(optCard, 12)
-local optList = listLayout(optCard, 2)
-
-local autoRow = checkRow(optCard, "Recolección automática", 1, auto, function(v)
-    auto = v
-    setStatus(v and "Buscando cofres..." or "Recolección apagada")
+task.spawn(function()
+	while running do
+		if attackOn() or keepDistance or tpEnemy then
+			refreshEnemies()
+		end
+		task.wait(0.25)
+	end
 end)
 
-local returnRow = checkRow(optCard, "Ir al barco y volver", 2, returnToSpot, function(v)
-    returnToSpot = v
-    setStatus(v and "Volverá a tu posición tras guardar" or "Se quedará en el barco tras guardar")
+track(RunService.Heartbeat:Connect(function()
+	if attackOn() or keepDistance or tpEnemy then
+		currentTarget = findNearestEnemy()
+	else
+		currentTarget = nil
+	end
+end))
+
+RunService:BindToRenderStep("CFlyCombat", Enum.RenderPriority.Input.Value + 1, function()
+	local hum, root = getParts()
+	if not hum or not root or flying or isBusy() then return end
+
+	local evade = getEvadeVector()
+	if evade then
+		hum:Move(evade, false)
+		local v = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(evade.X * EVADE_SPEED, v.Y, evade.Z * EVADE_SPEED)
+	end
+
+	local aiming = attackOn() and currentTarget ~= nil and currentTarget.Parent ~= nil
+	if aiming then
+		hum.AutoRotate = false
+		wasAiming = true
+		local p = currentTarget.Position
+		local from = root.Position
+		root.CFrame = CFrame.lookAt(from, Vector3.new(p.X, from.Y, p.Z))
+	elseif wasAiming then
+		hum.AutoRotate = true
+		wasAiming = false
+	end
 end)
 
-local othersRow = checkRow(optCard, "Solo cofres de otros jugadores", 3, onlyOthers, function(v)
-    onlyOthers = v
-    setStatus(v and "Modo: solo cofres de otros" or "Modo: no tomar cofres de otros")
+RunService:BindToRenderStep("CFlyTeleport", Enum.RenderPriority.Last.Value, function()
+	if not (tpEnemy or tpAttack) or isBusy() then return end
+	local hum, root = getParts()
+	if not hum or not root then return end
+	if not currentTarget or not currentTarget.Parent then return end
+
+	local targetPos = currentTarget.Position
+	local offset = root.Position - targetPos
+	local flat = Vector3.new(offset.X, 0, offset.Z)
+	local away = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+
+	local dest = targetPos + away * TP_DISTANCE
+	root.CFrame = CFrame.lookAt(dest, Vector3.new(targetPos.X, dest.Y, targetPos.Z))
+	root.AssemblyLinearVelocity = Vector3.zero
 end)
 
--- Ajustes con − +
-local setCard = card(body, 4, 92)
-local setList = listLayout(setCard, 2)
-local setPad = Instance.new("UIPadding")
-setPad.PaddingLeft = UDim.new(0, 12)
-setPad.PaddingRight = UDim.new(0, 12)
-setPad.PaddingTop = UDim.new(0, 6)
-setPad.Parent = setCard
-
-local capStepper = stepperRow(setCard, 1,
-    function() return "Espacio de bóveda: " .. capacity end,
-    function()
-        capacity = math.max(1, capacity - 1)
-        refreshUI()
-    end,
-    function()
-        capacity = math.min(CONFIG.CAPACIDAD_MAX, capacity + 1)
-        refreshUI()
-    end
-)
-
-local waitStepper = stepperRow(setCard, 2,
-    function() return "Espera en barco: " .. waitOnBoat .. " s" end,
-    function()
-        waitOnBoat = math.max(0, waitOnBoat - 1)
-        refreshUI()
-    end,
-    function()
-        waitOnBoat = math.min(CONFIG.ESPERA_BARCO_MAX, waitOnBoat + 1)
-        refreshUI()
-    end
-)
-
--- Modo de viaje
-local modeRow = Instance.new("Frame")
-modeRow.Size = UDim2.new(1, 0, 0, 38)
-modeRow.BackgroundTransparency = 1
-modeRow.LayoutOrder = 5
-modeRow.Parent = body
-
-local modeList = Instance.new("UIListLayout")
-modeList.FillDirection = Enum.FillDirection.Horizontal
-modeList.Padding = UDim.new(0, 8)
-modeList.Parent = modeRow
-
-local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -4, 1, 0), PALETTE.card)
-local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -4, 1, 0), PALETTE.card)
-
-makeDraggable(header, main)
-
--- Minimizado (cuadrado)
-local mini = button(gui, "🏴‍☠️", UDim2.new(0, 52, 0, 52), PALETTE.card)
-mini.TextSize = 22
-mini.Visible = false
-stroke(mini, PALETTE.accent, 1.2, 0.3)
-local miniScale = Instance.new("UIScale")
-miniScale.Parent = mini
-makeDraggable(mini, mini)
-
-local camera = Workspace.CurrentCamera
-local function updateScale()
-    local vp = camera.ViewportSize
-    local s = math.clamp(math.min(vp.X / 360, vp.Y / 500), 0.6, 1)
-    mainScale.Scale = s
-    miniScale.Scale = s
-end
-updateScale()
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
-
-refreshUI = function()
-    local used = usedSpace()
-    subtitle.Text = statusText
-    countLabel.Text = tostring(collectedCount)
-    vaultLabel.Text = used .. "/" .. capacity
-    barFill.Size = UDim2.new(math.clamp(used / math.max(capacity, 1), 0, 1), 0, 1, 0)
-
-    tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
-    glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
-
-    capStepper.refresh()
-    waitStepper.refresh()
+local function startAttackLoop()
+	attackToken += 1
+	local token = attackToken
+	task.spawn(function()
+		while running and attackOn() and token == attackToken do
+			local _, root = getParts()
+			if root and currentTarget and currentTarget.Parent and not isBusy() then
+				local dist = (currentTarget.Position - root.Position).Magnitude
+				if combatMode == "ranged" or dist <= MELEE_RANGE then
+					fireAttack()
+				end
+			end
+			task.wait(ATTACK_INTERVAL)
+		end
+	end)
 end
 
----------------------------------------------------------------
--- EVENTOS
----------------------------------------------------------------
-tpBtn.Activated:Connect(function()
-    mode = "TP"
-    refreshUI()
+local function setAutoAttack(state)
+	autoAttack = state
+	if attackOn() then
+		refreshEnemies()
+		startAttackLoop()
+	end
+end
+
+local function setTpAttack(state)
+	tpAttack = state
+	if attackOn() then
+		refreshEnemies()
+		startAttackLoop()
+	end
+end
+
+local function setTpEnemy(state)
+	tpEnemy = state
+	if state then refreshEnemies() end
+end
+
+local function setKeepDistance(state)
+	keepDistance = state
+	if state then refreshEnemies() end
+end
+
+---------------------------------------------------------------------
+-- PROMPTS (helpers compartidos)
+---------------------------------------------------------------------
+local function promptPosition(prompt)
+	local par = prompt.Parent
+	if not par then return nil end
+	if par:IsA("Attachment") then
+		return par.WorldPosition
+	elseif par:IsA("BasePart") then
+		return par.Position
+	elseif par:IsA("Model") then
+		return par:GetPivot().Position
+	end
+	local m = par:FindFirstAncestorOfClass("Model")
+	return m and m:GetPivot().Position or nil
+end
+
+local function getPosition(obj)
+	if obj:IsA("BasePart") then
+		return obj.Position
+	elseif obj:IsA("Model") then
+		return obj:GetPivot().Position
+	elseif obj:IsA("Attachment") then
+		return obj.WorldPosition
+	end
+	local part = obj:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function findPromptIn(inst)
+	if inst:IsA("ProximityPrompt") then return inst end
+	return inst:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+-- Prompt dentro del objeto o, si no hay, el más cercano dentro del rango
+local function findPromptFor(inst)
+	local inside = findPromptIn(inst)
+	if inside then return inside end
+
+	local pos = getPosition(inst)
+	if not pos then return nil end
+	local closest, closestD
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			local pp = promptPosition(d)
+			if pp then
+				local dist = (pp - pos).Magnitude
+				if dist <= PROMPT_NEARBY_RANGE and (not closestD or dist < closestD) then
+					closest, closestD = d, dist
+				end
+			end
+		end
+	end
+	return closest
+end
+
+-- CFrame desde el que el jugador puede usar el prompt
+local function standCFrameFor(prompt)
+	local pos = promptPosition(prompt)
+	if not pos then return nil end
+	local dest = pos + PROMPT_STAND_OFFSET
+	return CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z)), pos
+end
+
+---------------------------------------------------------------------
+-- AUTO-COFRES
+---------------------------------------------------------------------
+local function getChestPrompts()
+	local root = workspace:FindFirstChild(CHEST_ROOT)
+	if not root then
+		warnOnce("chestroot", "No encontré workspace." .. CHEST_ROOT)
+		return {}
+	end
+	local list = {}
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled and d:FindFirstAncestor(CHEST_NAME) then
+			table.insert(list, d)
+		end
+	end
+	return list
+end
+
+local function collectChest(prompt)
+	local _, root = getParts()
+	if not root then return end
+	local pos = promptPosition(prompt)
+	if not pos then return end
+
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		if prompt.MaxActivationDistance < 12 then
+			prompt.MaxActivationDistance = 12
+		end
+	end)
+
+	teleportCharacter(CFrame.new(pos + Vector3.new(0, CHEST_OFFSET_Y, 0)))
+	task.wait(CHEST_TP_DELAY)
+
+	if prompt.Parent and prompt.Enabled then
+		pcall(function() prompt:InputHoldBegin() end)
+		task.wait(math.max(prompt.HoldDuration, 0) + 0.2)
+		pcall(function() prompt:InputHoldEnd() end)
+	end
+end
+
+local function startChestLoop()
+	chestToken += 1
+	local token = chestToken
+	task.spawn(function()
+		local lastReset = os.clock()
+		while running and autoChest and token == chestToken do
+			local hum, root = getParts()
+			if hum and root and hum.Health > 0 and not crystalBusy and not healBusy then
+				local best, bestD
+				for _, p in ipairs(getChestPrompts()) do
+					if (chestAttempts[p] or 0) < CHEST_MAX_TRIES then
+						local pos = promptPosition(p)
+						if pos then
+							local d = (pos - root.Position).Magnitude
+							if not bestD or d < bestD then
+								best, bestD = p, d
+							end
+						end
+					end
+				end
+
+				if best then
+					chestBusy = true
+					pcall(collectChest, best)
+					chestAttempts[best] = (chestAttempts[best] or 0) + 1
+					if not best.Parent or not best.Enabled then
+						chestsCollected += 1
+						if chestSub then
+							chestSub.Text = "Cofres recogidos: " .. chestsCollected
+						end
+					end
+					chestBusy = false
+				else
+					if os.clock() - lastReset > 10 then
+						chestAttempts = {}
+						lastReset = os.clock()
+					end
+					task.wait(0.8)
+				end
+			end
+			task.wait(0.15)
+		end
+		if token == chestToken then
+			chestBusy = false
+		end
+	end)
+end
+
+local function setAutoChest(state)
+	autoChest = state
+	chestToken += 1
+	if state then
+		chestAttempts = {}
+		startChestLoop()
+	else
+		chestBusy = false
+	end
+end
+
+---------------------------------------------------------------------
+-- CRISTALES
+---------------------------------------------------------------------
+local function getCrystalModels()
+	local list = {}
+	for _, m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name == CRYSTAL_NAME and m.Parent then
+			table.insert(list, m)
+		end
+	end
+	return list
+end
+
+local function crystalAlive(m)
+	if not m or not m.Parent then return false end
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health <= 0 then return false end
+	return true
+end
+
+local function teleportNearCrystal(model)
+	local _, root = getParts()
+	if not root then return end
+	local pos = model:GetPivot().Position
+	local offset = root.Position - pos
+	local flat = Vector3.new(offset.X, 0, offset.Z)
+	local away = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+	local dest = pos + away * CRYSTAL_TP_DISTANCE + Vector3.new(0, 1.5, 0)
+	teleportCharacter(CFrame.lookAt(dest, Vector3.new(pos.X, dest.Y, pos.Z)))
+end
+
+local function farmCrystal(model)
+	local startT = os.clock()
+	while running and crystalFarm and crystalAlive(model) and os.clock() - startT < CRYSTAL_TIMEOUT do
+		local hum, root = getParts()
+		if hum and root and hum.Health > 0 and not healBusy then
+			teleportNearCrystal(model)
+			fireAttack()
+		end
+		task.wait(CRYSTAL_ATTACK_INTERVAL)
+	end
+end
+
+local function updateCrystalLabel()
+	if crystalSub then
+		crystalSub.Text = "Cristales rotos: " .. crystalsCollected
+	end
+end
+
+local function startCrystalLoop()
+	crystalToken += 1
+	local token = crystalToken
+	task.spawn(function()
+		while running and crystalFarm and token == crystalToken do
+			local hum, root = getParts()
+			if hum and root and hum.Health > 0 and not healBusy then
+				local best, bestD
+				local now = os.clock()
+				for _, m in ipairs(getCrystalModels()) do
+					if not crystalSkip[m] or now > crystalSkip[m] then
+						local d = (m:GetPivot().Position - root.Position).Magnitude
+						if not bestD or d < bestD then
+							best, bestD = m, d
+						end
+					end
+				end
+
+				if best then
+					crystalBusy = true
+					pcall(farmCrystal, best)
+					if not crystalAlive(best) then
+						crystalsCollected += 1
+						updateCrystalLabel()
+					else
+						crystalSkip[best] = os.clock() + CRYSTAL_SKIP_TIME
+					end
+					crystalBusy = false
+				else
+					task.wait(1)
+				end
+			else
+				task.wait(0.5)
+			end
+			task.wait(0.05)
+		end
+		crystalBusy = false
+	end)
+end
+
+local function setCrystalFarm(state)
+	crystalFarm = state
+	crystalToken += 1
+	if state then
+		crystalSkip = {}
+		startCrystalLoop()
+	else
+		crystalBusy = false
+	end
+end
+
+---------------------------------------------------------------------
+-- APAGAR / RESTAURAR OPCIONES AL CURARSE (modo manual)
+---------------------------------------------------------------------
+local function registerFeature(name, setFn, getFn)
+	table.insert(featureToggles, { name = name, set = setFn, get = getFn })
+end
+
+-- Apaga todo lo de Combate y Farm que esté activo y guarda cuáles eran
+local function disableFeatures()
+	featureSnapshot = {}
+	for _, f in ipairs(featureToggles) do
+		if f.get() then
+			featureSnapshot[f.name] = true
+			f.set(false)
+		end
+	end
+end
+
+-- Vuelve a activar solo las que estaban encendidas antes
+local function restoreFeatures()
+	if not featureSnapshot then return end
+	local snap = featureSnapshot
+	featureSnapshot = nil
+	for _, f in ipairs(featureToggles) do
+		if snap[f.name] then
+			f.set(true)
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- CURACIÓN EN FOUNTAIN (manual y automática)
+---------------------------------------------------------------------
+local function findFountain()
+	local found
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d.Name == FOUNTAIN_NAME and (d:IsA("BasePart") or d:IsA("Model")) then
+			local prompt = findPromptIn(d)
+			if prompt then
+				return d, prompt
+			end
+			found = found or d
+		end
+	end
+
+	if found then
+		local pos = getPosition(found)
+		local closest, closestD
+		if pos then
+			for _, p in ipairs(workspace:GetDescendants()) do
+				if p:IsA("ProximityPrompt") then
+					local pp = promptPosition(p)
+					if pp then
+						local dist = (pp - pos).Magnitude
+						if dist < PROMPT_NEARBY_RANGE and (not closestD or dist < closestD) then
+							closest, closestD = p, dist
+						end
+					end
+				end
+			end
+		end
+		return found, closest
+	end
+	return nil, nil
+end
+
+-- Lleva al personaje a la fuente y guarda su posición anterior
+local function moveToFountain()
+	local _, root = getParts()
+	if not root then return false end
+
+	local fountain, prompt = findFountain()
+	if not fountain then
+		setStatus("No encontré Fountain")
+		return false
+	end
+
+	local cf
+	if prompt then
+		cf = standCFrameFor(prompt)
+	end
+	if not cf then
+		local pos = getPosition(fountain)
+		if not pos then
+			setStatus("Fountain no tiene posición")
+			return false
+		end
+		cf = CFrame.new(pos + PROMPT_STAND_OFFSET)
+	end
+
+	if not atFountain then
+		savedHealCF = root.CFrame
+	end
+	teleportCharacter(cf)
+	atFountain = true
+	return true, fountain, prompt
+end
+
+local function returnFromFountain()
+	if savedHealCF then
+		teleportCharacter(savedHealCF)
+		savedHealCF = nil
+	end
+	atFountain = false
+	setHealVisual(false)
+	restoreFeatures()
+end
+
+-- Botón manual: 1ª vez va a Fountain (y apaga lo de combate/farm), 2ª vez vuelve
+local function onManualHealTap()
+	if atFountain then
+		returnFromFountain()
+		setStatus("Regresaste a tu posición guardada.")
+	else
+		local ok = moveToFountain()
+		if ok then
+			disableFeatures()
+			setHealVisual(true)
+			setStatus("En Fountain. Activa el prompt; con ↩ Volver regresas.")
+		end
+	end
+end
+
+-- Automático: al bajar del 20% va a la fuente, espera a 95% y regresa
+local function runAutoHeal()
+	if healBusy or atFountain then return end
+	local hum, root = getParts()
+	if not hum or not root or hum.Health <= 0 then return end
+
+	local ok, fountain, prompt = moveToFountain()
+	if not ok then return end
+
+	healBusy = true
+	healToken += 1
+	local token = healToken
+	setHealVisual(true)
+	setStatus("Curando automáticamente...")
+
+	local fpos = getPosition(fountain)
+	if prompt then fpos = promptPosition(prompt) or fpos end
+
+	while running and healMode == "auto" and token == healToken do
+		local h, r = getParts()
+		if not h or not r or h.Health <= 0 then break end
+		if h.Health >= h.MaxHealth * HEAL_DONE then break end
+
+		-- Si te devolvieron sin curarte, vuelves a la fuente
+		if fpos and (r.Position - fpos).Magnitude > HEAL_RETURN_DIST then
+			local cf = prompt and standCFrameFor(prompt)
+			teleportCharacter(cf or CFrame.new(fpos + PROMPT_STAND_OFFSET))
+		end
+
+		if prompt and prompt.Parent and prompt.Enabled then
+			pcall(function() prompt.RequiresLineOfSight = false end)
+			if typeof(fireproximityprompt) == "function" then
+				pcall(fireproximityprompt, prompt)
+			else
+				pcall(function() prompt:InputHoldBegin() end)
+				task.wait(math.max(prompt.HoldDuration, 0) + 0.3)
+				pcall(function() prompt:InputHoldEnd() end)
+			end
+		end
+		task.wait(HEAL_POLL)
+	end
+
+	if token == healToken then
+		local h, r = getParts()
+		if healMode == "auto" and h and r and h.Health > 0 and h.Health >= h.MaxHealth * HEAL_DONE then
+			returnFromFountain()
+			setStatus("Curado. Regresaste a tu posición.")
+		elseif not (h and h.Health > 0) then
+			savedHealCF = nil
+			atFountain = false
+		end
+		healBusy = false
+	end
+end
+
+local autoWatcherRunning = false
+local function startAutoWatcher()
+	if autoWatcherRunning then return end
+	autoWatcherRunning = true
+	task.spawn(function()
+		while running do
+			if healMode == "auto" and not healBusy and not atFountain then
+				local hum = getParts()
+				if hum and hum.Health > 0 and hum.Health <= hum.MaxHealth * HEAL_THRESHOLD then
+					runAutoHeal()
+					task.wait(HEAL_COOLDOWN)
+				end
+			end
+			task.wait(0.2)
+		end
+		autoWatcherRunning = false
+	end)
+end
+
+-- Cambia el modo: "manual", "auto" o "off"
+local function setHealModeOption(mode)
+	if healMode == mode then return end
+
+	-- Si estabas en Fountain, regresa antes de cambiar de modo
+	if atFountain then
+		returnFromFountain()
+	end
+
+	healMode = mode
+
+	for key, b in pairs(healModeButtons) do
+		local active = key == mode
+		tween(b, { BackgroundColor3 = active and COLORS.accentA or COLORS.off })
+		b.TextColor3 = active and Color3.new(1, 1, 1) or COLORS.subtext
+	end
+
+	if mode == "off" then
+		healBusy = false
+		healToken += 1
+	end
+	setHealModeVisual()
+	startAutoWatcher()
+end
+
+---------------------------------------------------------------------
+-- JEFES (StarRune)
+---------------------------------------------------------------------
+local function normalizeName(s)
+	return string.lower((string.gsub(s, "%s+", "")))
+end
+
+local function isBossName(name)
+	local pattern = "^" .. string.lower(BOSS_NAME) .. "%d*$"
+	return string.match(normalizeName(name), pattern) ~= nil
+end
+
+local function getStarRunes()
+	local found, seen = {}, {}
+
+	local function scan(root)
+		for _, d in ipairs(root:GetDescendants()) do
+			if not seen[d] and isBossName(d.Name) then
+				seen[d] = true
+				local nested = false
+				local anc = d.Parent
+				while anc and anc ~= game do
+					if seen[anc] then
+						nested = true
+						break
+					end
+					anc = anc.Parent
+				end
+				if not nested then
+					table.insert(found, d)
+				end
+			end
+		end
+	end
+
+	scan(workspace)
+	if #found == 0 then
+		scan(ReplicatedStorage)
+		scan(Lighting)
+	end
+	return found
+end
+
+local function fightBoss(index)
+	local inst = bossEntries[index]
+	if not inst or not inst.Parent then
+		refreshBosses()
+		inst = bossEntries[index]
+		if not inst then
+			setStatus("Jefe " .. index .. " no encontrado. Pulsa Buscar jefes.")
+			return
+		end
+	end
+
+	local prompt = findPromptFor(inst)
+	if prompt then
+		local cf = standCFrameFor(prompt)
+		if cf then
+			teleportCharacter(cf)
+			setStatus("Jefe " .. index .. ": activa su prompt manualmente.")
+			return
+		end
+	end
+
+	local pos = getPosition(inst)
+	if not pos then
+		setStatus("Jefe " .. index .. " no tiene posición")
+		return
+	end
+	teleportCharacter(CFrame.new(pos + Vector3.new(0, BOSS_FALLBACK_HEIGHT, 0)))
+	setStatus("Jefe " .. index .. ": llegaste (sin prompt cercano).")
+end
+
+---------------------------------------------------------------------
+-- VUELO (CFLY)
+---------------------------------------------------------------------
+setFlyVisual = function(on)
+	if flyBtn then
+		flyBtn.Text = on and "✈ ON" or "✈ OFF"
+		tween(flyBtn, { BackgroundColor3 = on and COLORS.flyOn or COLORS.flyOff })
+	end
+end
+
+setHealVisual = function(atF)
+	if healBtn then
+		healBtn.Text = atF and "↩ Volver" or "🏥 Curar"
+		tween(healBtn, { BackgroundColor3 = atF and COLORS.healBack or COLORS.heal })
+	end
+end
+
+-- Manual: barra dividida (Curar | FLY). Automático u off: solo FLY.
+setHealModeVisual = function()
+	if not healBtn then return end
+	local manual = healMode == "manual"
+	healBtn.Visible = manual
+	flyBtn.Size = manual and UDim2.new(0.5, -5, 1, -6) or UDim2.new(1, -6, 1, -6)
+	flyBtn.Position = manual and UDim2.new(0.5, 2, 0, 3) or UDim2.new(0, 3, 0, 3)
+end
+
+local function stopFly()
+	flying = false
+	if connection then
+		connection:Disconnect()
+		connection = nil
+	end
+	if flyVelocity then
+		flyVelocity:Destroy()
+		flyVelocity = nil
+	end
+	if flyAttachment then
+		flyAttachment:Destroy()
+		flyAttachment = nil
+	end
+	local hum = getParts()
+	if hum then
+		hum.PlatformStand = false
+	end
+	setFlyVisual(false)
+	if setFlyRow then setFlyRow(false, true) end
+end
+
+local function startFly()
+	local hum, root = getParts()
+	if not hum or not root then return end
+
+	flying = true
+	hum.PlatformStand = true
+
+	flyAttachment = Instance.new("Attachment")
+	flyAttachment.Name = "CFlyAttachment"
+	flyAttachment.Parent = root
+
+	flyVelocity = Instance.new("LinearVelocity")
+	flyVelocity.Name = "CFlyVelocity"
+	flyVelocity.Attachment0 = flyAttachment
+	flyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	flyVelocity.MaxForce = math.huge
+	flyVelocity.VectorVelocity = Vector3.zero
+	flyVelocity.Parent = root
+
+	setFlyVisual(true)
+	if setFlyRow then setFlyRow(true, true) end
+
+	connection = RunService.RenderStepped:Connect(function(dt)
+		local h, r = getParts()
+		if not h or not r then return end
+
+		if isBusy() then
+			r.AssemblyLinearVelocity = Vector3.zero
+			return
+		end
+
+		local camCF = camera.CFrame
+		local look = camCF.LookVector
+		local flatLook = Vector3.new(look.X, 0, look.Z)
+		local flatRight = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
+
+		local move = h.MoveDirection
+		local forward, side = 0, 0
+		if flatLook.Magnitude > 0 then
+			forward = move:Dot(flatLook.Unit)
+		end
+		if flatRight.Magnitude > 0 then
+			side = move:Dot(flatRight.Unit)
+		end
+
+		local dir = Vector3.zero
+		if flatRight.Magnitude > 0 then
+			dir = (look * forward + flatRight.Unit * side) * SPEED
+		end
+
+		local evade = getEvadeVector()
+		if evade then
+			dir = dir + evade * EVADE_SPEED
+		end
+
+		local vertical = 0
+		if UserInputService:IsKeyDown(UP_KEY) or h.Jump then
+			vertical = VERTICAL_SPEED
+		elseif UserInputService:IsKeyDown(DOWN_KEY) then
+			vertical = -VERTICAL_SPEED
+		end
+
+		local velocity = dir + Vector3.new(0, vertical, 0)
+
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+
+		local pos = r.Position + velocity * dt
+
+		local faceDir = flatLook
+		if attackOn() and currentTarget and currentTarget.Parent then
+			local d = currentTarget.Position - r.Position
+			faceDir = Vector3.new(d.X, 0, d.Z)
+		end
+		if faceDir.Magnitude > 0 then
+			r.CFrame = CFrame.lookAt(pos, pos + faceDir)
+		else
+			r.CFrame = CFrame.new(pos) * (r.CFrame - r.Position)
+		end
+	end)
+end
+
+toggleFly = function()
+	if flying then
+		stopFly()
+	else
+		startFly()
+	end
+end
+
+---------------------------------------------------------------------
+-- NOCLIP
+---------------------------------------------------------------------
+local function setNoclip(state)
+	noclip = state
+	if noclipConn then
+		noclipConn:Disconnect()
+		noclipConn = nil
+	end
+
+	if state then
+		noclipConn = RunService.Stepped:Connect(function()
+			local char = player.Character
+			if not char then return end
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then
+					if originalCollide[part] == nil then
+						originalCollide[part] = part.CanCollide
+					end
+					part.CanCollide = false
+				end
+			end
+		end)
+	else
+		for part, original in pairs(originalCollide) do
+			if part and part.Parent then
+				part.CanCollide = original
+			end
+		end
+		originalCollide = {}
+	end
+end
+
+---------------------------------------------------------------------
+-- CERRAR EL SCRIPT
+---------------------------------------------------------------------
+local function shutdown()
+	running = false
+	autoAttack, tpAttack, tpEnemy, keepDistance = false, false, false, false
+	autoChest, crystalFarm = false, false
+	chestBusy, crystalBusy, healBusy = false, false, false
+	healMode = "off"
+	savedHealCF = nil
+	atFountain = false
+	featureSnapshot = nil
+	attackToken += 1
+	chestToken += 1
+	crystalToken += 1
+	healToken += 1
+
+	stopFly()
+	setNoclip(false)
+
+	pcall(function() RunService:UnbindFromRenderStep("CFlyCombat") end)
+	pcall(function() RunService:UnbindFromRenderStep("CFlyTeleport") end)
+
+	for _, c in ipairs(allConnections) do
+		c:Disconnect()
+	end
+	table.clear(allConnections)
+
+	local hum = getParts()
+	if hum then
+		hum.AutoRotate = true
+	end
+
+	gui:Destroy()
+end
+
+---------------------------------------------------------------------
+-- BARRA RECTANGULAR (Curar | FLY)
+---------------------------------------------------------------------
+bar = Instance.new("Frame")
+bar.Name = "CFlyBar"
+bar.Size = UDim2.fromOffset(BAR_W, BAR_H)
+bar.Position = UDim2.new(0.5, -BAR_W / 2, 0, 46)
+bar.BackgroundColor3 = COLORS.panel
+bar.BorderSizePixel = 0
+bar.Parent = gui
+corner(bar, UDim.new(0, 6))
+
+local barStroke = Instance.new("UIStroke")
+barStroke.Thickness = 1.2
+barStroke.Color = Color3.new(1, 1, 1)
+barStroke.Parent = bar
+
+local barGrad = Instance.new("UIGradient")
+barGrad.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+barGrad.Rotation = 45
+barGrad.Parent = barStroke
+
+local function makeBarButton(text, color)
+	local b = Instance.new("TextButton")
+	b.BackgroundColor3 = color
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 10
+	b.AutoButtonColor = false
+	b.Parent = bar
+	corner(b, UDim.new(0, 4))
+	return b
+end
+
+healBtn = makeBarButton("🏥 Curar", COLORS.heal)
+healBtn.Size = UDim2.new(0.5, -5, 1, -6)
+healBtn.Position = UDim2.new(0, 3, 0, 3)
+
+flyBtn = makeBarButton("✈ OFF", COLORS.flyOff)
+
+makeDraggable(healBtn, bar, function()
+	if healMode == "manual" then
+		onManualHealTap()
+	end
+end)
+makeDraggable(flyBtn, bar, function() toggleFly() end)
+
+---------------------------------------------------------------------
+-- BURBUJA DE MINIMIZAR (pequeña, cuadrada)
+---------------------------------------------------------------------
+menuBubble = Instance.new("TextButton")
+menuBubble.Name = "MenuBubble"
+menuBubble.Size = UDim2.fromOffset(MENU_SIZE, MENU_SIZE)
+menuBubble.Position = UDim2.fromOffset(20, 120)
+menuBubble.BackgroundColor3 = COLORS.accentA
+menuBubble.Text = "☰"
+menuBubble.TextColor3 = Color3.new(1, 1, 1)
+menuBubble.TextSize = 16
+menuBubble.Font = Enum.Font.GothamBold
+menuBubble.AutoButtonColor = false
+menuBubble.Visible = false
+menuBubble.Parent = gui
+corner(menuBubble, UDim.new(0, 8))
+
+local menuStroke = Instance.new("UIStroke")
+menuStroke.Thickness = 1.5
+menuStroke.Color = Color3.new(1, 1, 1)
+menuStroke.Parent = menuBubble
+
+---------------------------------------------------------------------
+-- PANEL
+---------------------------------------------------------------------
+local PANEL_W = 300
+local TITLE_H = 50
+local TAB_H = 34
+local FULL_H = 380
+panelW, panelFullH = PANEL_W, FULL_H
+
+panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.AnchorPoint = Vector2.new(0.5, 0)
+panel.Position = UDim2.new(0.5, 0, 0, 100)
+panel.Size = UDim2.fromOffset(PANEL_W, FULL_H)
+panel.BackgroundColor3 = COLORS.panel
+panel.BorderSizePixel = 0
+panel.ClipsDescendants = true
+panel.Parent = gui
+corner(panel, UDim.new(0, 22))
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Thickness = 2
+panelStroke.Color = Color3.new(1, 1, 1)
+panelStroke.Parent = panel
+
+local strokeGradient = Instance.new("UIGradient")
+strokeGradient.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+strokeGradient.Rotation = 45
+strokeGradient.Parent = panelStroke
+
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
+titleBar.BackgroundTransparency = 1
+titleBar.Active = true
+titleBar.Parent = panel
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(18, 0)
+title.Size = UDim2.new(1, -120, 1, 0)
+title.Text = "✈  CFly"
+title.TextColor3 = COLORS.text
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextTruncate = Enum.TextTruncate.AtEnd
+title.Parent = titleBar
+
+local divider = Instance.new("Frame")
+divider.Position = UDim2.new(0, 16, 0, TITLE_H)
+divider.Size = UDim2.new(1, -32, 0, 2)
+divider.BackgroundColor3 = Color3.new(1, 1, 1)
+divider.BorderSizePixel = 0
+divider.Parent = panel
+corner(divider, UDim.new(1, 0))
+local dividerGradient = Instance.new("UIGradient")
+dividerGradient.Color = ColorSequence.new(COLORS.accentA, COLORS.accentB)
+dividerGradient.Parent = divider
+
+local function makeCircleButton(text, color, xOffset)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(30, 30)
+	b.Position = UDim2.new(1, xOffset, 0, 10)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(30, 30, 40)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 15
+	b.AutoButtonColor = true
+	b.Parent = panel
+	corner(b, UDim.new(1, 0))
+	return b
+end
+
+local minBtn = makeCircleButton("−", COLORS.yellow, -76)
+local closeBtn = makeCircleButton("✕", COLORS.red, -40)
+
+-- Pestañas
+local tabBar = Instance.new("Frame")
+tabBar.Name = "Tabs"
+tabBar.Position = UDim2.fromOffset(12, TITLE_H + 8)
+tabBar.Size = UDim2.new(1, -24, 0, TAB_H)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = panel
+
+local pagesHolder = Instance.new("Frame")
+pagesHolder.Position = UDim2.fromOffset(12, TITLE_H + TAB_H + 18)
+pagesHolder.Size = UDim2.new(1, -24, 1, -(TITLE_H + TAB_H + 26))
+pagesHolder.BackgroundTransparency = 1
+pagesHolder.Parent = panel
+
+local pages, tabButtons = {}, {}
+
+local function showTab(name)
+	for key, page in pairs(pages) do
+		page.Visible = key == name
+	end
+	for key, b in pairs(tabButtons) do
+		local active = key == name
+		tween(b, { BackgroundColor3 = active and COLORS.accentA or COLORS.off })
+		b.TextColor3 = active and Color3.new(1, 1, 1) or COLORS.subtext
+	end
+end
+
+local function makeTab(name, text, index)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0.25, -4, 1, 0)
+	b.Position = UDim2.new(0.25 * (index - 1), 2, 0, 0)
+	b.Text = text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.AutoButtonColor = false
+	b.BorderSizePixel = 0
+	b.BackgroundColor3 = COLORS.off
+	b.TextColor3 = COLORS.subtext
+	b.Parent = tabBar
+	corner(b, UDim.new(0, 10))
+	b.Activated:Connect(function()
+		showTab(name)
+	end)
+	tabButtons[name] = b
+
+	local page = Instance.new("ScrollingFrame")
+	page.BackgroundTransparency = 1
+	page.BorderSizePixel = 0
+	page.Size = UDim2.new(1, 0, 1, 0)
+	page.CanvasSize = UDim2.new()
+	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	page.ScrollBarThickness = 3
+	page.ScrollBarImageColor3 = COLORS.accentA
+	page.Visible = false
+	page.Parent = pagesHolder
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = page
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.PaddingBottom = UDim.new(0, 6)
+	pad.Parent = page
+
+	pages[name] = page
+	return page
+end
+
+-- Fila con interruptor. Devuelve set, etiqueta de subtítulo y getter del estado.
+local function createRow(page, order, titleText, subtitleText, initial, callback)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 56)
+	row.BackgroundColor3 = COLORS.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = page
+	corner(row, UDim.new(0, 14))
+
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Position = UDim2.fromOffset(14, 8)
+	t.Size = UDim2.new(1, -92, 0, 20)
+	t.Text = titleText
+	t.TextColor3 = COLORS.text
+	t.Font = Enum.Font.GothamBold
+	t.TextSize = 14
+	t.TextXAlignment = Enum.TextXAlignment.Left
+	t.TextTruncate = Enum.TextTruncate.AtEnd
+	t.Parent = row
+
+	local s = Instance.new("TextLabel")
+	s.BackgroundTransparency = 1
+	s.Position = UDim2.fromOffset(14, 29)
+	s.Size = UDim2.new(1, -92, 0, 16)
+	s.Text = subtitleText
+	s.TextColor3 = COLORS.subtext
+	s.Font = Enum.Font.Gotham
+	s.TextSize = 11
+	s.TextXAlignment = Enum.TextXAlignment.Left
+	s.TextTruncate = Enum.TextTruncate.AtEnd
+	s.Parent = row
+
+	local sw = Instance.new("Frame")
+	sw.Size = UDim2.fromOffset(50, 28)
+	sw.Position = UDim2.new(1, -62, 0.5, -14)
+	sw.BackgroundColor3 = COLORS.off
+	sw.BorderSizePixel = 0
+	sw.Parent = row
+	corner(sw, UDim.new(1, 0))
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(22, 22)
+	knob.Position = UDim2.new(0, 3, 0.5, -11)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.BorderSizePixel = 0
+	knob.Parent = sw
+	corner(knob, UDim.new(1, 0))
+
+	local hit = Instance.new("TextButton")
+	hit.Size = UDim2.new(1, 0, 1, 0)
+	hit.BackgroundTransparency = 1
+	hit.Text = ""
+	hit.ZIndex = 5
+	hit.Parent = row
+
+	local state = initial
+	local function get()
+		return state
+	end
+	local function set(value, silent)
+		state = value
+		tween(sw, { BackgroundColor3 = value and COLORS.on or COLORS.off })
+		tween(row, { BackgroundColor3 = value and COLORS.rowOn or COLORS.row })
+		tween(knob, { Position = value and UDim2.new(1, -25, 0.5, -11) or UDim2.new(0, 3, 0.5, -11) })
+		if not silent and callback then
+			callback(value)
+		end
+	end
+
+	hit.Activated:Connect(function()
+		set(not state)
+	end)
+
+	set(initial, true)
+	return set, s, get
+end
+
+-- Botón de acción
+local function createButtonRow(page, order, titleText, color, callback)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 44)
+	btn.BackgroundColor3 = color
+	btn.Text = titleText
+	btn.TextColor3 = Color3.fromRGB(30, 30, 40)
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 14
+	btn.AutoButtonColor = true
+	btn.BorderSizePixel = 0
+	btn.LayoutOrder = order
+	btn.Parent = page
+	corner(btn, UDim.new(0, 14))
+	btn.Activated:Connect(callback)
+	return btn
+end
+
+-- Selector de modo de curación: Apagado / Manual / Automático
+local function createHealModeSelector(page, order)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 48)
+	row.BackgroundColor3 = COLORS.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = page
+	corner(row, UDim.new(0, 14))
+
+	local function makeButton(mode, text, xScale)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1 / 3, -10, 0, 34)
+		b.Position = UDim2.new(xScale, 5, 0.5, -17)
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 11
+		b.AutoButtonColor = false
+		b.BorderSizePixel = 0
+		b.BackgroundColor3 = COLORS.off
+		b.TextColor3 = COLORS.subtext
+		b.Parent = row
+		corner(b, UDim.new(0, 10))
+		b.Activated:Connect(function()
+			setHealModeOption(mode)
+		end)
+		healModeButtons[mode] = b
+	end
+
+	makeButton("off", "Apagado", 0)
+	makeButton("manual", "Manual", 1 / 3)
+	makeButton("auto", "Automático", 2 / 3)
+	return row
+end
+
+-- Selector: cuerpo a cuerpo / a distancia
+local function createModeSelector(page, order)
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 48)
+	row.BackgroundColor3 = COLORS.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = page
+	corner(row, UDim.new(0, 14))
+
+	local buttons = {}
+
+	local function selectMode(mode)
+		combatMode = mode
+		for key, b in pairs(buttons) do
+			local active = key == mode
+			tween(b, { BackgroundColor3 = active and COLORS.accentA or COLORS.off })
+			b.TextColor3 = active and Color3.new(1, 1, 1) or COLORS.subtext
+		end
+	end
+
+	local function makeButton(mode, text, position)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(0.5, -12, 0, 34)
+		b.Position = position
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 12
+		b.AutoButtonColor = false
+		b.BorderSizePixel = 0
+		b.BackgroundColor3 = COLORS.off
+		b.Parent = row
+		corner(b, UDim.new(0, 10))
+		b.Activated:Connect(function()
+			selectMode(mode)
+		end)
+		buttons[mode] = b
+	end
+
+	makeButton("melee", "⚔ Cuerpo a cuerpo", UDim2.new(0, 7, 0.5, -17))
+	makeButton("ranged", "🏹 A distancia", UDim2.new(0.5, 5, 0.5, -17))
+	selectMode(combatMode)
+end
+
+makeTab("move", "🏃 Mov", 1)
+makeTab("combat", "⚔ Combate", 2)
+makeTab("farm", "💎 Farm", 3)
+makeTab("settings", "⚙ Ajustes", 4)
+
+-- Página: Movimiento
+local movePage = pages.move
+createRow(movePage, 1, "Barra Curar / FLY", "Muestra u oculta la barra superior", true, function(value)
+	bar.Visible = value
+end)
+setFlyRow = createRow(movePage, 2, "Volar (CFly)", "Sube y baja según tu mirada", false, function(value)
+	if value ~= flying then
+		toggleFly()
+	end
+end)
+createRow(movePage, 3, "Atravesar paredes", "Noclip: pasa por todo", false, function(value)
+	setNoclip(value)
 end)
 
-glideBtn.Activated:Connect(function()
-    mode = "DESLIZAR"
-    refreshUI()
+-- Página: Combate
+local combatPage = pages.combat
+createModeSelector(combatPage, 1)
+
+local aaSet, _, aaGet = createRow(combatPage, 2, "Auto-ataque", "Apunta y ataca al más cercano", false, setAutoAttack)
+registerFeature("autoAttack", aaSet, aaGet)
+
+local tpaSet, _, tpaGet = createRow(combatPage, 3, "TP + Auto-ataque", "Va hasta el enemigo y ataca", false, setTpAttack)
+registerFeature("tpAttack", tpaSet, tpaGet)
+
+local tpeSet, _, tpeGet = createRow(combatPage, 4, "TP al enemigo", "Te lleva junto al más cercano", false, setTpEnemy)
+registerFeature("tpEnemy", tpeSet, tpeGet)
+
+local kdSet, _, kdGet = createRow(combatPage, 5, "Mantener distancia", "Esquiva rápido (modo a distancia)", false, setKeepDistance)
+registerFeature("keepDistance", kdSet, kdGet)
+
+-- Página: Farm
+local farmPage = pages.farm
+createHealModeSelector(farmPage, 0)
+
+local chestSet, chestLabel, chestGet = createRow(farmPage, 1, "Auto-cofres", "Cofres recogidos: 0", false, setAutoChest)
+chestSub = chestLabel
+registerFeature("autoChest", chestSet, chestGet)
+
+local crystalSet, crystalLabel, crystalGet = createRow(farmPage, 2, "Auto-cristales", "Cristales rotos: 0", false, setCrystalFarm)
+crystalSub = crystalLabel
+registerFeature("crystalFarm", crystalSet, crystalGet)
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "StatusLabel"
+statusLabel.BackgroundTransparency = 1
+statusLabel.Size = UDim2.new(1, 0, 0, 30)
+statusLabel.Text = "Buscando StarRunes..."
+statusLabel.TextColor3 = COLORS.subtext
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 11
+statusLabel.TextWrapped = true
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.LayoutOrder = 8
+statusLabel.Parent = farmPage
+
+refreshBosses = function()
+	bossEntries = getStarRunes()
+	for i = 1, #bossEntries do
+		if not bossButtons[i] then
+			bossButtons[i] = createButtonRow(farmPage, 10 + i, "Jefe " .. i, COLORS.accentB, function()
+				fightBoss(i)
+			end)
+		end
+		bossButtons[i].Visible = true
+	end
+	for i = #bossEntries + 1, #bossButtons do
+		bossButtons[i].Visible = false
+	end
+
+	if #bossEntries > 0 then
+		setStatus("StarRunes encontrados: " .. #bossEntries)
+	else
+		setStatus("No encontré StarRunes. Acércate a la zona y pulsa Buscar jefes.")
+	end
+end
+
+createButtonRow(farmPage, 9, "🔄 Buscar jefes (StarRune)", COLORS.accentA, function()
+	refreshBosses()
 end)
+
+task.spawn(function()
+	for _ = 1, 15 do
+		refreshBosses()
+		if #bossEntries > 0 then break end
+		task.wait(2)
+	end
+end)
+
+-- Página: Ajustes
+local settingsPage = pages.settings
+createRow(settingsPage, 1, "Mover botones", "Actívalo para arrastrar la barra y el panel", false, function(value)
+	moveButtonsEnabled = value
+end)
+createButtonRow(settingsPage, 2, "Cerrar script", COLORS.red, shutdown)
+
+showTab("move")
+setHealModeVisual()
+
+---------------------------------------------------------------------
+-- MINIMIZAR / RESTAURAR
+---------------------------------------------------------------------
+local function setMinimized(state)
+	if state then
+		local p = panel.AbsolutePosition
+		panel.Visible = false
+		menuBubble.Position = UDim2.fromOffset(p.X + panelW - MENU_SIZE, p.Y)
+		menuBubble.Visible = true
+		clampToScreen(menuBubble)
+	else
+		menuBubble.Visible = false
+		panel.Visible = true
+		clampToScreen(panel)
+	end
+end
+
+makeDraggable(menuBubble, menuBubble, function()
+	setMinimized(false)
+end)
+
+makeDraggable(titleBar, panel, nil)
 
 minBtn.Activated:Connect(function()
-    main.Visible = false
-    mini.Position = UDim2.fromOffset(main.AbsolutePosition.X, main.AbsolutePosition.Y)
-    mini.Visible = true
+	setMinimized(true)
 end)
 
-mini.Activated:Connect(function()
-    mini.Visible = false
-    main.Visible = true
+closeBtn.Activated:Connect(shutdown)
+
+---------------------------------------------------------------------
+-- AJUSTE DE TAMAÑO
+---------------------------------------------------------------------
+local function fitPanel()
+	local screen = gui.AbsoluteSize
+	if screen.X <= 0 then return end
+	panelW = math.min(PANEL_W, screen.X - EDGE * 2)
+	panelFullH = math.min(FULL_H, screen.Y - TOP_EDGE - EDGE)
+	panel.Size = UDim2.fromOffset(panelW, panelFullH)
+end
+
+gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	fitPanel()
+	if panel.Visible then clampToScreen(panel) end
+	if menuBubble.Visible then clampToScreen(menuBubble) end
+	clampToScreen(bar)
 end)
 
-closeBtn.Activated:Connect(function()
-    closed = true
-    auto = false
-    gui:Destroy()
+panel:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	if panel.Visible then clampToScreen(panel) end
 end)
 
----------------------------------------------------------------
--- BUCLE PRINCIPAL
----------------------------------------------------------------
-task.spawn(function()
-    while not closed do
-        if auto then
-            local ok, err = pcall(collectCycle)
-            if not ok then
-                setStatus("Error: " .. tostring(err))
-            end
-        end
-        refreshUI()
-        task.wait(1)
-    end
+fitPanel()
+task.defer(function()
+	fitPanel()
+	clampToScreen(panel)
+	clampToScreen(bar)
 end)
 
-refreshUI()
+-- Tecla F: volar on/off
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == TOGGLE_KEY then
+		toggleFly()
+	end
+end))
+
+-- Al morir o reaparecer: se limpia el estado de curación
+track(player.CharacterAdded:Connect(function()
+	stopFly()
+	originalCollide = {}
+	chestBusy = false
+	crystalBusy = false
+	healBusy = false
+	savedHealCF = nil
+	atFountain = false
+	healToken += 1
+	setHealVisual(false)
+	if featureSnapshot then
+		task.delay(1, restoreFeatures)
+	end
+end))
