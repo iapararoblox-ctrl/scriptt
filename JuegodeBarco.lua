@@ -9,22 +9,22 @@ local LocalPlayer = Players.LocalPlayer
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
-    CAPACIDAD_INICIAL = 10,       -- cofres en la bóveda antes de ir con el tesorero (se cambia en la UI)
+    CAPACIDAD_INICIAL = 5,        -- espacio total de la bóveda (se cambia en la UI)
     CAPACIDAD_MAX = 50,
-    ESPERA_BARCO_INICIAL = 5,     -- segundos encima del barco antes del siguiente cofre (se cambia en la UI)
+    ESPERA_BARCO_INICIAL = 5,     -- segundos encima del barco antes del siguiente cofre
     ESPERA_BARCO_MAX = 60,
-    SOLO_OTROS_INICIAL = false,   -- false = no agarra cofres de otros; true = solo agarra de otros
-    ESPERA_RECOGER = 0.3,         -- igual que tu script que funciona
-    ESPERA_GUARDADO = 3,          -- máximo esperando que el cofre aparezca en CargoVisuals
+    SOLO_OTROS_INICIAL = false,   -- false = no agarra cofres de otros; true = solo de otros
+    ESPERA_RECOGER = 0.3,
+    ESPERA_GUARDADO = 3,          -- máximo esperando que el cofre ocupe espacio en la bóveda
     ESPERA_TESORERO = 1.5,        -- pausa para que abra la interfaz del tesorero
     ESPERA_APERTURA = 0.6,        -- pausa entre cofres abiertos
-    ALTURA = 3,                   -- studs por encima del cofre, cubierta o tesorero
+    ALTURA = 3,
     NOMBRE_BARCO_MANUAL = "",     -- nombre exacto de tu barco si no lo detecta
     ABRIR_RAPIDO = true,          -- Settings_Set("FastOpen", true)
-    DEBUG = true,                 -- imprime en consola (F9) de qué dueño es cada cofre
+    TAMANO_POR_DEFECTO = 1,       -- espacio si un cofre no tiene CargoSize
+    DEBUG = true,
 }
 
--- Claves donde podría guardarse el dueño de un cofre (ajústalas si ves otra en el Explorer)
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
 
 ---------------------------------------------------------------
@@ -69,6 +69,22 @@ local function setStatus(text)
 end
 
 ---------------------------------------------------------------
+-- ESPACIO (CargoSize)
+---------------------------------------------------------------
+-- Lee CargoSize como atributo o como NumberValue/IntValue hijo
+local function getCargoSize(obj)
+    local v = obj:GetAttribute("CargoSize")
+    if v ~= nil then
+        return tonumber(v) or CONFIG.TAMANO_POR_DEFECTO
+    end
+    local child = obj:FindFirstChild("CargoSize")
+    if child and (child:IsA("NumberValue") or child:IsA("IntValue")) then
+        return child.Value
+    end
+    return CONFIG.TAMANO_POR_DEFECTO
+end
+
+---------------------------------------------------------------
 -- DUEÑO DE LOS COFRES
 ---------------------------------------------------------------
 local function isMine(owner)
@@ -77,7 +93,6 @@ local function isMine(owner)
         or owner == tostring(LocalPlayer.UserId)
 end
 
--- Devuelve el dueño del cofre como texto, o nil si no tiene dueño visible
 local function getChestOwner(chest)
     for _, key in ipairs(OWNER_KEYS) do
         local v = chest:GetAttribute(key)
@@ -85,7 +100,6 @@ local function getChestOwner(chest)
             return tostring(v)
         end
     end
-
     for _, d in ipairs(chest:GetDescendants()) do
         local n = d.Name:lower()
         if n:find("owner") or n:find("player") then
@@ -102,17 +116,14 @@ local function getChestOwner(chest)
     return nil
 end
 
--- true si este cofre se debe agarrar según el filtro
 local function shouldCollect(chest)
     local owner = getChestOwner(chest)
-    local mine = owner == nil or isMine(owner)
-
-    dbg("Cofre", chest.Name, "| dueño:", owner or "sin dato")
+    dbg("Cofre", chest.Name, "| dueño:", owner or "sin dato", "| espacio:", getCargoSize(chest))
 
     if onlyOthers then
         return owner ~= nil and not isMine(owner)
     end
-    return mine
+    return owner == nil or isMine(owner)
 end
 
 ---------------------------------------------------------------
@@ -191,7 +202,7 @@ local function getShipTop(ship)
 end
 
 ---------------------------------------------------------------
--- BÓVEDA: cada Model dentro de CargoVisuals es un cofre
+-- BÓVEDA: cada Model en CargoVisuals es un cofre; ocupa CargoSize
 ---------------------------------------------------------------
 local function getStoredChests()
     local ship = getMyShip()
@@ -207,8 +218,17 @@ local function getStoredChests()
     return list
 end
 
-local function storedCount()
-    return #getStoredChests()
+-- Espacio ocupado = suma de CargoSize de los cofres guardados
+local function usedSpace()
+    local total = 0
+    for _, chest in ipairs(getStoredChests()) do
+        total += getCargoSize(chest)
+    end
+    return total
+end
+
+local function freeSpace()
+    return capacity - usedSpace()
 end
 
 ---------------------------------------------------------------
@@ -223,7 +243,7 @@ end
 ---------------------------------------------------------------
 -- GUARDAR EN EL BARCO
 ---------------------------------------------------------------
-local function storeOnBoat(countBefore)
+local function storeOnBoat(usedBefore)
     local ship = getMyShip()
     if not ship then
         setStatus("No encuentro tu barco")
@@ -235,7 +255,7 @@ local function storeOnBoat(countBefore)
 
     local t0 = os.clock()
     while os.clock() - t0 < CONFIG.ESPERA_GUARDADO do
-        if storedCount() > countBefore then
+        if usedSpace() > usedBefore then
             return true
         end
         task.wait(0.25)
@@ -244,7 +264,6 @@ local function storeOnBoat(countBefore)
     return false
 end
 
--- Espera encima del barco antes del siguiente cofre
 local function waitOnShip()
     local endTime = os.clock() + waitOnBoat
     while os.clock() < endTime and running and not closed do
@@ -266,7 +285,7 @@ local function openVault()
         return
     end
 
-    setStatus("Bóveda llena: yendo al tesorero...")
+    setStatus("Bóveda sin espacio: yendo al tesorero...")
     teleportTo(hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
 
     local p1 = hrp:FindFirstChild("NPCPrompt_1")
@@ -310,7 +329,7 @@ local function collectCycle()
         return
     end
 
-    if storedCount() >= capacity then
+    if freeSpace() <= 0 then
         openVault()
         return
     end
@@ -323,18 +342,25 @@ local function collectCycle()
         local prompt = attach and attach:FindFirstChild("TreasurePrompt")
 
         if base and prompt and prompt:IsA("ProximityPrompt") and shouldCollect(item) then
-            setStatus("Recogiendo cofre...")
-            local before = storedCount()
-            pickUpChest(base, prompt)
-            collectedCount += 1
+            local size = getCargoSize(item)
 
-            if storeOnBoat(before) then
-                waitOnShip()
-            end
+            if size > capacity then
+                setStatus("Cofre más grande que la bóveda, lo salto")
+            else
+                -- Si no le cabe, primero vacía la bóveda
+                if usedSpace() + size > capacity then
+                    openVault()
+                    return
+                end
 
-            if storedCount() >= capacity then
-                openVault()
-                return
+                setStatus("Recogiendo cofre (espacio " .. size .. ")...")
+                local usedBefore = usedSpace()
+                pickUpChest(base, prompt)
+                collectedCount += 1
+
+                if storeOnBoat(usedBefore) then
+                    waitOnShip()
+                end
             end
         end
     end
@@ -504,12 +530,12 @@ local countLabel = makeLabel(statCard, "0", 20, PALETTE.green, true, 26)
 countLabel.Position = UDim2.new(0, 12, 0, 20)
 countLabel.Size = UDim2.new(0.5, -12, 0, 26)
 
-makeLabel(statCard, "EN BÓVEDA", 10, PALETTE.muted, true, 14).Position = UDim2.new(0.5, 0, 0, 8)
+makeLabel(statCard, "ESPACIO", 10, PALETTE.muted, true, 14).Position = UDim2.new(0.5, 0, 0, 8)
 local vaultLabel = makeLabel(statCard, "0/0", 20, PALETTE.accent, true, 26)
 vaultLabel.Position = UDim2.new(0.5, 0, 0, 20)
 vaultLabel.Size = UDim2.new(0.5, -12, 0, 26)
 
--- Barra de la bóveda
+-- Barra de espacio
 local barTrack = Instance.new("Frame")
 barTrack.Size = UDim2.new(1, 0, 0, 8)
 barTrack.BackgroundColor3 = PALETTE.track
@@ -539,7 +565,7 @@ local waitLabel = makeLabel(waitCard, "", 13, PALETTE.text, true, nil)
 waitLabel.Size = UDim2.new(1, -110, 1, 0)
 waitLabel.Position = UDim2.new(0, 55, 0, 0)
 
--- Capacidad manual
+-- Capacidad (espacio total)
 local capCard = makeCard(body, 5, 40)
 local capMinus = makeButton(capCard, "−", UDim2.new(0, 48, 0, 30), PALETTE.bg)
 capMinus.Position = UDim2.new(0, 5, 0, 5)
@@ -576,17 +602,17 @@ updateScale()
 camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
 
 refreshUI = function()
-    local stored = storedCount()
+    local used = usedSpace()
     subtitleLabel.Text = statusText
     countLabel.Text = tostring(collectedCount)
-    vaultLabel.Text = stored .. "/" .. capacity
-    barFill.Size = UDim2.new(math.clamp(stored / math.max(capacity, 1), 0, 1), 0, 1, 0)
+    vaultLabel.Text = used .. "/" .. capacity
+    barFill.Size = UDim2.new(math.clamp(used / math.max(capacity, 1), 0, 1), 0, 1, 0)
 
     filterBtn.Text = onlyOthers and "👥 Solo cofres de otros" or "👤 No tomar cofres de otros"
     filterBtn.BackgroundColor3 = onlyOthers and PALETTE.orange or PALETTE.card
 
     waitLabel.Text = "Espera barco: " .. waitOnBoat .. " s"
-    capLabel.Text = "Bóveda: " .. capacity
+    capLabel.Text = "Espacio: " .. capacity
 
     toggleBtn.Text = running and "⏸  Pausar" or "▶  Reanudar"
     toggleBtn.BackgroundColor3 = running and PALETTE.green or PALETTE.orange
