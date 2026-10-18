@@ -1,4 +1,4 @@
--- Auto-farm de cofres: recoger, guardar en el barco, abrir con el tesorero (Ser pirata, Móvil)
+-- Recolección de cofres + guardar en el barco + abrir con el tesorero (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -9,58 +9,23 @@ local LocalPlayer = Players.LocalPlayer
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
-    MODO_INICIAL = "TP",              -- "TP" o "DESLIZAR"
-    VELOCIDAD_DESLIZAR = 45,
-    AGARRAR_INICIAL = false,          -- lo activas tú en la UI
-    CAPACIDAD_INICIAL = 10,           -- cofres que caben en la bóveda (ajustable en la UI)
+    CAPACIDAD_INICIAL = 10,       -- cofres en la bóveda antes de ir con el tesorero (se cambia en la UI)
     CAPACIDAD_MAX = 50,
-    ESPERA_BARCO = 5,                 -- segundos encima del barco antes del siguiente cofre
-    ESPERA_MAX_BARCO = 60,
-    ALTURA_BARCO = 3,                 -- studs por encima de la cubierta
-    ALTURA_COFRE = 3,                 -- studs por encima del cofre al llegar
-    ESPERA_GUARDADO = 5,              -- máximo esperando que el cofre aparezca en la bóveda
-    ESPERA_RECOGER = 2,               -- máximo esperando que el cofre desaparezca tras el prompt
-    ESPERA_UI_TESORERO = 1.5,         -- pausa para que abra la interfaz del tesorero
-    ESPERA_ENTRE_RONDAS = 2,
-    ABRIR_RAPIDO = true,              -- Settings_Set("FastOpen", true) antes de abrir
-    MAX_INTENTOS_APERTURA = 30,
-    RECOGER_EXHIBICION = false,       -- KingsChest y CrownOfTheDeep están en exhibición
-    NOMBRE_BARCO_MANUAL = "",         -- nombre exacto de tu barco si lo sabes
-    DEBUG = true,                     -- imprime lo que hace en la consola (F9)
+    ESPERA_RECOGER = 0.3,         -- igual que tu script que funciona
+    ESPERA_GUARDADO = 3,          -- máximo esperando que el cofre aparezca en CargoVisuals
+    ESPERA_TESORERO = 1.5,        -- pausa para que abra la interfaz del tesorero
+    ESPERA_APERTURA = 0.6,        -- pausa entre cofres abiertos
+    ALTURA = 3,                   -- studs por encima del cofre, cubierta o tesorero
+    NOMBRE_BARCO_MANUAL = "",     -- nombre exacto de tu barco si no lo detecta
+    ABRIR_RAPIDO = true,          -- Settings_Set("FastOpen", true)
 }
-
----------------------------------------------------------------
--- TIPOS DE COFRE
----------------------------------------------------------------
-local function norm(s)
-    return string.lower((string.gsub(s, "%s", "")))
-end
-
-local CHEST_TYPES = {}
-for _, n in ipairs({
-    "Halloween Chest", "Pearl Clam", "Wooden Chest", "Coin Sack", "Golden Coin Sack",
-    "Supply Crate", "Silver Coffer", "KingsChest", "CrownOfTheDeep",
-}) do
-    CHEST_TYPES[norm(n)] = true
-end
-local EXHIBITION = { [norm("KingsChest")] = true, [norm("CrownOfTheDeep")] = true }
-
-local function isChestName(name)
-    local n = norm(name)
-    if not CHEST_TYPES[n] then return false end
-    if EXHIBITION[n] and not CONFIG.RECOGER_EXHIBICION then return false end
-    return true
-end
 
 ---------------------------------------------------------------
 -- RUTAS
 ---------------------------------------------------------------
-local NPC_TESORERO = "NPC_StarterPort_Broker"
-local CARGO_NAME = "CargoVisuals"
-
-local function dbg(...)
-    if CONFIG.DEBUG then print("[COFRES]", ...) end
-end
+local treasureFolder = Workspace:FindFirstChild("World")
+    and Workspace.World:FindFirstChild("Dynamic")
+    and Workspace.World.Dynamic:FindFirstChild("Treasure")
 
 local function getDynamic()
     local world = Workspace:FindFirstChild("World")
@@ -77,26 +42,20 @@ end
 ---------------------------------------------------------------
 local running = true
 local closed = false
-local mode = CONFIG.MODO_INICIAL
-local grabChests = CONFIG.AGARRAR_INICIAL
 local capacity = CONFIG.CAPACIDAD_INICIAL
-local waitOnBoat = CONFIG.ESPERA_BARCO
-local manualOpen = false
-local cachedShip = nil
 local collectedCount = 0
 local openedCount = 0
 local statusText = "Listo"
-
-local refreshUI -- se asigna en la UI
+local cachedShip = nil
+local refreshUI
 
 local function setStatus(text)
     statusText = text
-    dbg(text)
     if refreshUI then refreshUI() end
 end
 
 ---------------------------------------------------------------
--- MOVIMIENTO
+-- PERSONAJE
 ---------------------------------------------------------------
 local function getRoot()
     local character = LocalPlayer.Character
@@ -108,33 +67,8 @@ local function teleportTo(pos)
     if not root then return false end
     root.AssemblyLinearVelocity = Vector3.zero
     root.CFrame = CFrame.new(pos) * (root.CFrame - root.CFrame.Position)
-    task.wait(0.15)
+    task.wait(0.2)
     return true
-end
-
-local function glideTo(pos)
-    local root = getRoot()
-    if not root then return end
-    local startPos = root.Position
-    local duration = math.max((pos - startPos).Magnitude / CONFIG.VELOCIDAD_DESLIZAR, 0.05)
-    local t0 = os.clock()
-    local alpha = 0
-    while alpha < 1 and running and not closed do
-        root = getRoot()
-        if not root then break end
-        alpha = math.min((os.clock() - t0) / duration, 1)
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.CFrame = CFrame.new(startPos:Lerp(pos, alpha)) * (root.CFrame - root.CFrame.Position)
-        task.wait()
-    end
-end
-
-local function moveTo(pos)
-    if mode == "TP" then
-        teleportTo(pos)
-    else
-        glideTo(pos)
-    end
 end
 
 ---------------------------------------------------------------
@@ -154,8 +88,6 @@ local function isMyShip(ship)
         if d:IsA("ObjectValue") and d.Value == LocalPlayer then
             return true
         elseif d:IsA("StringValue") and (d.Value == name or d.Value == userId) then
-            return true
-        elseif (d:IsA("IntValue") or d:IsA("NumberValue")) and tostring(d.Value) == userId then
             return true
         end
     end
@@ -187,29 +119,23 @@ local function getMyShip()
     return nil
 end
 
--- Punto encima de la cubierta usando la caja del barco
-local function getShipTop()
-    local ship = getMyShip()
-    if not ship then return nil end
+-- Punto encima de la cubierta
+local function getShipTop(ship)
     local center, size
     if ship:IsA("Model") then
         center, size = ship:GetBoundingBox()
     else
         center, size = ship.CFrame, ship.Size
     end
-    return Vector3.new(
-        center.Position.X,
-        center.Position.Y + size.Y / 2 + CONFIG.ALTURA_BARCO,
-        center.Position.Z
-    )
+    return Vector3.new(center.Position.X, center.Position.Y + size.Y / 2 + CONFIG.ALTURA, center.Position.Z)
 end
 
 ---------------------------------------------------------------
--- BÓVEDA (CargoVisuals): cada Model dentro es un cofre
+-- BÓVEDA: cada Model dentro de CargoVisuals es un cofre
 ---------------------------------------------------------------
 local function getStoredChests()
     local ship = getMyShip()
-    local cargo = ship and ship:FindFirstChild(CARGO_NAME)
+    local cargo = ship and ship:FindFirstChild("CargoVisuals")
     local list = {}
     if cargo then
         for _, child in ipairs(cargo:GetChildren()) do
@@ -225,101 +151,64 @@ local function storedCount()
     return #getStoredChests()
 end
 
-local function isVaultFull()
-    return manualOpen or storedCount() >= capacity
+---------------------------------------------------------------
+-- RECOGER UN COFRE (igual que tu script)
+---------------------------------------------------------------
+local function pickUpChest(base, prompt)
+    teleportTo(base.Position + Vector3.new(0, CONFIG.ALTURA, 0))
+    pcall(fireproximityprompt, prompt)
+    task.wait(CONFIG.ESPERA_RECOGER)
 end
 
 ---------------------------------------------------------------
--- COFRES EN EL MUNDO
+-- GUARDAR EN EL BARCO: subir encima y esperar a que aparezca
 ---------------------------------------------------------------
-local function findPrompt(obj)
-    local preferred = obj:FindFirstChild("TreasurePrompt", true) or obj:FindFirstChild("Grab", true)
-    if preferred and preferred:IsA("ProximityPrompt") then
-        return preferred
-    end
-    for _, d in ipairs(obj:GetDescendants()) do
-        if d:IsA("ProximityPrompt") then
-            return d
-        end
-    end
-    return nil
-end
-
-local function findWorldChests()
-    local result = {}
-    local dyn = getDynamic()
-    if not dyn then return result end
-
-    local ships = dyn:FindFirstChild("Ships")
-    local npcs = dyn:FindFirstChild("NPCs")
-
-    for _, obj in ipairs(dyn:GetDescendants()) do
-        local isCandidate = (obj:IsA("Model") or obj:IsA("BasePart")) and isChestName(obj.Name)
-        local insideShip = ships and obj:IsDescendantOf(ships)
-        local insideNpc = npcs and obj:IsDescendantOf(npcs)
-        local nestedChest = obj.Parent and isChestName(obj.Parent.Name)
-
-        if isCandidate and not insideShip and not insideNpc and not nestedChest then
-            local prompt = findPrompt(obj)
-            if prompt and prompt.Enabled then
-                local pos = obj:IsA("Model") and obj:GetPivot().Position or obj.Position
-                table.insert(result, { model = obj, prompt = prompt, pos = pos })
-            end
-        end
-    end
-    return result
-end
-
----------------------------------------------------------------
--- GUARDAR EN EL BARCO
----------------------------------------------------------------
-local function storeOnShip(countBefore)
-    local top = getShipTop()
-    if not top then
+local function storeOnBoat(countBefore)
+    local ship = getMyShip()
+    if not ship then
         setStatus("No encuentro tu barco")
         return false
     end
 
-    setStatus("Subiendo al barco para guardar...")
-    moveTo(top)
+    setStatus("Guardando en el barco...")
+    teleportTo(getShipTop(ship))
 
     local t0 = os.clock()
-    while os.clock() - t0 < CONFIG.ESPERA_GUARDADO and running and not closed do
+    while os.clock() - t0 < CONFIG.ESPERA_GUARDADO do
         if storedCount() > countBefore then
             return true
         end
         task.wait(0.25)
     end
-
     setStatus("El cofre no se guardó: revisa que estés sobre el barco")
     return false
 end
 
 ---------------------------------------------------------------
--- TESORERO: abrir cofres guardados
+-- TESORERO: ir, abrir la interfaz y abrir los cofres guardados
 ---------------------------------------------------------------
-local function getTreasurerRoot()
+local function openVault()
     local dyn = getDynamic()
     local npcs = dyn and dyn:FindFirstChild("NPCs")
-    local npc = npcs and npcs:FindFirstChild(NPC_TESORERO)
-    return npc and npc:FindFirstChild("HumanoidRootPart")
-end
+    local npc = npcs and npcs:FindFirstChild("NPC_StarterPort_Broker")
+    local hrp = npc and npc:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        setStatus("No encuentro al tesorero")
+        return
+    end
 
-local function getTreasurerPrompt(root)
-    local p1 = root:FindFirstChild("NPCPrompt_1")
-    local p = p1 and p1:FindFirstChild("NPCPrompt")
-    return (p and p:IsA("ProximityPrompt")) and p or nil
-end
+    setStatus("Bóveda llena: yendo al tesorero...")
+    teleportTo(hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
 
--- El ID del cofre es el nombre del Model dentro de CargoVisuals
-local function getTreasureId(chest)
-    return chest.Name
-end
+    local p1 = hrp:FindFirstChild("NPCPrompt_1")
+    local prompt = p1 and p1:FindFirstChild("NPCPrompt")
+    if prompt and prompt:IsA("ProximityPrompt") then
+        pcall(fireproximityprompt, prompt)
+        task.wait(CONFIG.ESPERA_TESORERO)
+    end
 
-local function openStoredChests()
     local openRemote = getRemote("Treasure_Open")
     local settingsRemote = getRemote("Settings_Set")
-
     if not (openRemote and openRemote:IsA("RemoteEvent")) then
         setStatus("No encuentro el remote Treasure_Open")
         return
@@ -330,128 +219,60 @@ local function openStoredChests()
         task.wait(0.2)
     end
 
-    local failures = 0
-    local usedAll = false
+    for _, chest in ipairs(getStoredChests()) do
+        if closed or not running then return end
+        pcall(function()
+            openRemote:FireServer("One", chest.Name, CONFIG.ABRIR_RAPIDO)
+        end)
+        openedCount += 1
+        setStatus("Abriendo " .. chest.Name)
+        task.wait(CONFIG.ESPERA_APERTURA)
+    end
 
-    for _ = 1, CONFIG.MAX_INTENTOS_APERTURA do
+    setStatus("Bóveda abierta, buscando cofres")
+end
+
+---------------------------------------------------------------
+-- CICLO
+---------------------------------------------------------------
+local function collectCycle()
+    if not treasureFolder then
+        setStatus("No encuentro World.Dynamic.Treasure")
+        return
+    end
+
+    if storedCount() >= capacity then
+        openVault()
+        return
+    end
+
+    for _, item in ipairs(treasureFolder:GetChildren()) do
         if closed or not running then return end
 
-        local chests = getStoredChests()
-        local before = #chests
-        if before == 0 then break end
+        local base = item:FindFirstChild("Base")
+        local attach = base and base:FindFirstChild("PromptAttachment")
+        local prompt = attach and attach:FindFirstChild("TreasurePrompt")
 
-        if not usedAll then
-            pcall(function()
-                openRemote:FireServer("One", getTreasureId(chests[1]), CONFIG.ABRIR_RAPIDO)
-            end)
-        else
-            pcall(function()
-                openRemote:FireServer("All", nil, CONFIG.ABRIR_RAPIDO)
-            end)
-        end
+        if base and prompt and prompt:IsA("ProximityPrompt") then
+            setStatus("Recogiendo cofre...")
+            local before = storedCount()
+            pickUpChest(base, prompt)
+            collectedCount += 1
 
-        task.wait(0.6)
-        local after = storedCount()
+            storeOnBoat(before)
 
-        if after < before then
-            openedCount += (before - after)
-            failures = 0
-            setStatus("Abriendo cofres... quedan " .. after)
-        else
-            failures += 1
-            dbg("Apertura sin cambio, intento fallido #" .. failures)
-            if failures >= 3 and not usedAll then
-                usedAll = true
-                failures = 0
-                dbg("Cambiando a apertura 'All'")
-            elseif failures >= 3 then
-                setStatus("La bóveda no baja: revisa el ID o el remote")
-                break
+            if storedCount() >= capacity then
+                openVault()
+                return
             end
         end
     end
-end
 
-local function goToTreasurerAndOpen()
-    local root = getTreasurerRoot()
-    if not root then
-        setStatus("No encuentro al tesorero")
-        return
-    end
-
-    setStatus("Bóveda llena: yendo al tesorero...")
-    moveTo(root.Position + Vector3.new(0, CONFIG.ALTURA_COFRE, 0))
-
-    local prompt = getTreasurerPrompt(root)
-    if prompt then
-        pcall(fireproximityprompt, prompt)
-        task.wait(CONFIG.ESPERA_UI_TESORERO)
-    else
-        dbg("Sin prompt del tesorero, intento abrir directo")
-    end
-
-    openStoredChests()
-    manualOpen = false
-    setStatus("Bóveda vacía, buscando cofres")
+    setStatus("Buscando cofres...")
 end
 
 ---------------------------------------------------------------
--- ESPERA ENCIMA DEL BARCO
----------------------------------------------------------------
-local function waitOnShip()
-    local endTime = os.clock() + waitOnBoat
-    while os.clock() < endTime and running and not closed do
-        setStatus(string.format("En el barco: %ds", math.ceil(endTime - os.clock())))
-        task.wait(0.25)
-    end
-end
-
----------------------------------------------------------------
--- CICLO: recoger → (guardar) → repetir → abrir cuando esté llena
----------------------------------------------------------------
-local function collectRound()
-    if isVaultFull() then
-        goToTreasurerAndOpen()
-        return
-    end
-
-    local chests = findWorldChests()
-    if #chests == 0 then
-        setStatus("No hay cofres disponibles")
-        return
-    end
-    dbg("Cofres encontrados:", #chests)
-
-    for _, chest in ipairs(chests) do
-        if closed or not running then return end
-        if isVaultFull() then
-            goToTreasurerAndOpen()
-            return
-        end
-        if not chest.model.Parent or not chest.prompt.Parent then continue end
-
-        setStatus("Yendo a " .. chest.model.Name)
-        moveTo(chest.pos + Vector3.new(0, CONFIG.ALTURA_COFRE, 0))
-
-        local countBefore = storedCount()
-        pcall(fireproximityprompt, chest.prompt)
-
-        local t0 = os.clock()
-        while os.clock() - t0 < CONFIG.ESPERA_RECOGER and chest.prompt.Parent do
-            task.wait(0.1)
-        end
-        collectedCount += 1
-
-        if grabChests then
-            if storeOnShip(countBefore) then
-                waitOnShip()
-            end
-        end
-    end
-end
-
----------------------------------------------------------------
--- UI ADAPTATIVA
+-- UI
 ---------------------------------------------------------------
 local PALETTE = {
     bg = Color3.fromRGB(22, 24, 34),
@@ -500,7 +321,7 @@ local function makeLabel(parent, text, size, color, bold, height)
     return l
 end
 
-local function makeButton(parent, text, size, color, order)
+local function makeButton(parent, text, size, color)
     local b = Instance.new("TextButton")
     b.Size = size
     b.BackgroundColor3 = color
@@ -510,23 +331,9 @@ local function makeButton(parent, text, size, color, order)
     b.Font = Enum.Font.GothamBold
     b.AutoButtonColor = true
     b.BorderSizePixel = 0
-    b.LayoutOrder = order or 0
     b.Parent = parent
     addCorner(b, 10)
     return b
-end
-
-local function makeRow(parent, order, height)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, height)
-    row.BackgroundTransparency = 1
-    row.LayoutOrder = order
-    row.Parent = parent
-    local list = Instance.new("UIListLayout")
-    list.FillDirection = Enum.FillDirection.Horizontal
-    list.Padding = UDim.new(0, 6)
-    list.Parent = row
-    return row
 end
 
 local function makeCard(parent, order, height)
@@ -567,12 +374,11 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.new(0, 260, 0, 340)
+main.Size = UDim2.new(0, 260, 0, 250)
 main.BackgroundColor3 = PALETTE.bg
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -620,31 +426,17 @@ padding.PaddingRight = UDim.new(0, 12)
 padding.PaddingTop = UDim.new(0, 4)
 padding.Parent = body
 
--- Tarjeta de estadísticas
+-- Estadísticas
 local statCard = makeCard(body, 1, 52)
 makeLabel(statCard, "RECOGIDOS", 10, PALETTE.muted, true, 14).Position = UDim2.new(0, 12, 0, 8)
-local countLabel = Instance.new("TextLabel")
-countLabel.BackgroundTransparency = 1
+local countLabel = makeLabel(statCard, "0", 20, PALETTE.green, true, 26)
 countLabel.Position = UDim2.new(0, 12, 0, 20)
 countLabel.Size = UDim2.new(0.5, -12, 0, 26)
-countLabel.Text = "0"
-countLabel.TextSize = 20
-countLabel.TextColor3 = PALETTE.green
-countLabel.Font = Enum.Font.GothamBold
-countLabel.TextXAlignment = Enum.TextXAlignment.Left
-countLabel.Parent = statCard
 
-makeLabel(statCard, "BÓVEDA", 10, PALETTE.muted, true, 14).Position = UDim2.new(0.5, 0, 0, 8)
-local vaultLabel = Instance.new("TextLabel")
-vaultLabel.BackgroundTransparency = 1
+makeLabel(statCard, "EN BÓVEDA", 10, PALETTE.muted, true, 14).Position = UDim2.new(0.5, 0, 0, 8)
+local vaultLabel = makeLabel(statCard, "0/0", 20, PALETTE.accent, true, 26)
 vaultLabel.Position = UDim2.new(0.5, 0, 0, 20)
 vaultLabel.Size = UDim2.new(0.5, -12, 0, 26)
-vaultLabel.Text = "0/0"
-vaultLabel.TextSize = 20
-vaultLabel.TextColor3 = PALETTE.accent
-vaultLabel.Font = Enum.Font.GothamBold
-vaultLabel.TextXAlignment = Enum.TextXAlignment.Left
-vaultLabel.Parent = statCard
 
 -- Barra de la bóveda
 local barTrack = Instance.new("Frame")
@@ -662,42 +454,24 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 addCorner(barFill, 4)
 
--- Modo de viaje
-local modeRow = makeRow(body, 3, 36)
-local tpBtn = makeButton(modeRow, "⚡ TP", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 1)
-local glideBtn = makeButton(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 2)
+-- Capacidad manual
+local capCard = makeCard(body, 3, 44)
+local capMinus = makeButton(capCard, "−", UDim2.new(0, 48, 0, 32), PALETTE.bg)
+capMinus.Position = UDim2.new(0, 6, 0, 6)
+local capPlus = makeButton(capCard, "+", UDim2.new(0, 48, 0, 32), PALETTE.bg)
+capPlus.Position = UDim2.new(1, -54, 0, 6)
+local capLabel = makeLabel(capCard, "", 14, PALETTE.text, true, nil)
+capLabel.Size = UDim2.new(1, -116, 1, 0)
+capLabel.Position = UDim2.new(0, 60, 0, 0)
+capLabel.TextXAlignment = Enum.TextXAlignment.Center
 
--- Agarrar / abrir ahora
-local optRow = makeRow(body, 4, 36)
-local grabBtn = makeButton(optRow, "🎒 Agarrar", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 1)
-local openNowBtn = makeButton(optRow, "🏦 Abrir ahora", UDim2.new(0.5, -3, 1, 0), PALETTE.card, 2)
-
--- Espera encima del barco
-local waitCard = makeCard(body, 5, 40)
-local waitMinus = makeButton(waitCard, "−", UDim2.new(0, 48, 0, 30), PALETTE.bg, 0)
-waitMinus.Position = UDim2.new(0, 5, 0, 5)
-local waitPlus = makeButton(waitCard, "+", UDim2.new(0, 48, 0, 30), PALETTE.bg, 0)
-waitPlus.Position = UDim2.new(1, -53, 0, 5)
-local waitLabel = makeLabel(waitCard, "", 13, PALETTE.text, true, nil)
-waitLabel.Size = UDim2.new(1, -110, 1, 0)
-waitLabel.Position = UDim2.new(0, 55, 0, 0)
-
--- Capacidad de la bóveda
-local capCard = makeCard(body, 6, 40)
-local capMinus = makeButton(capCard, "−", UDim2.new(0, 48, 0, 30), PALETTE.bg, 0)
-capMinus.Position = UDim2.new(0, 5, 0, 5)
-local capPlus = makeButton(capCard, "+", UDim2.new(0, 48, 0, 30), PALETTE.bg, 0)
-capPlus.Position = UDim2.new(1, -53, 0, 5)
-local capLabel = makeLabel(capCard, "", 13, PALETTE.text, true, nil)
-capLabel.Size = UDim2.new(1, -110, 1, 0)
-capLabel.Position = UDim2.new(0, 55, 0, 0)
-
--- Pausa
-local toggleBtn = makeButton(body, "", UDim2.new(1, 0, 0, 40), PALETTE.green, 7)
+-- Pausa / reanudar
+local toggleBtn = makeButton(body, "", UDim2.new(1, 0, 0, 42), PALETTE.green)
+toggleBtn.LayoutOrder = 4
 toggleBtn.TextSize = 14
 
--- Mini botón
-local mini = makeButton(gui, "🏴‍☠️", UDim2.new(0, 50, 0, 50), PALETTE.card, 0)
+-- Minimizado (cuadrado)
+local mini = makeButton(gui, "🏴‍☠️", UDim2.new(0, 50, 0, 50), PALETTE.card)
 mini.TextSize = 22
 mini.Visible = false
 addStroke(mini, PALETTE.accent, 1.2, 0.3)
@@ -707,7 +481,6 @@ miniScale.Parent = mini
 makeDraggable(header, main)
 makeDraggable(mini, mini)
 
--- Escala según pantalla
 local camera = Workspace.CurrentCamera
 local function updateScale()
     local vp = camera.ViewportSize
@@ -718,24 +491,13 @@ end
 updateScale()
 camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
 
----------------------------------------------------------------
--- ACTUALIZAR UI
----------------------------------------------------------------
 refreshUI = function()
     local stored = storedCount()
     subtitleLabel.Text = statusText
     countLabel.Text = tostring(collectedCount)
     vaultLabel.Text = stored .. "/" .. capacity
     barFill.Size = UDim2.new(math.clamp(stored / math.max(capacity, 1), 0, 1), 0, 1, 0)
-    waitLabel.Text = "Espera barco: " .. waitOnBoat .. " s"
-    capLabel.Text = "Bóveda: " .. capacity
-
-    tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
-    glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
-    grabBtn.BackgroundColor3 = grabChests and PALETTE.green or PALETTE.card
-    grabBtn.Text = grabChests and "🎒 Agarrar: ON" or "🎒 Agarrar: OFF"
-    openNowBtn.BackgroundColor3 = manualOpen and PALETTE.orange or PALETTE.card
-
+    capLabel.Text = "Capacidad: " .. capacity
     toggleBtn.Text = running and "⏸  Pausar" or "▶  Reanudar"
     toggleBtn.BackgroundColor3 = running and PALETTE.green or PALETTE.orange
 end
@@ -743,29 +505,6 @@ end
 ---------------------------------------------------------------
 -- EVENTOS
 ---------------------------------------------------------------
-tpBtn.Activated:Connect(function() mode = "TP"; refreshUI() end)
-glideBtn.Activated:Connect(function() mode = "DESLIZAR"; refreshUI() end)
-
-grabBtn.Activated:Connect(function()
-    grabChests = not grabChests
-    refreshUI()
-end)
-
-openNowBtn.Activated:Connect(function()
-    manualOpen = not manualOpen
-    setStatus(manualOpen and "Se abrirán cofres en el próximo ciclo" or "Apertura manual cancelada")
-end)
-
-waitMinus.Activated:Connect(function()
-    waitOnBoat = math.max(0, waitOnBoat - 1)
-    refreshUI()
-end)
-
-waitPlus.Activated:Connect(function()
-    waitOnBoat = math.min(CONFIG.ESPERA_MAX_BARCO, waitOnBoat + 1)
-    refreshUI()
-end)
-
 capMinus.Activated:Connect(function()
     capacity = math.max(1, capacity - 1)
     refreshUI()
@@ -804,13 +543,13 @@ end)
 task.spawn(function()
     while not closed do
         if running then
-            local ok, err = pcall(collectRound)
+            local ok, err = pcall(collectCycle)
             if not ok then
                 setStatus("Error: " .. tostring(err))
             end
         end
         refreshUI()
-        task.wait(CONFIG.ESPERA_ENTRE_RONDAS)
+        task.wait(1)
     end
 end)
 
