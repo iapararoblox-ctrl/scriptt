@@ -1,4 +1,4 @@
--- Recolección de cofres + barco + tesorero + modo por isla (Ser pirata, Móvil)
+-- Recolección de cofres + barco + tesorero + isla (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -74,8 +74,8 @@ local CONFIG = {
     RADIO_ISLA_SIN_CAJA = 250,
     MODO_INICIAL = "TP",
     VELOCIDAD_DESLIZAR = 45,
-    CAPACIDAD_INICIAL = 5,
-    CAPACIDAD_MAX = 50,
+    CAPACIDAD_INICIAL = 81,
+    CAPACIDAD_MAX = 81,
     ESPERA_BARCO_INICIAL = 5,
     ESPERA_BARCO_MAX = 60,
     ESPERA_RECOGER = 0.3,
@@ -86,10 +86,18 @@ local CONFIG = {
     NOMBRE_BARCO_MANUAL = "",
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
+    PANEL_ANCHO_INICIAL = 280,     -- ancho inicial del panel (px)
+    PANEL_ALTO_INICIAL = 440,      -- alto inicial del panel (px)
+    PANEL_PASO = 20,               -- cuánto cambia cada toque de − o +
+    PANEL_MIN_ANCHO = 220,
+    PANEL_MIN_ALTO = 300,
     DEBUG = true,
 }
 
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
+
+-- Diseño base del contenido; se escala para llenar el panel
+local BASE_W, BASE_H = 300, 470
 
 ---------------------------------------------------------------
 -- RUTAS
@@ -142,11 +150,14 @@ local islandIndex = CONFIG.ISLA_INDEX_INICIAL
 local mode = CONFIG.MODO_INICIAL
 local capacity = CONFIG.CAPACIDAD_INICIAL
 local waitOnBoat = CONFIG.ESPERA_BARCO_INICIAL
+local panelW = CONFIG.PANEL_ANCHO_INICIAL
+local panelH = CONFIG.PANEL_ALTO_INICIAL
 local collectedCount = 0
 local openedCount = 0
 local statusText = "Listo"
 local cachedShip = nil
 local islandCache = {}
+local manualOpenRequested = false
 local closed = false
 local refreshUI
 
@@ -479,7 +490,7 @@ local function openVault()
         return
     end
 
-    setStatus("Bóveda llena: yendo al tesorero...")
+    setStatus("Yendo al tesorero...")
     teleportTo(hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
 
     local p1 = hrp:FindFirstChild("NPCPrompt_1")
@@ -590,7 +601,7 @@ local function collectCycle()
 end
 
 ---------------------------------------------------------------
--- UI (compacta, se ajusta a la pantalla del teléfono)
+-- UI
 ---------------------------------------------------------------
 local PALETTE = {
     bg = Color3.fromRGB(18, 20, 28),
@@ -654,54 +665,57 @@ local function button(parent, text, size, color)
     return b
 end
 
--- Tarjeta: altura fija si se pasa, si no crece con su contenido
-local function card(parent, order, height)
-    local f = Instance.new("Frame")
-    f.Size = height and UDim2.new(1, 0, 0, height) or UDim2.new(1, 0, 0, 0)
-    if not height then
-        f.AutomaticSize = Enum.AutomaticSize.Y
+local function listLayout(parent, padding, horizontal)
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, padding)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    if horizontal then
+        l.FillDirection = Enum.FillDirection.Horizontal
     end
+    l.Parent = parent
+    return l
+end
+
+local function padding(frame, x, y)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, x)
+    p.PaddingRight = UDim.new(0, x)
+    p.PaddingTop = UDim.new(0, y or x)
+    p.PaddingBottom = UDim.new(0, y or x)
+    p.Parent = frame
+end
+
+-- Fila tipo tarjeta
+local function rowFrame(parent, order)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -4, 0, 34)
     f.BackgroundColor3 = PALETTE.card
     f.BorderSizePixel = 0
     f.LayoutOrder = order
     f.Parent = parent
-    corner(f, 12)
+    corner(f, 8)
     return f
-end
-
-local function padCard(frame, p)
-    local pad = Instance.new("UIPadding")
-    pad.PaddingLeft = UDim.new(0, p)
-    pad.PaddingRight = UDim.new(0, p)
-    pad.PaddingTop = UDim.new(0, p / 2)
-    pad.PaddingBottom = UDim.new(0, p / 2)
-    pad.Parent = frame
-end
-
-local function listLayout(parent, padding)
-    local l = Instance.new("UIListLayout")
-    l.Padding = UDim.new(0, padding)
-    l.SortOrder = Enum.SortOrder.LayoutOrder
-    l.Parent = parent
-    return l
 end
 
 -- Casilla de activado / desactivado
 local function checkRow(parent, text, order, initial, onChange)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, 0, 0, 30)
-    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, -4, 0, 34)
+    row.BackgroundColor3 = PALETTE.card
+    row.BorderSizePixel = 0
     row.Text = ""
     row.AutoButtonColor = false
     row.LayoutOrder = order
     row.Parent = parent
+    corner(row, 8)
 
     local lbl = label(row, text, 12, PALETTE.text, false)
-    lbl.Size = UDim2.new(1, -34, 1, 0)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.Size = UDim2.new(1, -44, 1, 0)
 
     local box = Instance.new("Frame")
-    box.Size = UDim2.new(0, 18, 0, 18)
-    box.Position = UDim2.new(1, -18, 0.5, -9)
+    box.Size = UDim2.fromOffset(18, 18)
+    box.Position = UDim2.new(1, -28, 0.5, -9)
     box.BorderSizePixel = 0
     box.Parent = row
     corner(box, 5)
@@ -724,29 +738,22 @@ local function checkRow(parent, text, order, initial, onChange)
     end)
 
     paint()
-    return { set = function(v) state = v; paint() end }
+    return { refresh = paint }
 end
 
 -- ◀ texto ▶
 local function arrowRow(parent, order, getText, onPrev, onNext)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 32)
-    row.BackgroundTransparency = 1
-    row.LayoutOrder = order
-    row.Parent = parent
+    local row = rowFrame(parent, order)
 
-    local prev = button(row, "◀", UDim2.new(0, 34, 0, 30), PALETTE.track)
-    prev.Position = UDim2.new(0, 0, 0.5, -15)
-    prev.TextSize = 14
-
-    local nxt = button(row, "▶", UDim2.new(0, 34, 0, 30), PALETTE.track)
-    nxt.Position = UDim2.new(1, -34, 0.5, -15)
-    nxt.TextSize = 14
+    local prev = button(row, "◀", UDim2.fromOffset(34, 28), PALETTE.track)
+    prev.Position = UDim2.new(0, 3, 0.5, -14)
+    local nxt = button(row, "▶", UDim2.fromOffset(34, 28), PALETTE.track)
+    nxt.Position = UDim2.new(1, -37, 0.5, -14)
 
     local lbl = label(row, "", 12, PALETTE.text, true)
     lbl.TextXAlignment = Enum.TextXAlignment.Center
-    lbl.Size = UDim2.new(1, -76, 1, 0)
-    lbl.Position = UDim2.new(0, 39, 0, 0)
+    lbl.Position = UDim2.new(0, 42, 0, 0)
+    lbl.Size = UDim2.new(1, -84, 1, 0)
     lbl.TextTruncate = Enum.TextTruncate.AtEnd
 
     prev.Activated:Connect(onPrev)
@@ -755,23 +762,19 @@ local function arrowRow(parent, order, getText, onPrev, onNext)
     return { refresh = function() lbl.Text = getText() end }
 end
 
--- − valor +
+-- Texto − +
 local function stepperRow(parent, order, getText, onMinus, onPlus)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 32)
-    row.BackgroundTransparency = 1
-    row.LayoutOrder = order
-    row.Parent = parent
+    local row = rowFrame(parent, order)
 
     local lbl = label(row, "", 12, PALETTE.text, true)
-    lbl.Size = UDim2.new(1, -76, 1, 0)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.Size = UDim2.new(1, -86, 1, 0)
 
-    local minus = button(row, "−", UDim2.new(0, 32, 0, 30), PALETTE.track)
-    minus.Position = UDim2.new(1, -72, 0.5, -15)
+    local minus = button(row, "−", UDim2.fromOffset(34, 28), PALETTE.track)
+    minus.Position = UDim2.new(1, -76, 0.5, -14)
     minus.TextSize = 16
-
-    local plus = button(row, "+", UDim2.new(0, 32, 0, 30), PALETTE.track)
-    plus.Position = UDim2.new(1, -36, 0.5, -15)
+    local plus = button(row, "+", UDim2.fromOffset(34, 28), PALETTE.track)
+    plus.Position = UDim2.new(1, -38, 0.5, -14)
     plus.TextSize = 16
 
     minus.Activated:Connect(onMinus)
@@ -807,32 +810,45 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal: se ajusta al tamaño de la pantalla
+-- Panel principal (tamaño en píxeles, editable desde la pestaña Panel)
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.fromOffset(260, 400)
 main.BackgroundColor3 = PALETTE.bg
 main.BorderSizePixel = 0
+main.ClipsDescendants = true
 main.Parent = gui
 corner(main, 16)
 stroke(main, PALETTE.accent, 1, 0.5)
 
-local function fitToScreen()
+-- Contenido con diseño base, escalado para llenar el panel
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.AnchorPoint = Vector2.new(0.5, 0.5)
+content.Position = UDim2.new(0.5, 0, 0.5, 0)
+content.Size = UDim2.fromOffset(BASE_W, BASE_H)
+content.BackgroundTransparency = 1
+content.Parent = main
+
+local contentScale = Instance.new("UIScale")
+contentScale.Parent = content
+
+local function applyPanelSize()
     local vp = camera.ViewportSize
-    local w = math.min(270, vp.X - 20)
-    local h = math.min(440, vp.Y - 30)
-    main.Size = UDim2.fromOffset(math.max(w, 200), math.max(h, 200))
+    local maxW = math.max(CONFIG.PANEL_MIN_ANCHO, vp.X - 10)
+    local maxH = math.max(CONFIG.PANEL_MIN_ALTO, vp.Y - 10)
+    panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, maxW)
+    panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, maxH)
+    main.Size = UDim2.fromOffset(panelW, panelH)
+    contentScale.Scale = math.min(panelW / BASE_W, panelH / BASE_H)
 end
-fitToScreen()
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitToScreen)
 
 -- Cabecera
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
-header.Parent = main
+header.Parent = content
 
 local title = label(header, "Cofres", 15, PALETTE.text, true)
 title.Position = UDim2.new(0, 14, 0, 6)
@@ -843,32 +859,20 @@ subtitle.Position = UDim2.new(0, 14, 0, 24)
 subtitle.Size = UDim2.new(1, -100, 0, 14)
 subtitle.TextTruncate = Enum.TextTruncate.AtEnd
 
-local minBtn = button(header, "—", UDim2.new(0, 30, 0, 30), PALETTE.card)
+local minBtn = button(header, "—", UDim2.fromOffset(30, 30), PALETTE.card)
 minBtn.Position = UDim2.new(1, -72, 0, 7)
-local closeBtn = button(header, "✕", UDim2.new(0, 30, 0, 30), PALETTE.red)
+local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), PALETTE.red)
 closeBtn.Position = UDim2.new(1, -36, 0, 7)
 
--- Cuerpo desplazable (si algo no cabe, se puede bajar)
-local body = Instance.new("ScrollingFrame")
-body.Position = UDim2.new(0, 0, 0, 44)
-body.Size = UDim2.new(1, 0, 1, -44)
-body.BackgroundTransparency = 1
-body.BorderSizePixel = 0
-body.ScrollBarThickness = 3
-body.ScrollBarImageColor3 = PALETTE.accent
-body.CanvasSize = UDim2.new(0, 0, 0, 0)
-body.AutomaticCanvasSize = Enum.AutomaticSize.Y
-body.Parent = main
+-- Tarjeta de resumen
+local statCard = Instance.new("Frame")
+statCard.Position = UDim2.new(0, 10, 0, 48)
+statCard.Size = UDim2.new(0, BASE_W - 20, 0, 54)
+statCard.BackgroundColor3 = PALETTE.card
+statCard.BorderSizePixel = 0
+statCard.Parent = content
+corner(statCard, 12)
 
-listLayout(body, 8)
-local bodyPad = Instance.new("UIPadding")
-bodyPad.PaddingLeft = UDim.new(0, 10)
-bodyPad.PaddingRight = UDim.new(0, 10)
-bodyPad.PaddingBottom = UDim.new(0, 10)
-bodyPad.Parent = body
-
--- Estadísticas + barra
-local statCard = card(body, 1, 56)
 local recLbl = label(statCard, "RECOGIDOS", 9, PALETTE.muted, true)
 recLbl.Position = UDim2.new(0, 12, 0, 7)
 recLbl.Size = UDim2.new(0.5, -12, 0, 12)
@@ -886,8 +890,8 @@ vaultLabel.Position = UDim2.new(0.5, 0, 0, 19)
 vaultLabel.Size = UDim2.new(0.5, -12, 0, 24)
 
 local barTrack = Instance.new("Frame")
-barTrack.Size = UDim2.new(1, -24, 0, 5)
-barTrack.Position = UDim2.new(0, 12, 1, -10)
+barTrack.Position = UDim2.new(0, 10, 1, -11)
+barTrack.Size = UDim2.new(1, -20, 0, 5)
 barTrack.BackgroundColor3 = PALETTE.track
 barTrack.BorderSizePixel = 0
 barTrack.Parent = statCard
@@ -900,37 +904,114 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 corner(barFill, 3)
 
--- Opciones
-local optCard = card(body, 2)
-padCard(optCard, 10)
-listLayout(optCard, 3)
+-- Pestañas
+local tabRow = Instance.new("Frame")
+tabRow.Position = UDim2.new(0, 10, 0, 110)
+tabRow.Size = UDim2.new(0, BASE_W - 20, 0, 30)
+tabRow.BackgroundTransparency = 1
+tabRow.Parent = content
+listLayout(tabRow, 4, true)
 
-checkRow(optCard, "Recolección automática", 1, auto, function(v)
+local tabNames = { "Cofres", "Isla", "Bóveda", "Panel" }
+local tabButtons = {}
+for i, name in ipairs(tabNames) do
+    local b = button(tabRow, name, UDim2.new(0.25, -3, 1, 0), PALETTE.card)
+    b.LayoutOrder = i
+    tabButtons[i] = b
+end
+
+-- Área de páginas
+local pageArea = Instance.new("Frame")
+pageArea.Position = UDim2.new(0, 10, 0, 148)
+pageArea.Size = UDim2.new(0, BASE_W - 20, 0, BASE_H - 158)
+pageArea.BackgroundTransparency = 1
+pageArea.Parent = content
+
+local pages = {}
+local function newPage()
+    local p = Instance.new("ScrollingFrame")
+    p.Size = UDim2.new(1, 0, 1, 0)
+    p.BackgroundTransparency = 1
+    p.BorderSizePixel = 0
+    p.ScrollBarThickness = 3
+    p.ScrollBarImageColor3 = PALETTE.accent
+    p.CanvasSize = UDim2.new(0, 0, 0, 0)
+    p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    p.Visible = false
+    p.Parent = pageArea
+    listLayout(p, 6)
+    padding(p, 2, 2)
+    table.insert(pages, p)
+    return p
+end
+
+local pageCofres = newPage()
+local pageIsla = newPage()
+local pageBoveda = newPage()
+local pagePanel = newPage()
+
+local function showTab(index)
+    for i, p in ipairs(pages) do
+        p.Visible = (i == index)
+    end
+    for i, b in ipairs(tabButtons) do
+        b.BackgroundColor3 = (i == index) and PALETTE.accent or PALETTE.card
+    end
+end
+
+for i, b in ipairs(tabButtons) do
+    b.Activated:Connect(function() showTab(i) end)
+end
+
+---------------------------------------------------------------
+-- PESTAÑA COFRES
+---------------------------------------------------------------
+checkRow(pageCofres, "Recolección automática", 1, auto, function(v)
     auto = v
     setStatus(v and "Buscando cofres..." or "Recolección apagada")
 end)
 
-checkRow(optCard, "Ir al barco y volver", 2, returnToSpot, function(v)
+checkRow(pageCofres, "Ir al barco y volver", 2, returnToSpot, function(v)
     returnToSpot = v
     setStatus(v and "Volverá a tu posición tras guardar" or "Se quedará en el barco tras guardar")
 end)
 
-checkRow(optCard, "Solo cofres de otros jugadores", 3, onlyOthers, function(v)
+checkRow(pageCofres, "Solo cofres de otros jugadores", 3, onlyOthers, function(v)
     onlyOthers = v
     setStatus(v and "Modo: solo cofres de otros" or "Modo: no tomar cofres de otros")
 end)
 
-checkRow(optCard, "Recolectar por isla", 4, islandMode, function(v)
+local modeRow = Instance.new("Frame")
+modeRow.Size = UDim2.new(1, -4, 0, 32)
+modeRow.BackgroundTransparency = 1
+modeRow.LayoutOrder = 4
+modeRow.Parent = pageCofres
+listLayout(modeRow, 6, true)
+
+local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+
+local waitStepper = stepperRow(pageCofres, 5,
+    function() return "Espera en barco: " .. waitOnBoat .. " s" end,
+    function()
+        waitOnBoat = math.max(0, waitOnBoat - 1)
+        refreshUI()
+    end,
+    function()
+        waitOnBoat = math.min(CONFIG.ESPERA_BARCO_MAX, waitOnBoat + 1)
+        refreshUI()
+    end
+)
+
+---------------------------------------------------------------
+-- PESTAÑA ISLA
+---------------------------------------------------------------
+checkRow(pageIsla, "Recolectar por isla", 1, islandMode, function(v)
     islandMode = v
     setStatus(v and ("Modo isla: " .. currentIslandName()) or "Modo isla apagado")
 end)
 
--- Selector de isla
-local islandCard = card(body, 3)
-padCard(islandCard, 8)
-listLayout(islandCard, 4)
-
-local diffRow = arrowRow(islandCard, 1,
+local diffRow = arrowRow(pageIsla, 2,
     function()
         return ISLAND_GROUPS[diffIndex].nombre .. " (" .. diffIndex .. "/" .. #ISLAND_GROUPS .. ")"
     end,
@@ -948,7 +1029,7 @@ local diffRow = arrowRow(islandCard, 1,
     end
 )
 
-local islandRow = arrowRow(islandCard, 2,
+local islandRow = arrowRow(pageIsla, 3,
     function()
         local group = ISLAND_GROUPS[diffIndex]
         return group.islas[islandIndex][1] .. " (" .. islandIndex .. "/" .. #group.islas .. ")"
@@ -967,12 +1048,16 @@ local islandRow = arrowRow(islandCard, 2,
     end
 )
 
--- Ajustes
-local setCard = card(body, 4)
-padCard(setCard, 8)
-listLayout(setCard, 4)
+local islandNote = label(pageIsla, "", 10, PALETTE.muted, false)
+islandNote.LayoutOrder = 4
+islandNote.Size = UDim2.new(1, -4, 0, 30)
+islandNote.TextWrapped = true
+islandNote.TextYAlignment = Enum.TextYAlignment.Top
 
-local capStepper = stepperRow(setCard, 1,
+---------------------------------------------------------------
+-- PESTAÑA BÓVEDA
+---------------------------------------------------------------
+local capStepper = stepperRow(pageBoveda, 1,
     function() return "Espacio de bóveda: " .. capacity end,
     function()
         capacity = math.max(1, capacity - 1)
@@ -984,34 +1069,64 @@ local capStepper = stepperRow(setCard, 1,
     end
 )
 
-local waitStepper = stepperRow(setCard, 2,
-    function() return "Espera en barco: " .. waitOnBoat .. " s" end,
+local vaultInfo = label(pageBoveda, "", 11, PALETTE.muted, false)
+vaultInfo.LayoutOrder = 2
+vaultInfo.Size = UDim2.new(1, -4, 0, 30)
+vaultInfo.TextWrapped = true
+vaultInfo.TextYAlignment = Enum.TextYAlignment.Top
+
+local emptyBtn = button(pageBoveda, "🏦 Vaciar bóveda ahora", UDim2.new(1, -4, 0, 36), PALETTE.orange or PALETTE.accent)
+emptyBtn.LayoutOrder = 3
+emptyBtn.Activated:Connect(function()
+    manualOpenRequested = true
+    setStatus("Se vaciará la bóveda en el próximo ciclo")
+end)
+
+---------------------------------------------------------------
+-- PESTAÑA PANEL (tamaño editable)
+---------------------------------------------------------------
+local widthStepper = stepperRow(pagePanel, 1,
+    function() return "Ancho del panel: " .. panelW .. " px" end,
     function()
-        waitOnBoat = math.max(0, waitOnBoat - 1)
+        panelW = panelW - CONFIG.PANEL_PASO
+        applyPanelSize()
         refreshUI()
     end,
     function()
-        waitOnBoat = math.min(CONFIG.ESPERA_BARCO_MAX, waitOnBoat + 1)
+        panelW = panelW + CONFIG.PANEL_PASO
+        applyPanelSize()
         refreshUI()
     end
 )
 
--- Modo de viaje
-local modeRow = Instance.new("Frame")
-modeRow.Size = UDim2.new(1, 0, 0, 32)
-modeRow.BackgroundTransparency = 1
-modeRow.LayoutOrder = 5
-modeRow.Parent = body
+local heightStepper = stepperRow(pagePanel, 2,
+    function() return "Alto del panel: " .. panelH .. " px" end,
+    function()
+        panelH = panelH - CONFIG.PANEL_PASO
+        applyPanelSize()
+        refreshUI()
+    end,
+    function()
+        panelH = panelH + CONFIG.PANEL_PASO
+        applyPanelSize()
+        refreshUI()
+    end
+)
 
-local modeList = Instance.new("UIListLayout")
-modeList.FillDirection = Enum.FillDirection.Horizontal
-modeList.Padding = UDim.new(0, 6)
-modeList.Parent = modeRow
+local resetBtn = button(pagePanel, "↺ Tamaño por defecto", UDim2.new(1, -4, 0, 36), PALETTE.card)
+resetBtn.LayoutOrder = 3
+resetBtn.Activated:Connect(function()
+    panelW = CONFIG.PANEL_ANCHO_INICIAL
+    panelH = CONFIG.PANEL_ALTO_INICIAL
+    applyPanelSize()
+    refreshUI()
+end)
 
-local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
-local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
-
-makeDraggable(header, main)
+local panelNote = label(pagePanel, "El contenido se ajusta al tamaño del panel. Si el panel tiene una proporción distinta al diseño, sobra espacio a los lados.", 10, PALETTE.muted, false)
+panelNote.LayoutOrder = 4
+panelNote.Size = UDim2.new(1, -4, 0, 40)
+panelNote.TextWrapped = true
+panelNote.TextYAlignment = Enum.TextYAlignment.Top
 
 -- Minimizado (cuadrado)
 local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
@@ -1020,6 +1135,14 @@ mini.Visible = false
 stroke(mini, PALETTE.accent, 1, 0.3)
 makeDraggable(mini, mini)
 
+makeDraggable(header, main)
+
+applyPanelSize()
+camera:GetPropertyChangedSignal("ViewportSize"):Connect(applyPanelSize)
+
+---------------------------------------------------------------
+-- ACTUALIZAR UI
+---------------------------------------------------------------
 refreshUI = function()
     local used = usedSpace()
     subtitle.Text = statusText
@@ -1030,10 +1153,18 @@ refreshUI = function()
     tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
     glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
 
+    waitStepper.refresh()
     diffRow.refresh()
     islandRow.refresh()
+    islandNote.Text = islandMode
+        and ("Irá a " .. currentIslandName() .. " y solo recogerá cofres dentro de esa isla.")
+        or "Activa la opción para recoger solo en la isla elegida."
+
     capStepper.refresh()
-    waitStepper.refresh()
+    vaultInfo.Text = "Guardados: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
+
+    widthStepper.refresh()
+    heightStepper.refresh()
 end
 
 tpBtn.Activated:Connect(function()
@@ -1063,9 +1194,14 @@ closeBtn.Activated:Connect(function()
     gui:Destroy()
 end)
 
+showTab(1)
+
 task.spawn(function()
     while not closed do
-        if auto then
+        if manualOpenRequested then
+            manualOpenRequested = false
+            pcall(openVault)
+        elseif auto then
             local ok, err = pcall(collectCycle)
             if not ok then
                 setStatus("Error: " .. tostring(err))
