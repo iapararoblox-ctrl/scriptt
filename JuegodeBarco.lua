@@ -90,14 +90,17 @@ local CONFIG = {
     -- Panel (tamaño libre: escribe el valor o usa − +)
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
-    PANEL_MIN_ANCHO = 180,          -- mínimo que permite el panel
+    PANEL_MIN_ANCHO = 180,
     PANEL_MIN_ALTO = 240,
-    PANEL_MAX = 3000,               -- máximo (muy alto para no tener límite práctico)
-    PANEL_PASOS = { 5, 10, 20, 50 }, -- pasos que puedes elegir para − y +
-    PANEL_PASO_INICIAL = 3,         -- índice del paso inicial (3 = 20 px)
+    PANEL_MAX = 3000,
+    PANEL_PASOS = { 5, 10, 20, 50 },
+    PANEL_PASO_INICIAL = 3,          -- índice del paso inicial (3 = 20 px)
 
     DEBUG = true,
 }
+
+-- Diseño base del contenido. Todo se escala a partir de este tamaño.
+local BASE_W, BASE_H = 300, 470
 
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
 
@@ -742,7 +745,6 @@ local function checkRow(parent, text, order, initial, onChange)
     return { refresh = paint }
 end
 
--- ◀ texto ▶
 local function arrowRow(parent, order, getText, onPrev, onNext)
     local row = rowFrame(parent, order)
 
@@ -763,7 +765,6 @@ local function arrowRow(parent, order, getText, onPrev, onNext)
     return { refresh = function() lbl.Text = getText() end }
 end
 
--- Texto − +
 local function stepperRow(parent, order, getText, onMinus, onPlus)
     local row = rowFrame(parent, order)
 
@@ -784,7 +785,6 @@ local function stepperRow(parent, order, getText, onMinus, onPlus)
     return { refresh = function() lbl.Text = getText() end }
 end
 
--- Fila para editar un tamaño: nombre, caja para escribir, − y +
 local function sizeRow(parent, order, name, getVal, setVal, getStep)
     local row = rowFrame(parent, order)
 
@@ -875,18 +875,28 @@ main.Parent = gui
 corner(main, 16)
 stroke(main, PALETTE.accent, 1, 0.5)
 
--- Contenido: llena el panel completo (se estira con el tamaño)
+-- Contenido: diseño base que se escala completo (texto, botones, espacios)
 local content = Instance.new("Frame")
 content.Name = "Content"
-content.Size = UDim2.fromScale(1, 1)
+content.Position = UDim2.new(0, 0, 0, 0)
 content.BackgroundTransparency = 1
 content.Parent = main
 
--- Solo se limita el tamaño mínimo y el máximo; no el de la pantalla
+local contentScale = Instance.new("UIScale")
+contentScale.Parent = content
+
+-- Ajusta el panel y escala todo lo de adentro según el tamaño
 local function applyPanelSize()
     panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, CONFIG.PANEL_MAX)
     panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, CONFIG.PANEL_MAX)
     main.Size = UDim2.fromOffset(panelW, panelH)
+
+    -- Escala uniforme: el texto y los controles crecen o se achican con el panel
+    local s = math.min(panelW / BASE_W, panelH / BASE_H)
+    contentScale.Scale = s
+
+    -- El área de diseño ocupa exactamente el panel después de escalar
+    content.Size = UDim2.fromOffset(panelW / s, panelH / s)
 end
 
 -- Cabecera
@@ -909,7 +919,7 @@ minBtn.Position = UDim2.new(1, -72, 0, 7)
 local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), PALETTE.red)
 closeBtn.Position = UDim2.new(1, -36, 0, 7)
 
--- Tarjeta de resumen (ancho según el panel)
+-- Tarjeta de resumen
 local statCard = Instance.new("Frame")
 statCard.Position = UDim2.new(0, 10, 0, 48)
 statCard.Size = UDim2.new(1, -20, 0, 54)
@@ -965,7 +975,7 @@ for i, name in ipairs(tabNames) do
     tabButtons[i] = b
 end
 
--- Área de páginas (llena lo que queda del panel)
+-- Área de páginas
 local pageArea = Instance.new("Frame")
 pageArea.Position = UDim2.new(0, 10, 0, 148)
 pageArea.Size = UDim2.new(1, -20, 1, -158)
@@ -1128,7 +1138,7 @@ emptyBtn.Activated:Connect(function()
 end)
 
 ---------------------------------------------------------------
--- PESTAÑA PANEL (tamaño libre)
+-- PESTAÑA PANEL
 ---------------------------------------------------------------
 local function currentStep()
     return CONFIG.PANEL_PASOS[panelStepIdx]
@@ -1178,7 +1188,7 @@ resetBtn.Activated:Connect(function()
 end)
 
 local panelNote = label(pagePanel,
-    "Escribe el ancho y el alto en la caja, o usa − y +. El contenido se estira para llenar el panel.",
+    "Escribe el ancho y el alto en la caja, o usa − y +. Todo el contenido se escala con el panel.",
     10, PALETTE.muted, false)
 panelNote.LayoutOrder = 5
 panelNote.Size = UDim2.new(1, -4, 0, 40)
