@@ -98,10 +98,10 @@ local CONFIG = {
 
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
-    PANEL_MIN_ANCHO = 180,
-    PANEL_MIN_ALTO = 240,
+    PANEL_MIN_ANCHO = 50,
+    PANEL_MIN_ALTO = 10,
     PANEL_MAX = 3000,
-    PANEL_PASOS = { 5, 10, 20, 50 },
+    PANEL_PASOS = {1, 5, 10, 20, 50 },
     PANEL_PASO_INICIAL = 3,
 
     CONFIG_ARCHIVO = "CofresConfig.json",
