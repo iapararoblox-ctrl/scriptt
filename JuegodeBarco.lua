@@ -1,4 +1,4 @@
--- Recolección de cofres + barco + tesorero + isla + filtros (Ser pirata, Móvil)
+-- Recolección de cofres + barco + barco de otro jugador + tesorero + isla + filtros (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -92,8 +92,7 @@ local CONFIG = {
     VALOR_MIN_INICIAL = 10000,
     VALOR_PASO = 1000,
     RAREZA_FILTRO_INICIAL = false,
-    RAREZA_MIN_INICIAL = 3,                 -- índice en RAREZAS (3 = Rare)
-    -- Orden de menor a mayor. Edita o agrega nombres según veas en el juego.
+    RAREZA_MIN_INICIAL = 3,
     RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine" },
 
     PANEL_ANCHO_INICIAL = 280,
@@ -101,7 +100,7 @@ local CONFIG = {
     PANEL_MIN_ANCHO = 50,
     PANEL_MIN_ALTO = 10,
     PANEL_MAX = 3000,
-    PANEL_PASOS = {1, 5, 10, 20, 50 },
+    PANEL_PASOS = { 1, 5, 10, 20, 50 },
     PANEL_PASO_INICIAL = 3,
 
     CONFIG_ARCHIVO = "CofresConfig.json",
@@ -110,6 +109,7 @@ local CONFIG = {
 
 local BASE_W, BASE_H = 300, 470
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
+local MINE_LABEL = "Mi barco"
 
 ---------------------------------------------------------------
 -- CARGAR CONFIGURACIÓN GUARDADA
@@ -130,6 +130,13 @@ end
 
 local function svb(key, default)
     if type(saved[key]) == "boolean" then
+        return saved[key]
+    end
+    return default
+end
+
+local function svs(key, default)
+    if type(saved[key]) == "string" then
         return saved[key]
     end
     return default
@@ -193,11 +200,13 @@ local panelW = svn("panelW", CONFIG.PANEL_ANCHO_INICIAL)
 local panelH = svn("panelH", CONFIG.PANEL_ALTO_INICIAL)
 local panelStepIdx = math.clamp(math.floor(svn("panelStepIdx", CONFIG.PANEL_PASO_INICIAL)), 1, #CONFIG.PANEL_PASOS)
 
--- Filtros
 local valueFilter = svb("valueFilter", CONFIG.VALOR_FILTRO_INICIAL)
 local valueMin = math.max(0, math.floor(svn("valueMin", CONFIG.VALOR_MIN_INICIAL)))
 local rarityFilter = svb("rarityFilter", CONFIG.RAREZA_FILTRO_INICIAL)
 local rarityMinIdx = math.clamp(math.floor(svn("rarityMinIdx", CONFIG.RAREZA_MIN_INICIAL)), 1, #CONFIG.RAREZAS)
+
+-- Destino de los cofres: "Mi barco" o el nombre del barco de otro jugador
+local targetLabel = svs("targetLabel", MINE_LABEL)
 
 local collectedCount = 0
 local openedCount = 0
@@ -231,6 +240,7 @@ local function saveConfig()
         valueMin = valueMin,
         rarityFilter = rarityFilter,
         rarityMinIdx = rarityMinIdx,
+        targetLabel = targetLabel,
     }
     pcall(function()
         writefile(CONFIG.CONFIG_ARCHIVO, HttpService:JSONEncode(data))
@@ -253,7 +263,6 @@ end
 
 ---------------------------------------------------------------
 -- PROPIEDADES DEL COFRE (CargoSize, Value, Rarity)
--- Se leen como atributo o como objeto hijo (NumberValue, StringValue, etc.)
 ---------------------------------------------------------------
 local function getChestProp(obj, name)
     local v = obj:GetAttribute(name)
@@ -468,7 +477,7 @@ local function moveTo(pos)
 end
 
 ---------------------------------------------------------------
--- TU BARCO
+-- BARCOS: el tuyo y los de otros jugadores
 ---------------------------------------------------------------
 local function isMyShip(ship)
     local name = LocalPlayer.Name
@@ -515,6 +524,65 @@ local function getMyShip()
     return nil
 end
 
+-- Nombre visible del dueño de un barco; si no hay dato, usa el nombre del barco
+local function shipOwnerLabel(ship)
+    for _, attr in ipairs({ "OwnerName", "Owner", "PlayerName", "Player" }) do
+        local v = ship:GetAttribute(attr)
+        if v ~= nil and tostring(v) ~= "" then
+            return tostring(v)
+        end
+    end
+    for _, d in ipairs(ship:GetDescendants()) do
+        if d:IsA("ObjectValue") and d.Value and d.Value:IsA("Player") then
+            return d.Value.Name
+        end
+    end
+    return ship.Name
+end
+
+-- Lista de barcos de otros jugadores, con nombres sin repetir
+local function listOtherShips()
+    local result = {}
+    local seen = {}
+    local dyn = getDynamic()
+    local ships = dyn and dyn:FindFirstChild("Ships")
+    if not ships then return result end
+
+    for _, ship in ipairs(ships:GetChildren()) do
+        if isModelOrPart(ship) and not isMyShip(ship) then
+            local lbl = shipOwnerLabel(ship)
+            seen[lbl] = (seen[lbl] or 0) + 1
+            if seen[lbl] > 1 then
+                lbl = lbl .. " #" .. seen[lbl]
+            end
+            table.insert(result, { ship = ship, label = lbl })
+        end
+    end
+    return result
+end
+
+-- Opciones del selector de destino: primero "Mi barco", luego los demás
+local function buildTargetOptions()
+    local opts = { MINE_LABEL }
+    for _, e in ipairs(listOtherShips()) do
+        table.insert(opts, e.label)
+    end
+    return opts
+end
+
+-- Barco donde se guardarán los cofres según el destino elegido
+local function getDestinationShip()
+    if targetLabel == MINE_LABEL or targetLabel == "" then
+        return getMyShip()
+    end
+    for _, e in ipairs(listOtherShips()) do
+        if e.label == targetLabel then
+            return e.ship
+        end
+    end
+    return nil
+end
+
 local function getShipTop(ship)
     local center, size
     if ship:IsA("Model") then
@@ -526,10 +594,9 @@ local function getShipTop(ship)
 end
 
 ---------------------------------------------------------------
--- BÓVEDA
+-- BÓVEDA (CargoVisuals de cualquier barco)
 ---------------------------------------------------------------
-local function getStoredChests()
-    local ship = getMyShip()
+local function chestsOn(ship)
     local cargo = ship and ship:FindFirstChild("CargoVisuals")
     local list = {}
     if cargo then
@@ -542,12 +609,21 @@ local function getStoredChests()
     return list
 end
 
-local function usedSpace()
+local function usedSpaceOn(ship)
     local total = 0
-    for _, chest in ipairs(getStoredChests()) do
+    for _, chest in ipairs(chestsOn(ship)) do
         total += getCargoSize(chest)
     end
     return total
+end
+
+-- Bóveda propia (la que abre el tesorero)
+local function getStoredChests()
+    return chestsOn(getMyShip())
+end
+
+local function usedSpace()
+    return usedSpaceOn(getMyShip())
 end
 
 ---------------------------------------------------------------
@@ -559,19 +635,19 @@ local function pickUpChest(base, prompt)
     task.wait(CONFIG.ESPERA_RECOGER)
 end
 
-local function storeOnBoat(usedBefore)
-    local ship = getMyShip()
-    if not ship then
-        setStatus("No encuentro tu barco")
+-- Lleva el cofre a "dest" (barco propio u otro) y espera a que aparezca en su bóveda
+local function storeOnBoat(usedBefore, dest)
+    if not dest then
+        setStatus("No encuentro el barco destino")
         return false
     end
 
-    setStatus("Guardando en el barco...")
-    teleportTo(getShipTop(ship))
+    setStatus("Guardando en " .. targetLabel .. "...")
+    teleportTo(getShipTop(dest))
 
     local t0 = os.clock()
     while os.clock() - t0 < CONFIG.ESPERA_GUARDADO do
-        if usedSpace() > usedBefore then
+        if usedSpaceOn(dest) > usedBefore then
             return true
         end
         task.wait(0.25)
@@ -589,7 +665,7 @@ local function waitOnShip()
 end
 
 ---------------------------------------------------------------
--- TESORERO
+-- TESORERO (solo abre los cofres de TU barco)
 ---------------------------------------------------------------
 local function openVault()
     local dyn = getDynamic()
@@ -646,8 +722,19 @@ local function collectCycle()
         return
     end
 
-    if usedSpace() >= capacity then
-        openVault()
+    local dest = getDestinationShip()
+    if not dest then
+        setStatus("No encuentro el barco de " .. targetLabel)
+        return
+    end
+    local destIsMine = (dest == getMyShip())
+
+    if usedSpaceOn(dest) >= capacity then
+        if destIsMine then
+            openVault()
+        else
+            setStatus("El barco de " .. targetLabel .. " está lleno")
+        end
         return
     end
 
@@ -685,8 +772,12 @@ local function collectCycle()
             if size > capacity then
                 setStatus("Cofre más grande que la bóveda, lo salto")
             else
-                if usedSpace() + size > capacity then
-                    openVault()
+                if usedSpaceOn(dest) + size > capacity then
+                    if destIsMine then
+                        openVault()
+                    else
+                        setStatus("El barco de " .. targetLabel .. " no tiene espacio")
+                    end
                     return
                 end
 
@@ -694,11 +785,11 @@ local function collectCycle()
                 local returnCF = root and root.CFrame
 
                 setStatus("Recogiendo cofre (espacio " .. size .. ")...")
-                local usedBefore = usedSpace()
+                local usedBefore = usedSpaceOn(dest)
                 pickUpChest(base, prompt)
                 collectedCount += 1
 
-                if storeOnBoat(usedBefore) then
+                if storeOnBoat(usedBefore, dest) then
                     waitOnShip()
                 end
 
@@ -894,7 +985,6 @@ local function stepperRow(parent, order, getText, onMinus, onPlus)
     return { refresh = function() lbl.Text = getText() end }
 end
 
--- Caja escribible con − y +; sirve para tamaños y para el valor mínimo
 local function numberRow(parent, order, name, getVal, setVal, getStep, boxWidth)
     local row = rowFrame(parent, order)
     boxWidth = boxWidth or 64
@@ -974,7 +1064,6 @@ local function makeDraggable(handle, frame)
     end)
 end
 
--- Panel principal
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -1065,7 +1154,7 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 corner(barFill, 3)
 
--- Pestañas (5)
+-- Pestañas
 local tabRow = Instance.new("Frame")
 tabRow.Position = UDim2.new(0, 10, 0, 110)
 tabRow.Size = UDim2.new(1, -20, 0, 30)
@@ -1082,7 +1171,6 @@ for i, name in ipairs(tabNames) do
     tabButtons[i] = b
 end
 
--- Área de páginas
 local pageArea = Instance.new("Frame")
 pageArea.Position = UDim2.new(0, 10, 0, 148)
 pageArea.Size = UDim2.new(1, -20, 1, -158)
@@ -1156,7 +1244,31 @@ listLayout(modeRow, 6, true)
 local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
 local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
 
-local waitStepper = stepperRow(pageCofres, 5,
+-- Selector de destino: Mi barco o el barco de otro jugador
+local function cycleTarget(step)
+    local opts = buildTargetOptions()
+    local idx = 1
+    for i, v in ipairs(opts) do
+        if v == targetLabel then
+            idx = i
+            break
+        end
+    end
+    idx = idx + step
+    if idx < 1 then idx = #opts end
+    if idx > #opts then idx = 1 end
+    targetLabel = opts[idx]
+    markDirty()
+    setStatus("Destino: " .. targetLabel)
+end
+
+local destRow = arrowRow(pageCofres, 5,
+    function() return "Destino: " .. targetLabel end,
+    function() cycleTarget(-1) end,
+    function() cycleTarget(1) end
+)
+
+local waitStepper = stepperRow(pageCofres, 6,
     function() return "Espera en barco: " .. waitOnBoat .. " s" end,
     function()
         waitOnBoat = math.max(0, waitOnBoat - 1)
@@ -1399,6 +1511,7 @@ refreshUI = function()
     tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
     glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
 
+    destRow.refresh()
     waitStepper.refresh()
     diffRow.refresh()
     islandRow.refresh()
@@ -1407,7 +1520,7 @@ refreshUI = function()
         or "Activa la opción para recoger solo en la isla elegida."
 
     capStepper.refresh()
-    vaultInfo.Text = "Guardados: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
+    vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. usedSpace() .. " de " .. capacity .. " espacios."
 
     valueRow.refresh()
     rarityRow.refresh()
