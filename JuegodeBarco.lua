@@ -1,4 +1,4 @@
--- Recolección de cofres + barco + barco de otro jugador + tesorero + isla + filtros (Ser pirata, Móvil)
+-- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + isla + filtros (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -82,12 +82,12 @@ local CONFIG = {
     ESPERA_GUARDADO = 3,
     ESPERA_TESORERO = 1.5,
     ESPERA_APERTURA = 0.6,
+    ESPERA_CARGA_BARCO = 6,        -- segundos máximos esperando que el juego cargue un barco lejano
     ALTURA = 3,
     NOMBRE_BARCO_MANUAL = "",
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
 
-    -- Filtros por valor y rareza
     VALOR_FILTRO_INICIAL = false,
     VALOR_MIN_INICIAL = 10000,
     VALOR_PASO = 1000,
@@ -205,8 +205,12 @@ local valueMin = math.max(0, math.floor(svn("valueMin", CONFIG.VALOR_MIN_INICIAL
 local rarityFilter = svb("rarityFilter", CONFIG.RAREZA_FILTRO_INICIAL)
 local rarityMinIdx = math.clamp(math.floor(svn("rarityMinIdx", CONFIG.RAREZA_MIN_INICIAL)), 1, #CONFIG.RAREZAS)
 
--- Destino de los cofres: "Mi barco" o el nombre del barco de otro jugador
 local targetLabel = svs("targetLabel", MINE_LABEL)
+
+-- Memoria de sesión de barcos de otros jugadores (no se guarda en archivo)
+-- label -> { ship = Instance|nil, shipName = string, pos = Vector3 }
+local shipMemory = {}
+local memoryOrder = {}
 
 local collectedCount = 0
 local openedCount = 0
@@ -477,26 +481,61 @@ local function moveTo(pos)
 end
 
 ---------------------------------------------------------------
--- BARCOS: el tuyo y los de otros jugadores
+-- BARCOS
 ---------------------------------------------------------------
-local function isMyShip(ship)
-    local name = LocalPlayer.Name
-    local userId = tostring(LocalPlayer.UserId)
+-- Busca barcos en Ships, incluidas carpetas dentro de Ships
+local function collectShipCandidates()
+    local result = {}
+    local dyn = getDynamic()
+    local ships = dyn and dyn:FindFirstChild("Ships")
+    if not ships then return result end
 
-    for _, attr in ipairs({ "Owner", "OwnerName", "OwnerId", "Player", "UserId" }) do
-        local v = ship:GetAttribute(attr)
-        if v ~= nil and (tostring(v) == name or tostring(v) == userId) then
-            return true
+    for _, child in ipairs(ships:GetChildren()) do
+        if child:IsA("Model") or child:IsA("BasePart") then
+            table.insert(result, child)
+        elseif child:IsA("Folder") then
+            for _, d in ipairs(child:GetChildren()) do
+                if d:IsA("Model") or d:IsA("BasePart") then
+                    table.insert(result, d)
+                end
+            end
         end
     end
+    return result
+end
+
+local function isMyShip(ship)
+    local name = LocalPlayer.Name
+    local displayName = LocalPlayer.DisplayName
+    local userId = tostring(LocalPlayer.UserId)
+
+    for _, attr in ipairs({ "Owner", "OwnerName", "OwnerId", "Player", "PlayerName", "UserId" }) do
+        local v = ship:GetAttribute(attr)
+        if v ~= nil then
+            local s = tostring(v)
+            if s == name or s == displayName or s == userId then
+                return true
+            end
+        end
+    end
+
     for _, d in ipairs(ship:GetDescendants()) do
         if d:IsA("ObjectValue") and d.Value == LocalPlayer then
             return true
         elseif d:IsA("StringValue") and (d.Value == name or d.Value == userId) then
             return true
+        elseif (d:IsA("IntValue") or d:IsA("NumberValue")) and tostring(d.Value) == userId then
+            return true
         end
     end
-    return ship.Name:find(name, 1, true) ~= nil or ship.Name:find(userId, 1, true) ~= nil
+
+    if ship.Name == name or ship.Name == displayName then
+        return true
+    end
+    if ship.Name:find(userId, 1, true) then
+        return true
+    end
+    return false
 end
 
 local function getMyShip()
@@ -505,11 +544,7 @@ local function getMyShip()
     end
     cachedShip = nil
 
-    local dyn = getDynamic()
-    local ships = dyn and dyn:FindFirstChild("Ships")
-    if not ships then return nil end
-
-    for _, ship in ipairs(ships:GetChildren()) do
+    for _, ship in ipairs(collectShipCandidates()) do
         local match
         if CONFIG.NOMBRE_BARCO_MANUAL ~= "" then
             match = ship.Name == CONFIG.NOMBRE_BARCO_MANUAL
@@ -524,63 +559,135 @@ local function getMyShip()
     return nil
 end
 
--- Nombre visible del dueño de un barco; si no hay dato, usa el nombre del barco
-local function shipOwnerLabel(ship)
-    for _, attr in ipairs({ "OwnerName", "Owner", "PlayerName", "Player" }) do
+-- Nombre del dueño: convierte UserId en nombre y revisa jugadores del servidor
+local function ownerNameOf(ship)
+    for _, attr in ipairs({ "OwnerName", "PlayerName", "Owner", "Player", "OwnerId", "UserId" }) do
         local v = ship:GetAttribute(attr)
         if v ~= nil and tostring(v) ~= "" then
-            return tostring(v)
+            local asNumber = tonumber(v)
+            if asNumber then
+                local p = Players:GetPlayerByUserId(asNumber)
+                if p then return p.Name end
+            else
+                return tostring(v)
+            end
         end
     end
+
     for _, d in ipairs(ship:GetDescendants()) do
         if d:IsA("ObjectValue") and d.Value and d.Value:IsA("Player") then
             return d.Value.Name
         end
     end
-    return ship.Name
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and ship.Name:find(p.Name, 1, true) then
+            return p.Name
+        end
+    end
+
+    return nil
 end
 
--- Lista de barcos de otros jugadores, con nombres sin repetir
+local function shipPivotPos(ship)
+    if ship:IsA("Model") then
+        return ship:GetPivot().Position
+    end
+    return ship.Position
+end
+
+-- Guarda o actualiza un barco en la memoria de la sesión
+local function rememberShip(label, ship)
+    local m = shipMemory[label]
+    if not m then
+        m = {}
+        shipMemory[label] = m
+        table.insert(memoryOrder, label)
+    end
+    m.ship = ship
+    m.shipName = ship.Name
+    m.pos = shipPivotPos(ship)
+end
+
+-- Revisa los barcos cargados ahora y los recuerda
 local function listOtherShips()
     local result = {}
     local seen = {}
-    local dyn = getDynamic()
-    local ships = dyn and dyn:FindFirstChild("Ships")
-    if not ships then return result end
 
-    for _, ship in ipairs(ships:GetChildren()) do
-        if isModelOrPart(ship) and not isMyShip(ship) then
-            local lbl = shipOwnerLabel(ship)
+    for _, ship in ipairs(collectShipCandidates()) do
+        if not isMyShip(ship) then
+            local lbl = ownerNameOf(ship) or ship.Name
             seen[lbl] = (seen[lbl] or 0) + 1
             if seen[lbl] > 1 then
                 lbl = lbl .. " #" .. seen[lbl]
             end
+            rememberShip(lbl, ship)
             table.insert(result, { ship = ship, label = lbl })
         end
     end
     return result
 end
 
--- Opciones del selector de destino: primero "Mi barco", luego los demás
+-- Opciones del selector: "Mi barco" y todos los barcos recordados en esta sesión
 local function buildTargetOptions()
+    listOtherShips()
     local opts = { MINE_LABEL }
-    for _, e in ipairs(listOtherShips()) do
-        table.insert(opts, e.label)
+    for _, lbl in ipairs(memoryOrder) do
+        table.insert(opts, lbl)
     end
     return opts
 end
 
--- Barco donde se guardarán los cofres según el destino elegido
+-- Si el barco ya no está cargado, se acerca a su última posición para que el juego lo cargue
+local function loadRememberedShip(label)
+    local m = shipMemory[label]
+    if not m or not m.pos then return nil end
+
+    setStatus("Cargando barco de " .. label .. "...")
+    teleportTo(m.pos + Vector3.new(0, 15, 0))
+
+    local t0 = os.clock()
+    while os.clock() - t0 < CONFIG.ESPERA_CARGA_BARCO and not closed do
+        local fallback
+        for _, c in ipairs(collectShipCandidates()) do
+            if not isMyShip(c) and c.Name == m.shipName then
+                if (ownerNameOf(c) or c.Name) == label then
+                    rememberShip(label, c)
+                    return c
+                end
+                fallback = fallback or c
+            end
+        end
+        if fallback then
+            rememberShip(label, fallback)
+            return fallback
+        end
+        task.wait(0.5)
+    end
+
+    setStatus("No se cargó el barco de " .. label .. ": el juego no lo mostró")
+    return nil
+end
+
+-- Barco de destino según la opción elegida
 local function getDestinationShip()
     if targetLabel == MINE_LABEL or targetLabel == "" then
         return getMyShip()
     end
-    for _, e in ipairs(listOtherShips()) do
-        if e.label == targetLabel then
-            return e.ship
-        end
+
+    local m = shipMemory[targetLabel]
+    if not m then
+        listOtherShips()
+        m = shipMemory[targetLabel]
+        if not m then return nil end
     end
-    return nil
+
+    if m.ship and m.ship.Parent then
+        m.pos = shipPivotPos(m.ship)
+        return m.ship
+    end
+
+    return loadRememberedShip(targetLabel)
 end
 
 local function getShipTop(ship)
@@ -617,7 +724,6 @@ local function usedSpaceOn(ship)
     return total
 end
 
--- Bóveda propia (la que abre el tesorero)
 local function getStoredChests()
     return chestsOn(getMyShip())
 end
@@ -635,7 +741,6 @@ local function pickUpChest(base, prompt)
     task.wait(CONFIG.ESPERA_RECOGER)
 end
 
--- Lleva el cofre a "dest" (barco propio u otro) y espera a que aparezca en su bóveda
 local function storeOnBoat(usedBefore, dest)
     if not dest then
         setStatus("No encuentro el barco destino")
@@ -724,10 +829,14 @@ local function collectCycle()
 
     local dest = getDestinationShip()
     if not dest then
-        setStatus("No encuentro el barco de " .. targetLabel)
+        if targetLabel ~= MINE_LABEL then
+            setStatus("No encuentro el barco de " .. targetLabel)
+        else
+            setStatus("No encuentro tu barco")
+        end
         return
     end
-    local destIsMine = (dest == getMyShip())
+    local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
 
     if usedSpaceOn(dest) >= capacity then
         if destIsMine then
@@ -766,6 +875,12 @@ local function collectCycle()
             and inIsland
             and passesOwnerFilter(item)
             and passesValueRarity(item) then
+
+            -- Si el barco de otro jugador se descargó, vuelve a cargarlo
+            if not dest.Parent then
+                dest = getDestinationShip()
+                if not dest then return end
+            end
 
             local size = getCargoSize(item)
 
@@ -1094,7 +1209,6 @@ local function applyPanelSize()
     content.Size = UDim2.fromOffset(panelW / s, panelH / s)
 end
 
--- Cabecera
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
@@ -1114,7 +1228,6 @@ minBtn.Position = UDim2.new(1, -72, 0, 7)
 local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), PALETTE.red)
 closeBtn.Position = UDim2.new(1, -36, 0, 7)
 
--- Tarjeta de resumen
 local statCard = Instance.new("Frame")
 statCard.Position = UDim2.new(0, 10, 0, 48)
 statCard.Size = UDim2.new(1, -20, 0, 54)
@@ -1154,7 +1267,6 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 corner(barFill, 3)
 
--- Pestañas
 local tabRow = Instance.new("Frame")
 tabRow.Position = UDim2.new(0, 10, 0, 110)
 tabRow.Size = UDim2.new(1, -20, 0, 30)
@@ -1244,7 +1356,6 @@ listLayout(modeRow, 6, true)
 local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
 local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
 
--- Selector de destino: Mi barco o el barco de otro jugador
 local function cycleTarget(step)
     local opts = buildTargetOptions()
     local idx = 1
@@ -1259,7 +1370,12 @@ local function cycleTarget(step)
     if idx > #opts then idx = 1 end
     targetLabel = opts[idx]
     markDirty()
-    setStatus("Destino: " .. targetLabel)
+
+    if #opts == 1 then
+        setStatus("Solo veo tu barco: acércate a otros barcos para que aparezcan")
+    else
+        setStatus("Destino: " .. targetLabel)
+    end
 end
 
 local destRow = arrowRow(pageCofres, 5,
@@ -1268,7 +1384,14 @@ local destRow = arrowRow(pageCofres, 5,
     function() cycleTarget(1) end
 )
 
-local waitStepper = stepperRow(pageCofres, 6,
+-- Información recordada del barco destino
+local destNote = label(pageCofres, "", 10, PALETTE.muted, false)
+destNote.LayoutOrder = 6
+destNote.Size = UDim2.new(1, -4, 0, 30)
+destNote.TextWrapped = true
+destNote.TextYAlignment = Enum.TextYAlignment.Top
+
+local waitStepper = stepperRow(pageCofres, 7,
     function() return "Espera en barco: " .. waitOnBoat .. " s" end,
     function()
         waitOnBoat = math.max(0, waitOnBoat - 1)
@@ -1487,7 +1610,6 @@ panelNote.Size = UDim2.new(1, -4, 0, 40)
 panelNote.TextWrapped = true
 panelNote.TextYAlignment = Enum.TextYAlignment.Top
 
--- Minimizado
 local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
 mini.TextSize = 20
 mini.Visible = false
@@ -1512,6 +1634,17 @@ refreshUI = function()
     glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
 
     destRow.refresh()
+
+    local m = shipMemory[targetLabel]
+    if targetLabel == MINE_LABEL then
+        destNote.Text = "Los cofres se guardan en tu barco."
+    elseif m then
+        local estado = (m.ship and m.ship.Parent) and "cargado" or "recordado (se cargará al ir)"
+        destNote.Text = "Barco: " .. (m.shipName or "?") .. " · " .. estado
+    else
+        destNote.Text = "Aún no he visto este barco en esta sesión."
+    end
+
     waitStepper.refresh()
     diffRow.refresh()
     islandRow.refresh()
@@ -1520,7 +1653,7 @@ refreshUI = function()
         or "Activa la opción para recoger solo en la isla elegida."
 
     capStepper.refresh()
-    vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. usedSpace() .. " de " .. capacity .. " espacios."
+    vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
 
     valueRow.refresh()
     rarityRow.refresh()
