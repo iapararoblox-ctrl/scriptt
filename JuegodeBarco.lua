@@ -1,4 +1,4 @@
--- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + mares/islas (español/inglés) + filtros
+-- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + mares/islas (español/inglés) + filtros + COMBATE AUTOMÁTICO
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -149,6 +149,22 @@ local CONFIG = {
     RAREZA_MIN_INICIAL = 3,
     RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine" },
 
+    -- COMBATE
+    PREFIJO_TIERRA = "Enemy_",         -- enemigos de tierra: Enemy_(nombre)
+    PREFIJO_BARCO = "NPCShip_",        -- enemigos en barco: NPCShip_(nombre)
+    ATAQUE_POR_ISLA_INICIAL = true,    -- solo ataca enemigos dentro de la isla elegida
+    EQUIPAR_AUTO_INICIAL = true,       -- si no tienes tool en la mano, equipa la primera de la mochila
+    OBJETIVO_INICIAL = "*ALL",         -- *ALL = todos, *LAND = todos de tierra, *SHIP = todos de barco
+    ATAQUE_DISTANCIA_INICIAL = 4,      -- studs de distancia al enemigo
+    ATAQUE_ALTURA_INICIAL = 0,         -- studs extra de altura sobre el enemigo
+    ATAQUE_DISTANCIA_MAX = 40,
+    ATAQUE_ALTURA_MIN = -20,
+    ATAQUE_ALTURA_MAX = 40,
+    ESPERA_ATAQUE = 0.15,              -- segundos entre cada golpe (tool:Activate)
+    ATAQUE_TIMEOUT = 25,               -- segundos máximos por enemigo antes de saltarlo
+    ENEMIGO_BLOQUEO = 30,              -- segundos que se ignora un enemigo al que no se pudo matar
+    MAX_ENEMIGOS_POR_CICLO = 5,        -- tras estos kills deja turno a la recolección de cofres
+
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
     PANEL_MIN_ANCHO = 50,
@@ -165,6 +181,8 @@ local BASE_W, BASE_H = 300, 470
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
 local MINE_LABEL = "Mi barco"
 local HOVER_NAME = "CofresHover"
+
+local ENEMY_ALL, ENEMY_LAND, ENEMY_SHIP = "*ALL", "*LAND", "*SHIP"
 
 ---------------------------------------------------------------
 -- CARGAR CONFIGURACIÓN GUARDADA
@@ -208,6 +226,11 @@ end
 local function getTreasureFolder()
     local dyn = getDynamic()
     return dyn and dyn:FindFirstChild("Treasure")
+end
+
+local function getEnemiesFolder()
+    local dyn = getDynamic()
+    return dyn and dyn:FindFirstChild("Enemies")
 end
 
 local function getIslandRoots()
@@ -263,6 +286,22 @@ local rarityMinIdx = math.clamp(math.floor(svn("rarityMinIdx", CONFIG.RAREZA_MIN
 
 local targetLabel = svs("targetLabel", MINE_LABEL)
 
+-- Combate
+local attackEnabled = false
+local attackByIsland = svb("attackByIsland", CONFIG.ATAQUE_POR_ISLA_INICIAL)
+local autoEquip = svb("autoEquip", CONFIG.EQUIPAR_AUTO_INICIAL)
+local attackTarget = svs("attackTarget", CONFIG.OBJETIVO_INICIAL)
+local attackDist = math.clamp(math.floor(svn("attackDist", CONFIG.ATAQUE_DISTANCIA_INICIAL)), 0, CONFIG.ATAQUE_DISTANCIA_MAX)
+local attackHeight = math.clamp(math.floor(svn("attackHeight", CONFIG.ATAQUE_ALTURA_INICIAL)),
+    CONFIG.ATAQUE_ALTURA_MIN, CONFIG.ATAQUE_ALTURA_MAX)
+local killedCount = 0
+
+-- Memoria de sesión de enemigos vistos (nombre completo -> "LAND" | "SHIP")
+local enemyMemory = {}
+local enemyOrder = {}
+-- Enemigos que no se pudieron matar a tiempo (se ignoran un rato)
+local enemyBlacklist = setmetatable({}, { __mode = "k" })
+
 -- Memoria de sesión de barcos de otros jugadores (no se guarda en archivo)
 -- label -> { ship = Instance|nil, shipName = string, pos = Vector3 }
 local shipMemory = {}
@@ -302,6 +341,11 @@ local function saveConfig()
         rarityFilter = rarityFilter,
         rarityMinIdx = rarityMinIdx,
         targetLabel = targetLabel,
+        attackByIsland = attackByIsland,
+        autoEquip = autoEquip,
+        attackTarget = attackTarget,
+        attackDist = attackDist,
+        attackHeight = attackHeight,
     }
     pcall(function()
         writefile(CONFIG.CONFIG_ARCHIVO, HttpService:JSONEncode(data))
@@ -525,6 +569,15 @@ local function teleportToCFrame(cf)
     root.AssemblyLinearVelocity = Vector3.zero
     root.CFrame = cf
     task.wait(0.2)
+    return true
+end
+
+-- Teletransporte instantáneo, sin espera (para seguir a un enemigo mientras se ataca)
+local function snapToCFrame(cf)
+    local root = getRoot()
+    if not root then return false end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = cf
     return true
 end
 
@@ -862,7 +915,7 @@ end
 -- RECOGER, GUARDAR, ESPERAR
 ---------------------------------------------------------------
 -- Se coloca justo sobre el prompt del cofre (a "height" studs) y lo activa.
--- En modo isla: height = ALTURA_ISLA (8) y se queda flotando, sin anclarse.
+-- En modo isla: height = ALTURA_ISLA y se queda flotando, sin anclarse.
 local function pickUpChest(base, prompt, height, hover)
     local anchorPos = base.Position
     local att = prompt.Parent
@@ -970,6 +1023,260 @@ local function openVault()
 end
 
 ---------------------------------------------------------------
+-- ISLA: ir y quedarse flotando (lo usan cofres y combate)
+---------------------------------------------------------------
+local function prepareIsland()
+    local entry = currentIslandEntry()
+    local island = getIsland(entry)
+    if not island then
+        setStatus("No encuentro la isla " .. islandDisplayName(entry))
+        return nil
+    end
+    local root = getRoot()
+    if root and not isInsideIsland(island, root.Position) then
+        setHover(false)
+        setStatus("Yendo a la isla " .. islandDisplayName(entry) .. "...")
+        moveTo(islandTop(island))
+        hoverHere()
+        setStatus("Esperando que carguen los cofres...")
+        task.wait(CONFIG.ESPERA_STREAMING)
+    elseif root and not hoverActive(root) then
+        hoverHere()
+    end
+    return island
+end
+
+---------------------------------------------------------------
+-- COMBATE (enemigos en World.Dynamic.Enemies)
+--   Enemy_(nombre)    -> enemigos de tierra
+--   NPCShip_(nombre)  -> enemigos en barcos
+---------------------------------------------------------------
+local function enemyKind(name)
+    if name:sub(1, #CONFIG.PREFIJO_TIERRA) == CONFIG.PREFIJO_TIERRA then
+        return "LAND"
+    elseif name:sub(1, #CONFIG.PREFIJO_BARCO) == CONFIG.PREFIJO_BARCO then
+        return "SHIP"
+    end
+    return nil
+end
+
+local function enemyBaseName(name)
+    local kind = enemyKind(name)
+    if kind == "LAND" then
+        return name:sub(#CONFIG.PREFIJO_TIERRA + 1)
+    elseif kind == "SHIP" then
+        return name:sub(#CONFIG.PREFIJO_BARCO + 1)
+    end
+    return name
+end
+
+local function enemyLabel(key)
+    if key == ENEMY_ALL then return "Todos" end
+    if key == ENEMY_LAND then return "Todos (tierra)" end
+    if key == ENEMY_SHIP then return "Todos (barcos)" end
+    local kind = enemyKind(key)
+    local base = enemyBaseName(key)
+    if kind == "LAND" then return "Tierra: " .. base end
+    if kind == "SHIP" then return "Barco: " .. base end
+    return key
+end
+
+local function rememberEnemy(name, kind)
+    if not enemyMemory[name] then
+        enemyMemory[name] = kind
+        table.insert(enemyOrder, name)
+        table.sort(enemyOrder)
+    end
+end
+
+-- Enemigos cargados ahora (y los recuerda para el selector)
+local function listEnemies()
+    local result = {}
+    local folder = getEnemiesFolder()
+    if not folder then return result end
+
+    for _, e in ipairs(folder:GetChildren()) do
+        if e:IsA("Model") or e:IsA("BasePart") then
+            local kind = enemyKind(e.Name)
+            if kind then
+                rememberEnemy(e.Name, kind)
+                table.insert(result, e)
+            end
+        end
+    end
+    return result
+end
+
+local function buildEnemyOptions()
+    listEnemies()
+    local opts = { ENEMY_ALL, ENEMY_LAND, ENEMY_SHIP }
+    for _, name in ipairs(enemyOrder) do
+        table.insert(opts, name)
+    end
+    return opts
+end
+
+local function matchesTarget(name)
+    local kind = enemyKind(name)
+    if not kind then return false end
+    if attackTarget == ENEMY_ALL then return true end
+    if attackTarget == ENEMY_LAND then return kind == "LAND" end
+    if attackTarget == ENEMY_SHIP then return kind == "SHIP" end
+    return name == attackTarget
+end
+
+local function enemyAlive(e)
+    if not e or not e.Parent then return false end
+    local hum = e:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return false end
+    local hp = e:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return false end
+    return true
+end
+
+local function enemyPos(e)
+    return e:GetPivot().Position
+end
+
+-- Enemigo válido más cercano (según el objetivo elegido y, si aplica, la isla)
+local function nextEnemy(island)
+    local root = getRoot()
+    local myPos = root and root.Position or Vector3.zero
+    local now = os.clock()
+    local best, bestDist
+
+    for _, e in ipairs(listEnemies()) do
+        local expiry = enemyBlacklist[e]
+        local blocked = expiry ~= nil and expiry > now
+        if not blocked and matchesTarget(e.Name) and enemyAlive(e) then
+            local pos = enemyPos(e)
+            if (not island) or isInsideIsland(island, pos) then
+                local d = (pos - myPos).Magnitude
+                if not bestDist or d < bestDist then
+                    best, bestDist = e, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function countEnemies()
+    local land, ship = 0, 0
+    for _, e in ipairs(listEnemies()) do
+        if enemyAlive(e) then
+            if enemyKind(e.Name) == "LAND" then
+                land += 1
+            else
+                ship += 1
+            end
+        end
+    end
+    return land, ship
+end
+
+local function getHeldTool()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChildOfClass("Tool")
+end
+
+-- Usa la tool que tienes en la mano; si no hay y está activado, equipa la primera de la mochila
+local function ensureTool()
+    local tool = getHeldTool()
+    if tool then return tool end
+    if not autoEquip then return nil end
+
+    local character = LocalPlayer.Character
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if hum and backpack then
+        local t = backpack:FindFirstChildOfClass("Tool")
+        if t then
+            pcall(function() hum:EquipTool(t) end)
+            task.wait(0.25)
+            return getHeldTool()
+        end
+    end
+    return nil
+end
+
+-- Posición desde la que se golpea al enemigo
+local function attackCFrameFor(e, kind)
+    local pos = enemyPos(e)
+    local p
+    if kind == "SHIP" then
+        p = getShipTop(e) + Vector3.new(0, attackHeight, 0)
+    else
+        p = pos + Vector3.new(0, attackHeight, attackDist)
+    end
+    local look = Vector3.new(pos.X, p.Y, pos.Z)
+    if (look - p).Magnitude < 0.1 then
+        look = p + Vector3.new(0, 0, -1)
+    end
+    return CFrame.lookAt(p, look)
+end
+
+-- Persigue y golpea al enemigo hasta que muera, desaparezca o se acabe el tiempo
+local function attackEnemy(e)
+    local kind = enemyKind(e.Name) or "LAND"
+    local t0 = os.clock()
+    setHover(true)
+
+    while not closed and attackEnabled and enemyAlive(e) and os.clock() - t0 < CONFIG.ATAQUE_TIMEOUT do
+        local tool = ensureTool()
+        if not tool then
+            setStatus("No tienes ninguna tool en la mano")
+            return false, true
+        end
+
+        snapToCFrame(attackCFrameFor(e, kind))
+        pcall(function() tool:Activate() end)
+        task.wait(CONFIG.ESPERA_ATAQUE)
+    end
+
+    return not enemyAlive(e), false
+end
+
+local function combatCycle()
+    local folder = getEnemiesFolder()
+    if not folder then
+        setStatus("No encuentro World.Dynamic.Enemies")
+        return
+    end
+
+    local island
+    if attackByIsland then
+        island = prepareIsland()
+        if not island then return end
+    end
+
+    local kills = 0
+    while attackEnabled and not closed and kills < CONFIG.MAX_ENEMIGOS_POR_CICLO do
+        local enemy = nextEnemy(island)
+        if not enemy then break end
+
+        setStatus("Atacando " .. enemyLabel(enemy.Name))
+        local dead, noTool = attackEnemy(enemy)
+        if noTool then return end
+
+        if dead then
+            kills += 1
+            killedCount += 1
+        else
+            enemyBlacklist[enemy] = os.clock() + CONFIG.ENEMIGO_BLOQUEO
+        end
+    end
+
+    if attackEnabled and kills == 0 then
+        if attackByIsland then
+            setStatus("Sin enemigos (" .. enemyLabel(attackTarget) .. ") en " .. currentIslandName())
+        else
+            setStatus("Sin enemigos (" .. enemyLabel(attackTarget) .. ")")
+        end
+    end
+end
+
+---------------------------------------------------------------
 -- CICLO
 ---------------------------------------------------------------
 local function collectCycle()
@@ -1001,23 +1308,8 @@ local function collectCycle()
 
     local island
     if islandMode then
-        local entry = currentIslandEntry()
-        island = getIsland(entry)
-        if not island then
-            setStatus("No encuentro la isla " .. islandDisplayName(entry))
-            return
-        end
-        local root = getRoot()
-        if root and not isInsideIsland(island, root.Position) then
-            setHover(false)
-            setStatus("Yendo a la isla " .. islandDisplayName(entry) .. "...")
-            moveTo(islandTop(island))
-            hoverHere()
-            setStatus("Esperando que carguen los cofres...")
-            task.wait(CONFIG.ESPERA_STREAMING)
-        elseif root and not hoverActive(root) then
-            hoverHere()
-        end
+        island = prepareIsland()
+        if not island then return end
     end
 
     local seen, inside, passed = 0, 0, 0
@@ -1444,11 +1736,11 @@ tabRow.BackgroundTransparency = 1
 tabRow.Parent = content
 listLayout(tabRow, 3, true)
 
-local tabNames = { "Cofres", "Isla", "Bóveda", "Filtros", "Panel" }
+local tabNames = { "Cofres", "Isla", "Bóveda", "Filtros", "Combate", "Panel" }
 local tabButtons = {}
 for i, name in ipairs(tabNames) do
-    local b = button(tabRow, name, UDim2.new(0.2, -3, 1, 0), PALETTE.card)
-    b.TextSize = 11
+    local b = button(tabRow, name, UDim2.new(1 / #tabNames, -3, 1, 0), PALETTE.card)
+    b.TextSize = 10
     b.LayoutOrder = i
     tabButtons[i] = b
 end
@@ -1481,6 +1773,7 @@ local pageCofres = newPage()
 local pageIsla = newPage()
 local pageBoveda = newPage()
 local pageFiltros = newPage()
+local pageCombate = newPage()
 local pagePanel = newPage()
 
 local function showTab(index)
@@ -1719,6 +2012,88 @@ filterNote.TextWrapped = true
 filterNote.TextYAlignment = Enum.TextYAlignment.Top
 
 ---------------------------------------------------------------
+-- PESTAÑA COMBATE
+---------------------------------------------------------------
+checkRow(pageCombate, "Ataque automático", 1, attackEnabled, function(v)
+    attackEnabled = v
+    setStatus(v and "Buscando enemigos..." or "Ataque apagado")
+end)
+
+checkRow(pageCombate, "Solo enemigos de la isla elegida", 2, attackByIsland, function(v)
+    attackByIsland = v
+    markDirty()
+    setStatus(v and ("Atacará solo en: " .. currentIslandName()) or "Atacará enemigos en todo el mapa")
+end)
+
+checkRow(pageCombate, "Equipar tool si no tengo en mano", 3, autoEquip, function(v)
+    autoEquip = v
+    markDirty()
+    setStatus(v and "Equipará una tool de la mochila si hace falta" or "Solo usará la tool que tengas en la mano")
+end)
+
+local function cycleEnemyTarget(step)
+    local opts = buildEnemyOptions()
+    local idx = 1
+    for i, v in ipairs(opts) do
+        if v == attackTarget then
+            idx = i
+            break
+        end
+    end
+    idx = idx + step
+    if idx < 1 then idx = #opts end
+    if idx > #opts then idx = 1 end
+    attackTarget = opts[idx]
+    markDirty()
+
+    if #opts == 3 then
+        setStatus("Aún no he visto enemigos: acércate a ellos para que aparezcan en la lista")
+    else
+        setStatus("Objetivo: " .. enemyLabel(attackTarget))
+    end
+end
+
+local enemyRow = arrowRow(pageCombate, 4,
+    function() return "Objetivo: " .. enemyLabel(attackTarget) end,
+    function() cycleEnemyTarget(-1) end,
+    function() cycleEnemyTarget(1) end
+)
+
+local distStepper = stepperRow(pageCombate, 5,
+    function() return "Distancia: " .. attackDist .. " studs" end,
+    function()
+        attackDist = math.max(0, attackDist - 1)
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        attackDist = math.min(CONFIG.ATAQUE_DISTANCIA_MAX, attackDist + 1)
+        markDirty()
+        refreshUI()
+    end
+)
+
+local heightStepper = stepperRow(pageCombate, 6,
+    function() return "Altura: " .. attackHeight .. " studs" end,
+    function()
+        attackHeight = math.max(CONFIG.ATAQUE_ALTURA_MIN, attackHeight - 1)
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        attackHeight = math.min(CONFIG.ATAQUE_ALTURA_MAX, attackHeight + 1)
+        markDirty()
+        refreshUI()
+    end
+)
+
+local combatNote = label(pageCombate, "", 10, PALETTE.muted, false)
+combatNote.LayoutOrder = 7
+combatNote.Size = UDim2.new(1, -4, 0, 70)
+combatNote.TextWrapped = true
+combatNote.TextYAlignment = Enum.TextYAlignment.Top
+
+---------------------------------------------------------------
 -- PESTAÑA PANEL
 ---------------------------------------------------------------
 local function currentStep()
@@ -1839,6 +2214,17 @@ refreshUI = function()
         .. ". Rareza: desde " .. CONFIG.RAREZAS[rarityMinIdx]
         .. (rarityFilter and " (activo)" or " (apagado)") .. "."
 
+    -- Combate
+    enemyRow.refresh()
+    distStepper.refresh()
+    heightStepper.refresh()
+    local land, ship = countEnemies()
+    local tool = getHeldTool()
+    combatNote.Text = "Enemigos cargados: " .. land .. " de tierra, " .. ship .. " en barcos."
+        .. "\nEliminados: " .. killedCount
+        .. "\nTool en mano: " .. (tool and tool.Name or "ninguna")
+        .. (attackByIsland and ("\nIsla: " .. currentIslandName()) or "\nIsla: todo el mapa")
+
     widthRow.refresh()
     heightRow.refresh()
     stepSelector.refresh()
@@ -1870,6 +2256,7 @@ end)
 closeBtn.Activated:Connect(function()
     closed = true
     auto = false
+    attackEnabled = false
     setHover(false)
     saveConfig()
     gui:Destroy()
@@ -1887,14 +2274,24 @@ task.spawn(function()
         if manualOpenRequested then
             manualOpenRequested = false
             pcall(openVault)
-        elseif auto then
-            local ok, err = pcall(collectCycle)
-            if not ok then
-                setHover(false)
-                setStatus("Error: " .. tostring(err))
+        elseif attackEnabled or auto then
+            -- Primero combate (si está activo) y luego recolección de cofres
+            if attackEnabled then
+                local ok, err = pcall(combatCycle)
+                if not ok then
+                    setHover(false)
+                    setStatus("Error de combate: " .. tostring(err))
+                end
+            end
+            if auto and not closed then
+                local ok, err = pcall(collectCycle)
+                if not ok then
+                    setHover(false)
+                    setStatus("Error: " .. tostring(err))
+                end
             end
         end
-        if not auto and hovering then
+        if not auto and not attackEnabled and hovering then
             setHover(false)
         end
         refreshUI()
