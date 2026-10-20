@@ -1,4 +1,4 @@
--- Recolección de cofres + barcos + mares/islas (ES/EN) + ruta de rareza con tiempo por isla (Ser pirata, Móvil)
+-- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + mares/islas (español/inglés) + filtros
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,106 +8,106 @@ local LocalPlayer = Players.LocalPlayer
 
 ---------------------------------------------------------------
 -- MARES E ISLAS
--- IS(nombre_ingles, nombre_espanol, ids_del_juego...)
+-- I(nombreEnIngles, nombreEnEspañol, ...alias)
+-- El nombre en inglés es el que usa el juego para encontrar la isla.
 ---------------------------------------------------------------
-local function IS(en, es, ...)
-    return { en = en, es = es, ids = { ... } }
+local function I(en, es, ...)
+    local names = { en }
+    for _, a in ipairs({ ... }) do
+        table.insert(names, a)
+    end
+    return { en = en, es = es, names = names }
 end
 
-local SEAS = {
-    { key = "Abyssal", es = "Abisal", islas = {
-        IS("Abyssal Throne", "Trono Abisal", "AbyssalThrone"),
-        IS("Blackwake Harbor", "Puerto Estela Negra", "BlackwakeHarbor"),
-        IS("Drowned Cathedral", "Catedral Ahogada", "DrownedCathedral"),
-        IS("Hollowmast Graveyard", "Cementerio del Mástil Hueco", "HollowmastGraveyard"),
-        IS("Midnight Reef", "Arrecife de Medianoche", "MidnightReef"),
-        IS("Seabed", "Lecho Marino", "Seabed"),
-        IS("Trenchgate Passage", "Paso de la Fosa", "TrenchgatePassage"),
+local ISLAND_GROUPS = {
+    { en = "Calm", es = "Calma", islas = {
+        I("StarterPort", "Puerto Inicial", "Starter Port"),
+        I("FinnsBeach", "Playa de Finn", "Starter Island"),
+        I("TinyCay", "Cayo Diminuto", "Small Island"),
+        I("MerchantBay", "Bahía del Mercader"),
+        I("PalmCove", "Cala Palmera"),
+        I("CorallIsland", "Isla Coral", "CoralIsland"),
+        I("CoconutAtoll", "Atolón del Coco"),
+        I("GullSpire", "Aguja de la Gaviota"),
+        I("TurtleRock", "Roca Tortuga"),
+        I("SkullRock", "Roca Calavera"),
+        I("CrabKingLair", "Guarida del Rey Cangrejo", "Crab Shoals"),
+        I("CalmAnchors", "Anclas de la Calma"),
     }},
-    { key = "Ash", es = "Ceniza", islas = {
-        IS("Blackpowder Cove", "Caleta de Pólvora Negra", "BlackpowderCove"),
-        IS("Cinder Dock", "Muelle de Cenizas", "CinderDock"),
-        IS("Kraken Caldera", "Caldera del Kraken", "KrakenCaldera"),
-        IS("Mount Pyre", "Monte Pira", "MountPyre"),
-        IS("Obsidian Key", "Llave de Obsidiana", "ObsidianKey"),
-        IS("Open Water", "Aguas Abiertas", "OpenWater"),
+    { en = "Wild", es = "Salvaje", islas = {
+        I("RedwaterHaven", "Refugio Aguaroja"),
+        I("CutthroatKey", "Cayo Degollador"),
+        I("ThunderFalls", "Cataratas del Trueno"),
+        I("ParrotPeak", "Pico del Loro"),
+        I("FangJungle", "Jungla Colmillo"),
+        I("RedBeardsCove", "Cala Barbarroja"),
     }},
-    { key = "Calm", es = "Calma", islas = {
-        IS("Calm Anchors", "Anclas en Calma", "CalmAnchors"),
-        IS("Coconut Atoll", "Atolón de Cocos", "CoconutAtoll"),
-        IS("Coral Island", "Isla de Coral", "CorallIsland", "CoralIsland"),
-        IS("Crab King Lair", "Guarida del Rey Cangrejo", "CrabKingLair"),
-        IS("Starter Island", "Isla de entrenamiento", "FinnsBeach"),
-        IS("Gull Spire", "Aguja de las Gaviotas", "GullSpire"),
-        IS("Merchant Bay", "Bahía Mercante", "MerchantBay"),
-        IS("Palm Cove", "Caleta de Palmas", "PalmCove"),
-        IS("Skull Rock", "Roca Calavera", "SkullRock"),
-        IS("Starter Port", "Puerto Inicial", "StarterPort"),
-        IS("Small Island", "Isla pequeña", "TinyCay"),
-        IS("Turtle Rock", "Roca Tortuga", "TurtleRock"),
+    { en = "Sunken", es = "Hundido", islas = {
+        I("CoralSpire", "Aguja de Coral"),
+        I("GuardianTemple", "Templo Guardián"),
+        I("TidalColonnade", "Columnata de la Marea"),
+        I("CatacombIsle", "Isla Catacumba"),
+        I("DrownedThrone", "Trono Ahogado"),
     }},
-    { key = "Celestial", es = "Celestial", islas = {
-        IS("Astral Ruins", "Ruinas Astrales", "AstralRuins"),
-        IS("Aurora Rift", "Grieta de Aurora", "AuroraRift"),
-        IS("Moonpetal Atoll", "Atolón Pétalo de Luna", "MoonpetalAtoll"),
-        IS("Prism Reef", "Arrecife Prisma", "PrismReef"),
-        IS("Skyhold Gardens", "Jardines de Cielo Alto", "SkyholdGardens"),
-        IS("Starfall Sanctuary", "Santuario de la Caída Estelar", "StarfallSanctuary"),
+    { en = "Frozen", es = "Helado", islas = {
+        I("Frostpoint", "Punta Escarcha"),
+        I("Rimeclaw", "Garra de Escarcha"),
+        I("Howling", "Aullante"),
+        I("Shiverpeak", "Pico Escalofrío"),
+        I("WreckersFloe", "Banquisa de Naufragios"),
+        I("LeviathanStrait", "Estrecho del Leviatán"),
+        I("OpenWater", "Mar Abierto"),
     }},
-    { key = "Cursed", es = "Maldito", islas = {
-        IS("Dutchmans Fog", "Niebla del Holandés", "DutchmansFog"),
-        IS("Gallows Key", "Llave del Patíbulo", "GallowsKey"),
-        IS("Lanterns End", "Fin de los Faroles", "LanternsEnd"),
-        IS("Wailing Spires", "Agujas Lamentosas", "WailingSpires"),
-        IS("Widows Rest", "Descanso de la Viuda", "WidowsRest"),
-        IS("Wreckers Graveyard", "Cementerio de los Saqueadores", "WreckersGraveyard"),
+    { en = "Ash", es = "Ceniza", islas = {
+        I("CinderDock", "Muelle de Brasas"),
+        I("MountPyre", "Monte Pira"),
+        I("KrakenCaldera", "Caldera del Kraken"),
+        I("BlackpowderCove", "Cala Pólvora Negra"),
+        I("ObsidianKey", "Cayo Obsidiana"),
+        I("OpenWater", "Mar Abierto"),
     }},
-    { key = "DeadMans", es = "Cofre del Muerto", islas = {
-        IS("Abyss Gate", "Puerta del Abismo", "AbyssGate"),
-        IS("Broken Armada", "Armada Rota", "BrokenArmada"),
-        IS("Davys Locker", "Arcón de Davy", "DavysLocker"),
-        IS("Leviathans Grave", "Tumba del Leviatán", "LeviathansGrave"),
-        IS("Skullcrag", "Peñasco Calavera", "Skullcrag"),
+    { en = "Ironbound", es = "Férreo", islas = {
+        I("BlackIronPort", "Puerto Hierro Negro"),
+        I("ChainbreakAtoll", "Atolón Rompecadenas"),
+        I("FoundryIsle", "Isla Fundición"),
+        I("IronwallBastion", "Bastión Muro de Hierro"),
+        I("RivetRocks", "Rocas Remache"),
+        I("TheAnvil", "El Yunque"),
+        I("Seabed", "Lecho Marino"),
     }},
-    { key = "Frozen", es = "Helado", islas = {
-        IS("Frostpoint", "Punto Helado", "Frostpoint"),
-        IS("Howling", "Aullido", "Howling"),
-        IS("Leviathan Strait", "Estrecho del Leviatán", "LeviathanStrait"),
-        IS("Open Water", "Aguas Abiertas", "OpenWater"),
-        IS("Rimeclaw", "Garra Escarchada", "Rimeclaw"),
-        IS("Shiverpeak", "Pico Gélido", "Shiverpeak"),
-        IS("Wreckers Floe", "Témpano de los Saqueadores", "WreckersFloe"),
+    { en = "Cursed", es = "Maldito", islas = {
+        I("LanternsEnd", "Fin de los Faroles"),
+        I("WreckersGraveyard", "Cementerio de Naufragios"),
+        I("GallowsKey", "Cayo de la Horca"),
+        I("WidowsRest", "Descanso de la Viuda"),
+        I("WailingSpires", "Agujas Lamentosas"),
+        I("DutchmansFog", "Niebla del Holandés"),
     }},
-    { key = "Ironbound", es = "Hierro", islas = {
-        IS("Black Iron Port", "Puerto de Hierro Negro", "BlackIronPort"),
-        IS("Chainbreak Atoll", "Atolón Rompecadenas", "ChainbreakAtoll"),
-        IS("Foundry Isle", "Isla de la Fundición", "FoundryIsle"),
-        IS("Ironwall Bastion", "Bastión Muro de Hierro", "IronwallBastion"),
-        IS("Rivet Rocks", "Rocas Remachadas", "RivetRocks"),
-        IS("Seabed", "Lecho Marino", "Seabed"),
-        IS("The Anvil", "El Yunque", "TheAnvil"),
+    { en = "Celestial", es = "Celestial", islas = {
+        I("StarfallSanctuary", "Santuario de la Estrella Fugaz"),
+        I("PrismReef", "Arrecife Prisma"),
+        I("SkyholdGardens", "Jardines de la Fortaleza Celeste"),
+        I("AstralRuins", "Ruinas Astrales"),
+        I("MoonpetalAtoll", "Atolón Pétalo Lunar"),
+        I("AuroraRift", "Grieta de la Aurora"),
     }},
-    { key = "Sunken", es = "Hundido", islas = {
-        IS("Catacomb Isle", "Isla de las Catacumbas", "CatacombIsle"),
-        IS("Coral Spire", "Aguja de Coral", "CoralSpire"),
-        IS("Drowned Throne", "Trono Ahogado", "DrownedThrone"),
-        IS("Guardian Temple", "Templo del Guardián", "GuardianTemple"),
-        IS("Tidal Colonnade", "Columnata de la Marea", "TidalColonnade"),
+    { en = "DeadMans", es = "Mar del Muerto", islas = {
+        I("AbyssGate", "Puerta del Abismo"),
+        I("Skullcrag", "Risco Calavera"),
+        I("LeviathansGrave", "Tumba del Leviatán"),
+        I("BrokenArmada", "Armada Rota"),
+        I("DavysLocker", "Cofre de Davy"),
     }},
-    { key = "Wild", es = "Salvaje", islas = {
-        IS("Cutthroat Key", "Llave del Degollador", "CutthroatKey"),
-        IS("Fang Jungle", "Jungla de Colmillos", "FangJungle"),
-        IS("Parrot Peak", "Pico del Loro", "ParrotPeak"),
-        IS("Redbeards Cove", "Cueva de Barbirroja", "RedBeardsCove", "RedbeardsCove"),
-        IS("Redwater Haven", "Refugio de Aguas Rojas", "RedwaterHaven"),
-        IS("Thunder Falls", "Cascadas del Trueno", "ThunderFalls"),
+    { en = "Abyssal", es = "Abisal", islas = {
+        I("BlackwakeHarbor", "Puerto Estela Negra"),
+        I("MidnightReef", "Arrecife de Medianoche"),
+        I("TrenchgatePassage", "Paso de la Puerta de la Fosa"),
+        I("DrownedCathedral", "Catedral Ahogada"),
+        I("AbyssalThrone", "Trono Abisal"),
+        I("HollowmastGraveyard", "Cementerio del Mástil Hueco"),
+        I("Seabed", "Lecho Marino"),
     }},
 }
-
-local SEA_BY_KEY = {}
-for _, s in ipairs(SEAS) do
-    SEA_BY_KEY[s.key] = s
-end
 
 ---------------------------------------------------------------
 -- CONFIGURACIÓN
@@ -116,8 +116,9 @@ local CONFIG = {
     VOLVER_INICIAL = false,
     SOLO_OTROS_INICIAL = false,
     ISLA_INICIAL = false,
-    RUTA_RAREZA_INICIAL = false,
-    IDIOMA_INICIAL = "es",
+    INGLES_INICIAL = false,        -- false = nombres en español (por defecto), true = en inglés
+    DIFICULTAD_INICIAL = 1,
+    ISLA_INDEX_INICIAL = 1,
     MARGEN_ISLA = 40,
     RADIO_ISLA_SIN_CAJA = 250,
     MODO_INICIAL = "TP",
@@ -130,25 +131,18 @@ local CONFIG = {
     ESPERA_GUARDADO = 3,
     ESPERA_TESORERO = 1.5,
     ESPERA_APERTURA = 0.6,
-    ESPERA_CARGA_BARCO = 6,
+    ESPERA_CARGA_BARCO = 6,        -- segundos máximos esperando que el juego cargue un barco lejano
     ALTURA = 3,
     NOMBRE_BARCO_MANUAL = "",
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
-
-    -- Ruta de rareza: tiempo que se queda buscando en cada isla
-    TIEMPO_ISLA_RUTA_INICIAL = 10,    -- segundos por defecto
-    TIEMPO_ISLA_MIN = 1,
-    TIEMPO_ISLA_MAX = 600,
-    TIEMPO_ISLA_PASO = 1,
-    ESPERA_RUTA = 10,                 -- pausa si toda la ruta quedó sin cofres
 
     VALOR_FILTRO_INICIAL = false,
     VALOR_MIN_INICIAL = 10000,
     VALOR_PASO = 1000,
     RAREZA_FILTRO_INICIAL = false,
     RAREZA_MIN_INICIAL = 3,
-    RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Secret" },
+    RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine" },
 
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
@@ -243,35 +237,12 @@ local auto = false
 local returnToSpot = svb("returnToSpot", CONFIG.VOLVER_INICIAL)
 local onlyOthers = svb("onlyOthers", CONFIG.SOLO_OTROS_INICIAL)
 local islandMode = svb("islandMode", CONFIG.ISLA_INICIAL)
-local routeMode = svb("routeMode", CONFIG.RUTA_RAREZA_INICIAL)
-local lang = svs("lang", CONFIG.IDIOMA_INICIAL)
-if lang ~= "en" then lang = "es" end
-
-local seaIndex = math.clamp(math.floor(svn("seaIndex", 1)), 1, #SEAS)
-local islandIndex = math.clamp(math.floor(svn("islandIndex", 1)), 1, #SEAS[seaIndex].islas)
-
--- Ruta: lista de claves "Mar|IslaIngles"
-local route = {}
-if type(saved.route) == "table" then
-    for _, s in ipairs(saved.route) do
-        if type(s) == "string" then table.insert(route, s) end
-    end
-end
-
--- Tiempo por isla dentro de la ruta: clave -> segundos
-local routeWait = {}
-if type(saved.routeWait) == "table" then
-    for k, v in pairs(saved.routeWait) do
-        if type(k) == "string" and tonumber(v) then
-            routeWait[k] = math.clamp(math.floor(tonumber(v)), CONFIG.TIEMPO_ISLA_MIN, CONFIG.TIEMPO_ISLA_MAX)
-        end
-    end
-end
-local routeDefaultWait = math.clamp(
-    math.floor(svn("routeDefaultWait", CONFIG.TIEMPO_ISLA_RUTA_INICIAL)),
-    CONFIG.TIEMPO_ISLA_MIN, CONFIG.TIEMPO_ISLA_MAX
+local englishNames = svb("englishNames", CONFIG.INGLES_INICIAL)
+local diffIndex = math.clamp(math.floor(svn("diffIndex", CONFIG.DIFICULTAD_INICIAL)), 1, #ISLAND_GROUPS)
+local islandIndex = math.clamp(
+    math.floor(svn("islandIndex", CONFIG.ISLA_INDEX_INICIAL)),
+    1, #ISLAND_GROUPS[diffIndex].islas
 )
-
 local mode = saved.mode == "DESLIZAR" and "DESLIZAR" or "TP"
 local capacity = math.clamp(math.floor(svn("capacity", CONFIG.CAPACIDAD_INICIAL)), 1, CONFIG.CAPACIDAD_MAX)
 local waitOnBoat = math.clamp(math.floor(svn("waitOnBoat", CONFIG.ESPERA_BARCO_INICIAL)), 0, CONFIG.ESPERA_BARCO_MAX)
@@ -286,6 +257,8 @@ local rarityMinIdx = math.clamp(math.floor(svn("rarityMinIdx", CONFIG.RAREZA_MIN
 
 local targetLabel = svs("targetLabel", MINE_LABEL)
 
+-- Memoria de sesión de barcos de otros jugadores (no se guarda en archivo)
+-- label -> { ship = Instance|nil, shipName = string, pos = Vector3 }
 local shipMemory = {}
 local memoryOrder = {}
 
@@ -309,13 +282,9 @@ local function saveConfig()
         returnToSpot = returnToSpot,
         onlyOthers = onlyOthers,
         islandMode = islandMode,
-        routeMode = routeMode,
-        lang = lang,
-        seaIndex = seaIndex,
+        englishNames = englishNames,
+        diffIndex = diffIndex,
         islandIndex = islandIndex,
-        route = route,
-        routeWait = routeWait,
-        routeDefaultWait = routeDefaultWait,
         mode = mode,
         capacity = capacity,
         waitOnBoat = waitOnBoat,
@@ -339,29 +308,21 @@ local function setStatus(text)
     if refreshUI then refreshUI() end
 end
 
-local function currentSea()
-    return SEAS[seaIndex]
+-- Nombres que se muestran en la UI (español por defecto, inglés si está activado)
+local function seaDisplayName(group)
+    return englishNames and group.en or group.es
 end
 
-local function currentIsland()
-    return SEAS[seaIndex].islas[islandIndex]
+local function islandDisplayName(entry)
+    return englishNames and entry.en or entry.es
 end
 
-local function islandName(isl)
-    return lang == "en" and isl.en or isl.es
+local function currentIslandEntry()
+    return ISLAND_GROUPS[diffIndex].islas[islandIndex]
 end
 
-local function seaName(sea)
-    return lang == "en" and sea.key or sea.es
-end
-
-local function routeKey(sea, isl)
-    return sea.key .. "|" .. isl.en
-end
-
--- Segundos que se queda en una isla de la ruta
-local function waitForKey(key)
-    return routeWait[key] or routeDefaultWait
+local function currentIslandName()
+    return islandDisplayName(currentIslandEntry())
 end
 
 ---------------------------------------------------------------
@@ -397,25 +358,19 @@ local function rarityIndex(r)
     return nil
 end
 
-local function valueOk(chest)
-    local v = tonumber(getChestProp(chest, "Value"))
-    return v ~= nil and v >= valueMin
-end
-
-local function rarityAtLeast(chest, minIdx)
-    local idx = rarityIndex(getChestProp(chest, "Rarity"))
-    return idx ~= nil and idx >= minIdx
-end
-
-local function passesNormalFilters(chest)
-    if valueFilter and not valueOk(chest) then return false end
-    if rarityFilter and not rarityAtLeast(chest, rarityMinIdx) then return false end
-    return true
-end
-
-local function passesRouteFilters(chest)
-    if not rarityAtLeast(chest, rarityMinIdx) then return false end
-    if valueFilter and not valueOk(chest) then return false end
+local function passesValueRarity(chest)
+    if valueFilter then
+        local v = tonumber(getChestProp(chest, "Value"))
+        if not v or v < valueMin then
+            return false
+        end
+    end
+    if rarityFilter then
+        local idx = rarityIndex(getChestProp(chest, "Rarity"))
+        if not idx or idx < rarityMinIdx then
+            return false
+        end
+    end
     return true
 end
 
@@ -466,62 +421,42 @@ local function isModelOrPart(obj)
     return obj and (obj:IsA("Model") or obj:IsA("BasePart"))
 end
 
-local function islandTargets(isl)
-    local t = { norm(isl.en) }
-    for _, id in ipairs(isl.ids) do
-        table.insert(t, norm(id))
-    end
-    return t
-end
-
-local function matchesIsland(obj, targets)
-    if not isModelOrPart(obj) then return false end
-    local n = norm(obj.Name)
-    for _, t in ipairs(targets) do
-        if n == t then return true end
-    end
-    return false
-end
-
-local function getIsland(sea, isl)
-    local key = routeKey(sea, isl)
+local function getIsland(entry)
+    local key = entry.en
     local cached = islandCache[key]
     if cached and cached.Parent then
         return cached
     end
     islandCache[key] = nil
 
-    local targets = islandTargets(isl)
-    local found
+    local targets = {}
+    for _, name in ipairs(entry.names) do
+        table.insert(targets, norm(name))
+    end
 
+    local function matches(obj)
+        if not isModelOrPart(obj) then return false end
+        local n = norm(obj.Name)
+        for _, t in ipairs(targets) do
+            if n == t then return true end
+        end
+        return false
+    end
+
+    local found
     for _, root in ipairs(getIslandRoots()) do
-        local seaFolder = root:FindFirstChild(sea.key)
-        if seaFolder then
-            for _, obj in ipairs(seaFolder:GetDescendants()) do
-                if matchesIsland(obj, targets) then
-                    found = obj
-                    break
-                end
+        for _, obj in ipairs(root:GetDescendants()) do
+            if matches(obj) then
+                found = obj
+                break
             end
         end
         if found then break end
     end
 
     if not found then
-        for _, root in ipairs(getIslandRoots()) do
-            for _, obj in ipairs(root:GetDescendants()) do
-                if matchesIsland(obj, targets) then
-                    found = obj
-                    break
-                end
-            end
-            if found then break end
-        end
-    end
-
-    if not found then
         for _, obj in ipairs(Workspace:GetDescendants()) do
-            if matchesIsland(obj, targets) then
+            if matches(obj) then
                 found = obj
                 break
             end
@@ -552,31 +487,6 @@ local function islandTop(island)
         return cf.Position + Vector3.new(0, size.Y / 2 + 5, 0)
     end
     return island.Position + Vector3.new(0, island.Size.Y / 2 + 5, 0)
-end
-
--- Convierte la ruta (claves) en { sea, isl, key } en el orden elegido
-local function resolveRoute()
-    local list = {}
-    for _, s in ipairs(route) do
-        local seaKey, en = string.match(s, "^(.-)|(.*)$")
-        local sea = seaKey and SEA_BY_KEY[seaKey]
-        if sea then
-            for _, isl in ipairs(sea.islas) do
-                if isl.en == en then
-                    table.insert(list, { sea = sea, isl = isl, key = s })
-                    break
-                end
-            end
-        end
-    end
-    return list
-end
-
-local function routeHas(key)
-    for _, s in ipairs(route) do
-        if s == key then return true end
-    end
-    return false
 end
 
 ---------------------------------------------------------------
@@ -633,6 +543,7 @@ end
 ---------------------------------------------------------------
 -- BARCOS
 ---------------------------------------------------------------
+-- Busca barcos en Ships, incluidas carpetas dentro de Ships
 local function collectShipCandidates()
     local result = {}
     local dyn = getDynamic()
@@ -708,6 +619,7 @@ local function getMyShip()
     return nil
 end
 
+-- Nombre del dueño: convierte UserId en nombre y revisa jugadores del servidor
 local function ownerNameOf(ship)
     for _, attr in ipairs({ "OwnerName", "PlayerName", "Owner", "Player", "OwnerId", "UserId" }) do
         local v = ship:GetAttribute(attr)
@@ -744,6 +656,7 @@ local function shipPivotPos(ship)
     return ship.Position
 end
 
+-- Guarda o actualiza un barco en la memoria de la sesión
 local function rememberShip(label, ship)
     local m = shipMemory[label]
     if not m then
@@ -756,6 +669,7 @@ local function rememberShip(label, ship)
     m.pos = shipPivotPos(ship)
 end
 
+-- Revisa los barcos cargados ahora y los recuerda
 local function listOtherShips()
     local result = {}
     local seen = {}
@@ -774,6 +688,7 @@ local function listOtherShips()
     return result
 end
 
+-- Opciones del selector: "Mi barco" y todos los barcos recordados en esta sesión
 local function buildTargetOptions()
     listOtherShips()
     local opts = { MINE_LABEL }
@@ -783,6 +698,7 @@ local function buildTargetOptions()
     return opts
 end
 
+-- Si el barco ya no está cargado, se acerca a su última posición para que el juego lo cargue
 local function loadRememberedShip(label)
     local m = shipMemory[label]
     if not m or not m.pos then return nil end
@@ -813,6 +729,7 @@ local function loadRememberedShip(label)
     return nil
 end
 
+-- Barco de destino según la opción elegida
 local function getDestinationShip()
     if targetLabel == MINE_LABEL or targetLabel == "" then
         return getMyShip()
@@ -844,7 +761,7 @@ local function getShipTop(ship)
 end
 
 ---------------------------------------------------------------
--- BÓVEDA (CargoVisuals)
+-- BÓVEDA (CargoVisuals de cualquier barco)
 ---------------------------------------------------------------
 local function chestsOn(ship)
     local cargo = ship and ship:FindFirstChild("CargoVisuals")
@@ -961,79 +878,11 @@ local function openVault()
 end
 
 ---------------------------------------------------------------
--- RECOLECCIÓN: recorre los cofres y recoge los que cumplen el filtro
--- island: Instance o nil (nil = todo el mapa)
--- predicate: función(chest) -> bool
--- devuelve cuántos cofres recogió
----------------------------------------------------------------
-local function collectPass(island, predicate)
-    local treasure = getTreasureFolder()
-    if not treasure then return 0 end
-
-    local count = 0
-    local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
-
-    for _, item in ipairs(treasure:GetChildren()) do
-        if closed or not auto then return count end
-
-        local base = item:FindFirstChild("Base")
-        local attach = base and base:FindFirstChild("PromptAttachment")
-        local prompt = attach and attach:FindFirstChild("TreasurePrompt")
-        local inIsland = (not island) or (base ~= nil and isInsideIsland(island, base.Position))
-
-        if base and prompt and prompt:IsA("ProximityPrompt")
-            and inIsland
-            and passesOwnerFilter(item)
-            and predicate(item) then
-
-            local dest = getDestinationShip()
-            if not dest then
-                setStatus("No encuentro el barco de " .. targetLabel)
-                return count
-            end
-
-            local size = getCargoSize(item)
-
-            if size > capacity then
-                setStatus("Cofre más grande que la bóveda, lo salto")
-            else
-                if usedSpaceOn(dest) + size > capacity then
-                    if destIsMine then
-                        openVault()
-                    else
-                        setStatus("El barco de " .. targetLabel .. " no tiene espacio")
-                    end
-                    return count
-                end
-
-                local root = getRoot()
-                local returnCF = root and root.CFrame
-
-                setStatus("Recogiendo " .. item.Name .. " (espacio " .. size .. ")...")
-                local usedBefore = usedSpaceOn(dest)
-                pickUpChest(base, prompt)
-                collectedCount += 1
-                count += 1
-
-                if storeOnBoat(usedBefore, dest) then
-                    waitOnShip()
-                end
-
-                if returnToSpot and returnCF then
-                    setStatus("Volviendo a tu posición...")
-                    teleportToCFrame(returnCF)
-                end
-            end
-        end
-    end
-    return count
-end
-
----------------------------------------------------------------
--- CICLO PRINCIPAL
+-- CICLO
 ---------------------------------------------------------------
 local function collectCycle()
-    if not getTreasureFolder() then
+    local treasure = getTreasureFolder()
+    if not treasure then
         setStatus("No encuentro World.Dynamic.Treasure")
         return
     end
@@ -1058,80 +907,77 @@ local function collectCycle()
         return
     end
 
-    -- Modo ruta: se queda en cada isla el tiempo configurado buscando la rareza elegida
-    if routeMode then
-        local entries = resolveRoute()
-        if #entries == 0 then
-            setStatus("La ruta está vacía: agrega islas o un mar en la pestaña Isla")
-            return
-        end
-
-        local total = 0
-        for _, e in ipairs(entries) do
-            if closed or not auto then return end
-
-            local secs = waitForKey(e.key)
-            local name = islandName(e.isl)
-            local island = getIsland(e.sea, e.isl)
-
-            if not island then
-                setStatus("No encuentro " .. name)
-            else
-                local root = getRoot()
-                if root and not isInsideIsland(island, root.Position) then
-                    setStatus("Yendo a " .. name .. "...")
-                    moveTo(islandTop(island))
-                end
-
-                local deadline = os.clock() + secs
-                while os.clock() < deadline and auto and not closed do
-                    local remaining = math.ceil(deadline - os.clock())
-                    setStatus("Buscando rareza en " .. name .. " (" .. remaining .. " s)")
-                    local n = collectPass(island, passesRouteFilters)
-                    total += n
-                    if n == 0 then
-                        task.wait(0.5)
-                    end
-                end
-            end
-        end
-
-        if total == 0 and auto and not closed then
-            setStatus("Ruta sin cofres, reinicio en " .. CONFIG.ESPERA_RUTA .. " s")
-            local t0 = os.clock()
-            while os.clock() - t0 < CONFIG.ESPERA_RUTA and auto and not closed do
-                task.wait(0.5)
-            end
-        end
-        return
-    end
-
-    -- Modo isla única
+    local island
     if islandMode then
-        local sea = currentSea()
-        local isl = currentIsland()
-        local island = getIsland(sea, isl)
+        local entry = currentIslandEntry()
+        island = getIsland(entry)
         if not island then
-            setStatus("No encuentro " .. islandName(isl))
+            setStatus("No encuentro la isla " .. islandDisplayName(entry))
             return
         end
         local root = getRoot()
         if root and not isInsideIsland(island, root.Position) then
-            setStatus("Yendo a " .. islandName(isl) .. "...")
+            setStatus("Yendo a la isla " .. islandDisplayName(entry) .. "...")
             moveTo(islandTop(island))
         end
-        local n = collectPass(island, passesNormalFilters)
-        if n == 0 and auto and not closed then
-            setStatus("Sin cofres en " .. islandName(isl))
-            task.wait(2)
-        end
-        return
     end
 
-    -- Todo el mapa
-    collectPass(nil, passesNormalFilters)
+    for _, item in ipairs(treasure:GetChildren()) do
+        if closed or not auto then return end
+
+        local base = item:FindFirstChild("Base")
+        local attach = base and base:FindFirstChild("PromptAttachment")
+        local prompt = attach and attach:FindFirstChild("TreasurePrompt")
+
+        local inIsland = (not island) or (base ~= nil and isInsideIsland(island, base.Position))
+
+        if base and prompt and prompt:IsA("ProximityPrompt")
+            and inIsland
+            and passesOwnerFilter(item)
+            and passesValueRarity(item) then
+
+            -- Si el barco de otro jugador se descargó, vuelve a cargarlo
+            if not dest.Parent then
+                dest = getDestinationShip()
+                if not dest then return end
+            end
+
+            local size = getCargoSize(item)
+
+            if size > capacity then
+                setStatus("Cofre más grande que la bóveda, lo salto")
+            else
+                if usedSpaceOn(dest) + size > capacity then
+                    if destIsMine then
+                        openVault()
+                    else
+                        setStatus("El barco de " .. targetLabel .. " no tiene espacio")
+                    end
+                    return
+                end
+
+                local root = getRoot()
+                local returnCF = root and root.CFrame
+
+                setStatus("Recogiendo cofre (espacio " .. size .. ")...")
+                local usedBefore = usedSpaceOn(dest)
+                pickUpChest(base, prompt)
+                collectedCount += 1
+
+                if storeOnBoat(usedBefore, dest) then
+                    waitOnShip()
+                end
+
+                if returnToSpot and returnCF then
+                    setStatus("Volviendo a tu posición...")
+                    teleportToCFrame(returnCF)
+                end
+            end
+        end
+    end
+
     if auto then
-        setStatus("Buscando cofres...")
+        setStatus(islandMode and ("Buscando cofres en " .. currentIslandName()) or "Buscando cofres...")
     end
 end
 
@@ -1598,6 +1444,7 @@ local destRow = arrowRow(pageCofres, 5,
     function() cycleTarget(1) end
 )
 
+-- Información recordada del barco destino
 local destNote = label(pageCofres, "", 10, PALETTE.muted, false)
 destNote.LayoutOrder = 6
 destNote.Size = UDim2.new(1, -4, 0, 30)
@@ -1619,72 +1466,55 @@ local waitStepper = stepperRow(pageCofres, 7,
 )
 
 ---------------------------------------------------------------
--- PESTAÑA ISLA
+-- PESTAÑA ISLA (mares)
 ---------------------------------------------------------------
 checkRow(pageIsla, "Recolectar por isla", 1, islandMode, function(v)
     islandMode = v
-    if v then routeMode = false end
     markDirty()
-    setStatus(v and ("Modo isla: " .. islandName(currentIsland())) or "Modo isla apagado")
+    setStatus(v and ("Modo isla: " .. currentIslandName()) or "Modo isla apagado")
 end)
 
-checkRow(pageIsla, "Buscar rareza en la ruta", 2, routeMode, function(v)
-    routeMode = v
-    if v then islandMode = false end
+-- Opción para ver los nombres de mares e islas en inglés (por defecto: español)
+checkRow(pageIsla, "Nombres en inglés (English)", 2, englishNames, function(v)
+    englishNames = v
     markDirty()
-    setStatus(v and "Modo ruta: busco rareza en cada isla de la ruta" or "Modo ruta apagado")
+    setStatus(v and "Nombres de islas en inglés" or "Nombres de islas en español")
 end)
 
-local langRow = arrowRow(pageIsla, 3,
+local diffRow = arrowRow(pageIsla, 3,
     function()
-        return lang == "es" and "Idioma: Español" or "Language: English"
+        return seaDisplayName(ISLAND_GROUPS[diffIndex]) .. " (" .. diffIndex .. "/" .. #ISLAND_GROUPS .. ")"
     end,
     function()
-        lang = (lang == "es") and "en" or "es"
-        markDirty()
-        refreshUI()
-    end,
-    function()
-        lang = (lang == "es") and "en" or "es"
-        markDirty()
-        refreshUI()
-    end
-)
-
-local seaRow = arrowRow(pageIsla, 4,
-    function()
-        return seaName(currentSea()) .. " (" .. seaIndex .. "/" .. #SEAS .. ")"
-    end,
-    function()
-        seaIndex = seaIndex - 1
-        if seaIndex < 1 then seaIndex = #SEAS end
+        diffIndex = diffIndex - 1
+        if diffIndex < 1 then diffIndex = #ISLAND_GROUPS end
         islandIndex = 1
         markDirty()
         refreshUI()
     end,
     function()
-        seaIndex = seaIndex + 1
-        if seaIndex > #SEAS then seaIndex = 1 end
+        diffIndex = diffIndex + 1
+        if diffIndex > #ISLAND_GROUPS then diffIndex = 1 end
         islandIndex = 1
         markDirty()
         refreshUI()
     end
 )
 
-local islandRow = arrowRow(pageIsla, 5,
+local islandRow = arrowRow(pageIsla, 4,
     function()
-        local isl = currentIsland()
-        return islandName(isl) .. " (" .. islandIndex .. "/" .. #currentSea().islas .. ")"
+        local group = ISLAND_GROUPS[diffIndex]
+        return islandDisplayName(group.islas[islandIndex]) .. " (" .. islandIndex .. "/" .. #group.islas .. ")"
     end,
     function()
-        local count = #currentSea().islas
+        local count = #ISLAND_GROUPS[diffIndex].islas
         islandIndex = islandIndex - 1
         if islandIndex < 1 then islandIndex = count end
         markDirty()
         refreshUI()
     end,
     function()
-        local count = #currentSea().islas
+        local count = #ISLAND_GROUPS[diffIndex].islas
         islandIndex = islandIndex + 1
         if islandIndex > count then islandIndex = 1 end
         markDirty()
@@ -1692,115 +1522,8 @@ local islandRow = arrowRow(pageIsla, 5,
     end
 )
 
--- Botones de ruta: isla o mar completo
-local routeButtons = Instance.new("Frame")
-routeButtons.Size = UDim2.new(1, -4, 0, 32)
-routeButtons.BackgroundTransparency = 1
-routeButtons.LayoutOrder = 6
-routeButtons.Parent = pageIsla
-listLayout(routeButtons, 6, true)
-
-local addIslandBtn = button(routeButtons, "➕ Isla", UDim2.new(0.333, -4, 1, 0), PALETTE.card)
-local addSeaBtn = button(routeButtons, "🌊 Mar completo", UDim2.new(0.333, -4, 1, 0), PALETTE.card)
-local removeBtn = button(routeButtons, "🗑 Quitar isla", UDim2.new(0.333, -4, 1, 0), PALETTE.card)
-
-addIslandBtn.Activated:Connect(function()
-    local key = routeKey(currentSea(), currentIsland())
-    if routeHas(key) then
-        setStatus("Esa isla ya está en la ruta")
-        return
-    end
-    table.insert(route, key)
-    markDirty()
-    setStatus("Agregada: " .. islandName(currentIsland()))
-end)
-
-addSeaBtn.Activated:Connect(function()
-    local added = 0
-    for _, isl in ipairs(currentSea().islas) do
-        local key = routeKey(currentSea(), isl)
-        if not routeHas(key) then
-            table.insert(route, key)
-            added += 1
-        end
-    end
-    markDirty()
-    setStatus("Mar " .. seaName(currentSea()) .. ": " .. added .. " islas agregadas a la ruta")
-end)
-
-removeBtn.Activated:Connect(function()
-    local key = routeKey(currentSea(), currentIsland())
-    for i, s in ipairs(route) do
-        if s == key then
-            table.remove(route, i)
-            markDirty()
-            setStatus("Quitada: " .. islandName(currentIsland()))
-            return
-        end
-    end
-    setStatus("Esa isla no está en la ruta")
-end)
-
-local clearRow = Instance.new("Frame")
-clearRow.Size = UDim2.new(1, -4, 0, 32)
-clearRow.BackgroundTransparency = 1
-clearRow.LayoutOrder = 7
-clearRow.Parent = pageIsla
-listLayout(clearRow, 6, true)
-
-local clearRouteBtn = button(clearRow, "🧹 Limpiar ruta", UDim2.new(1, 0, 1, 0), PALETTE.card)
-clearRouteBtn.Activated:Connect(function()
-    route = {}
-    markDirty()
-    setStatus("Ruta limpia")
-end)
-
--- Tiempo de la isla seleccionada dentro de la ruta
-local routeTimeStepper = stepperRow(pageIsla, 8,
-    function()
-        return "Tiempo en esta isla: " .. waitForKey(routeKey(currentSea(), currentIsland())) .. " s"
-    end,
-    function()
-        local key = routeKey(currentSea(), currentIsland())
-        local v = math.max(CONFIG.TIEMPO_ISLA_MIN, waitForKey(key) - CONFIG.TIEMPO_ISLA_PASO)
-        routeWait[key] = v
-        markDirty()
-        refreshUI()
-    end,
-    function()
-        local key = routeKey(currentSea(), currentIsland())
-        local v = math.min(CONFIG.TIEMPO_ISLA_MAX, waitForKey(key) + CONFIG.TIEMPO_ISLA_PASO)
-        routeWait[key] = v
-        markDirty()
-        refreshUI()
-    end
-)
-
--- Tiempo por defecto para islas sin tiempo propio
-local defaultTimeStepper = stepperRow(pageIsla, 9,
-    function()
-        return "Tiempo por defecto: " .. routeDefaultWait .. " s"
-    end,
-    function()
-        routeDefaultWait = math.max(CONFIG.TIEMPO_ISLA_MIN, routeDefaultWait - CONFIG.TIEMPO_ISLA_PASO)
-        markDirty()
-        refreshUI()
-    end,
-    function()
-        routeDefaultWait = math.min(CONFIG.TIEMPO_ISLA_MAX, routeDefaultWait + CONFIG.TIEMPO_ISLA_PASO)
-        markDirty()
-        refreshUI()
-    end
-)
-
-local routeNote = label(pageIsla, "", 10, PALETTE.muted, false)
-routeNote.LayoutOrder = 10
-routeNote.Size = UDim2.new(1, -4, 0, 70)
-routeNote.TextWrapped = true
-routeNote.TextYAlignment = Enum.TextYAlignment.Top
-
 local islandNote = label(pageIsla, "", 10, PALETTE.muted, false)
-islandNote.LayoutOrder = 11
+islandNote.LayoutOrder = 5
 islandNote.Size = UDim2.new(1, -4, 0, 30)
 islandNote.TextWrapped = true
 islandNote.TextYAlignment = Enum.TextYAlignment.Top
@@ -1881,7 +1604,7 @@ local rarityRow = arrowRow(pageFiltros, 4,
 
 local filterNote = label(pageFiltros, "", 10, PALETTE.muted, false)
 filterNote.LayoutOrder = 5
-filterNote.Size = UDim2.new(1, -4, 0, 56)
+filterNote.Size = UDim2.new(1, -4, 0, 44)
 filterNote.TextWrapped = true
 filterNote.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -1978,6 +1701,7 @@ refreshUI = function()
     glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
 
     destRow.refresh()
+
     local m = shipMemory[targetLabel]
     if targetLabel == MINE_LABEL then
         destNote.Text = "Los cofres se guardan en tu barco."
@@ -1989,25 +1713,11 @@ refreshUI = function()
     end
 
     waitStepper.refresh()
-
-    langRow.refresh()
-    seaRow.refresh()
+    diffRow.refresh()
     islandRow.refresh()
-    routeTimeStepper.refresh()
-    defaultTimeStepper.refresh()
-
-    local entries = resolveRoute()
-    local parts = {}
-    for _, e in ipairs(entries) do
-        table.insert(parts, islandName(e.isl) .. " (" .. waitForKey(e.key) .. " s)")
-    end
-    routeNote.Text = "Ruta (" .. #entries .. " islas): "
-        .. (#parts > 0 and table.concat(parts, " → ") or "vacía")
-
     islandNote.Text = islandMode
-        and ("Irá a " .. islandName(currentIsland()) .. " y solo recogerá cofres de esa isla.")
-        or (routeMode and "Recorrerá la ruta en orden; en cada isla se queda el tiempo indicado buscando la rareza."
-            or "Activa una de las dos opciones de arriba para trabajar por isla.")
+        and ("Irá a " .. currentIslandName() .. " (" .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. ") y solo recogerá cofres dentro de esa isla.")
+        or "Activa la opción para recoger solo en la isla elegida."
 
     capStepper.refresh()
     vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
@@ -2017,8 +1727,7 @@ refreshUI = function()
     filterNote.Text = "Valor: recoge cofres con Value ≥ " .. valueMin
         .. (valueFilter and " (activo)" or " (apagado)")
         .. ". Rareza: desde " .. CONFIG.RAREZAS[rarityMinIdx]
-        .. (rarityFilter and " (activo)" or " (apagado)")
-        .. ". En modo ruta, la rareza siempre se aplica."
+        .. (rarityFilter and " (activo)" or " (apagado)") .. "."
 
     widthRow.refresh()
     heightRow.refresh()
