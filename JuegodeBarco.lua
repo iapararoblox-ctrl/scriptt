@@ -119,8 +119,13 @@ local CONFIG = {
     INGLES_INICIAL = false,        -- false = nombres en español (por defecto), true = en inglés
     DIFICULTAD_INICIAL = 1,
     ISLA_INDEX_INICIAL = 1,
-    MARGEN_ISLA = 40,
-    RADIO_ISLA_SIN_CAJA = 250,
+    MARGEN_ISLA = 60,
+    RADIO_ISLA_SIN_CAJA = 300,
+    RADIO_MIN_ISLA = 150,          -- radio mínimo de la isla aunque su caja sea pequeña
+    ALTURA_ISLA = 8,               -- altura a la que se queda en la isla (lejos de los enemigos)
+    ESPERA_STREAMING = 2,          -- segundos esperando que carguen los cofres al llegar
+    ESPERA_POSICION = 0.25,        -- segundos para que el servidor reciba tu posición antes de recoger
+    INTENTOS_RECOGER = 2,          -- veces que intenta activar el prompt de un cofre
     MODO_INICIAL = "TP",
     VELOCIDAD_DESLIZAR = 45,
     CAPACIDAD_INICIAL = 81,
@@ -159,6 +164,7 @@ local CONFIG = {
 local BASE_W, BASE_H = 300, 470
 local OWNER_KEYS = { "Owner", "OwnerId", "OwnerName", "Player", "PlayerName", "UserId" }
 local MINE_LABEL = "Mi barco"
+local HOVER_NAME = "CofresHover"
 
 ---------------------------------------------------------------
 -- CARGAR CONFIGURACIÓN GUARDADA
@@ -470,15 +476,22 @@ local function getIsland(entry)
 end
 
 local function isInsideIsland(island, pos)
+    local m = CONFIG.MARGEN_ISLA
     if island:IsA("Model") then
         local cf, size = island:GetBoundingBox()
         local rel = cf:PointToObjectSpace(pos)
-        local m = CONFIG.MARGEN_ISLA
-        return math.abs(rel.X) <= size.X / 2 + m
+        if math.abs(rel.X) <= size.X / 2 + m
             and math.abs(rel.Z) <= size.Z / 2 + m
-            and math.abs(rel.Y) <= size.Y / 2 + 200
+            and math.abs(rel.Y) <= size.Y / 2 + 300 then
+            return true
+        end
+        -- Respaldo: círculo alrededor del centro (cubre cajas giradas o pequeñas)
+        local flat = Vector3.new(cf.Position.X - pos.X, 0, cf.Position.Z - pos.Z)
+        local radius = math.max(math.max(size.X, size.Z) / 2 + m, CONFIG.RADIO_MIN_ISLA)
+        return flat.Magnitude <= radius
     end
-    return (island.Position - pos).Magnitude <= CONFIG.RADIO_ISLA_SIN_CAJA
+    local flat = Vector3.new(island.Position.X - pos.X, 0, island.Position.Z - pos.Z)
+    return flat.Magnitude <= CONFIG.RADIO_ISLA_SIN_CAJA
 end
 
 local function islandTop(island)
@@ -538,6 +551,58 @@ local function moveTo(pos)
     else
         glideTo(pos)
     end
+end
+
+-- Flotar: el personaje se queda quieto en el aire para que los enemigos no lo alcancen.
+-- IMPORTANTE: NO se ancla (Anchored). Un personaje anclado no envía su posición al servidor,
+-- y entonces el servidor creía que seguías lejos del cofre y no dejaba recogerlo.
+-- En su lugar se usa un BodyVelocity en cero que cancela la gravedad y mantiene la replicación.
+local hovering = false
+
+local function hoverActive(root)
+    root = root or getRoot()
+    return root ~= nil and root:FindFirstChild(HOVER_NAME) ~= nil
+end
+
+local function setHover(on)
+    hovering = on
+    local root = getRoot()
+    if not root then return end
+    pcall(function()
+        root.Anchored = false
+        local old = root:FindFirstChild(HOVER_NAME)
+        if on then
+            if not old then
+                local bv = Instance.new("BodyVelocity")
+                bv.Name = HOVER_NAME
+                bv.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+                bv.P = 1e4
+                bv.Velocity = Vector3.zero
+                bv.Parent = root
+            end
+        elseif old then
+            old:Destroy()
+        end
+    end)
+end
+
+local function groundY(pos)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    local res = Workspace:Raycast(pos + Vector3.new(0, 300, 0), Vector3.new(0, -800, 0), params)
+    return res and res.Position.Y or nil
+end
+
+-- Sube a ALTURA_ISLA sobre el suelo en el punto actual y se queda flotando
+local function hoverHere()
+    local root = getRoot()
+    if not root then return end
+    local p = root.Position
+    local gy = groundY(p)
+    local y = gy and (gy + CONFIG.ALTURA_ISLA) or p.Y
+    teleportTo(Vector3.new(p.X, y, p.Z))
+    setHover(true)
 end
 
 ---------------------------------------------------------------
@@ -704,6 +769,7 @@ local function loadRememberedShip(label)
     if not m or not m.pos then return nil end
 
     setStatus("Cargando barco de " .. label .. "...")
+    setHover(false)
     teleportTo(m.pos + Vector3.new(0, 15, 0))
 
     local t0 = os.clock()
@@ -795,10 +861,35 @@ end
 ---------------------------------------------------------------
 -- RECOGER, GUARDAR, ESPERAR
 ---------------------------------------------------------------
-local function pickUpChest(base, prompt)
-    teleportTo(base.Position + Vector3.new(0, CONFIG.ALTURA, 0))
-    pcall(fireproximityprompt, prompt)
-    task.wait(CONFIG.ESPERA_RECOGER)
+-- Se coloca justo sobre el prompt del cofre (a "height" studs) y lo activa.
+-- En modo isla: height = ALTURA_ISLA (8) y se queda flotando, sin anclarse.
+local function pickUpChest(base, prompt, height, hover)
+    local anchorPos = base.Position
+    local att = prompt.Parent
+    if att and att:IsA("Attachment") then
+        anchorPos = att.WorldPosition
+    end
+
+    teleportTo(anchorPos + Vector3.new(0, height or CONFIG.ALTURA, 0))
+    if hover then setHover(true) end
+
+    pcall(function()
+        prompt.RequiresLineOfSight = false
+        if prompt.MaxActivationDistance < 25 then
+            prompt.MaxActivationDistance = 25
+        end
+    end)
+
+    -- Deja que el servidor reciba tu nueva posición antes de activar el prompt
+    task.wait(CONFIG.ESPERA_POSICION)
+
+    for _ = 1, CONFIG.INTENTOS_RECOGER do
+        pcall(fireproximityprompt, prompt)
+        task.wait(CONFIG.ESPERA_RECOGER)
+        if not prompt.Parent or not prompt:IsDescendantOf(Workspace) then
+            break
+        end
+    end
 end
 
 local function storeOnBoat(usedBefore, dest)
@@ -833,6 +924,7 @@ end
 -- TESORERO (solo abre los cofres de TU barco)
 ---------------------------------------------------------------
 local function openVault()
+    setHover(false)
     local dyn = getDynamic()
     local npcs = dyn and dyn:FindFirstChild("NPCs")
     local npc = npcs and npcs:FindFirstChild("NPC_StarterPort_Broker")
@@ -917,10 +1009,18 @@ local function collectCycle()
         end
         local root = getRoot()
         if root and not isInsideIsland(island, root.Position) then
+            setHover(false)
             setStatus("Yendo a la isla " .. islandDisplayName(entry) .. "...")
             moveTo(islandTop(island))
+            hoverHere()
+            setStatus("Esperando que carguen los cofres...")
+            task.wait(CONFIG.ESPERA_STREAMING)
+        elseif root and not hoverActive(root) then
+            hoverHere()
         end
     end
+
+    local seen, inside, passed = 0, 0, 0
 
     for _, item in ipairs(treasure:GetChildren()) do
         if closed or not auto then return end
@@ -930,6 +1030,8 @@ local function collectCycle()
         local prompt = attach and attach:FindFirstChild("TreasurePrompt")
 
         local inIsland = (not island) or (base ~= nil and isInsideIsland(island, base.Position))
+        seen = seen + 1
+        if base and inIsland then inside = inside + 1 end
 
         if base and prompt and prompt:IsA("ProximityPrompt")
             and inIsland
@@ -942,6 +1044,7 @@ local function collectCycle()
                 if not dest then return end
             end
 
+            passed = passed + 1
             local size = getCargoSize(item)
 
             if size > capacity then
@@ -961,9 +1064,10 @@ local function collectCycle()
 
                 setStatus("Recogiendo cofre (espacio " .. size .. ")...")
                 local usedBefore = usedSpaceOn(dest)
-                pickUpChest(base, prompt)
+                pickUpChest(base, prompt, islandMode and CONFIG.ALTURA_ISLA or nil, islandMode)
                 collectedCount += 1
 
+                setHover(false)
                 if storeOnBoat(usedBefore, dest) then
                     waitOnShip()
                 end
@@ -971,13 +1075,19 @@ local function collectCycle()
                 if returnToSpot and returnCF then
                     setStatus("Volviendo a tu posición...")
                     teleportToCFrame(returnCF)
+                    if islandMode then hoverHere() end
                 end
             end
         end
     end
 
     if auto then
-        setStatus(islandMode and ("Buscando cofres en " .. currentIslandName()) or "Buscando cofres...")
+        if islandMode then
+            setStatus(string.format("%s: %d cofres en el mapa, %d en la isla, %d válidos con tus filtros",
+                currentIslandName(), seen, inside, passed))
+        else
+            setStatus("Buscando cofres...")
+        end
     end
 end
 
@@ -1760,6 +1870,7 @@ end)
 closeBtn.Activated:Connect(function()
     closed = true
     auto = false
+    setHover(false)
     saveConfig()
     gui:Destroy()
 end)
@@ -1779,8 +1890,12 @@ task.spawn(function()
         elseif auto then
             local ok, err = pcall(collectCycle)
             if not ok then
+                setHover(false)
                 setStatus("Error: " .. tostring(err))
             end
+        end
+        if not auto and hovering then
+            setHover(false)
         end
         refreshUI()
         task.wait(1)
