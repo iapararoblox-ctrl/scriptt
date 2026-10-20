@@ -1,4 +1,4 @@
--- Recolección de cofres + barcos + mares/islas + ruta con tiempo por isla + filtros (Ser pirata, Móvil)
+-- Recolección de cofres + barcos + mares/islas (ES/EN) + ruta de rareza con tiempo por isla (Ser pirata, Móvil)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,6 +8,7 @@ local LocalPlayer = Players.LocalPlayer
 
 ---------------------------------------------------------------
 -- MARES E ISLAS
+-- IS(nombre_ingles, nombre_espanol, ids_del_juego...)
 ---------------------------------------------------------------
 local function IS(en, es, ...)
     return { en = en, es = es, ids = { ... } }
@@ -130,13 +131,17 @@ local CONFIG = {
     ESPERA_TESORERO = 1.5,
     ESPERA_APERTURA = 0.6,
     ESPERA_CARGA_BARCO = 6,
-    ESPERA_RUTA_VACIA = 10,           -- espera si toda la ruta no tuvo cofres
-    TIEMPO_ISLA_INICIAL = 15,         -- segundos por isla al agregarla a la ruta
-    TIEMPO_ISLA_MAX = 600,
     ALTURA = 3,
     NOMBRE_BARCO_MANUAL = "",
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
+
+    -- Ruta de rareza: tiempo que se queda buscando en cada isla
+    TIEMPO_ISLA_RUTA_INICIAL = 10,    -- segundos por defecto
+    TIEMPO_ISLA_MIN = 1,
+    TIEMPO_ISLA_MAX = 600,
+    TIEMPO_ISLA_PASO = 1,
+    ESPERA_RUTA = 10,                 -- pausa si toda la ruta quedó sin cofres
 
     VALOR_FILTRO_INICIAL = false,
     VALOR_MIN_INICIAL = 10000,
@@ -245,32 +250,34 @@ if lang ~= "en" then lang = "es" end
 local seaIndex = math.clamp(math.floor(svn("seaIndex", 1)), 1, #SEAS)
 local islandIndex = math.clamp(math.floor(svn("islandIndex", 1)), 1, #SEAS[seaIndex].islas)
 
--- Ruta: lista de { k = "Mar|IslaIngles", w = segundos }
-local routeList = {}
-if type(saved.routeList) == "table" then
-    for _, e in ipairs(saved.routeList) do
-        if type(e) == "table" and type(e.k) == "string" then
-            table.insert(routeList, {
-                k = e.k,
-                w = math.clamp(tonumber(e.w) or CONFIG.TIEMPO_ISLA_INICIAL, 0, CONFIG.TIEMPO_ISLA_MAX),
-            })
-        end
-    end
-elseif type(saved.route) == "table" then
+-- Ruta: lista de claves "Mar|IslaIngles"
+local route = {}
+if type(saved.route) == "table" then
     for _, s in ipairs(saved.route) do
-        if type(s) == "string" then
-            table.insert(routeList, { k = s, w = CONFIG.TIEMPO_ISLA_INICIAL })
+        if type(s) == "string" then table.insert(route, s) end
+    end
+end
+
+-- Tiempo por isla dentro de la ruta: clave -> segundos
+local routeWait = {}
+if type(saved.routeWait) == "table" then
+    for k, v in pairs(saved.routeWait) do
+        if type(k) == "string" and tonumber(v) then
+            routeWait[k] = math.clamp(math.floor(tonumber(v)), CONFIG.TIEMPO_ISLA_MIN, CONFIG.TIEMPO_ISLA_MAX)
         end
     end
 end
-local routeSel = 1
+local routeDefaultWait = math.clamp(
+    math.floor(svn("routeDefaultWait", CONFIG.TIEMPO_ISLA_RUTA_INICIAL)),
+    CONFIG.TIEMPO_ISLA_MIN, CONFIG.TIEMPO_ISLA_MAX
+)
 
 local mode = saved.mode == "DESLIZAR" and "DESLIZAR" or "TP"
 local capacity = math.clamp(math.floor(svn("capacity", CONFIG.CAPACIDAD_INICIAL)), 1, CONFIG.CAPACIDAD_MAX)
 local waitOnBoat = math.clamp(math.floor(svn("waitOnBoat", CONFIG.ESPERA_BARCO_INICIAL)), 0, CONFIG.ESPERA_BARCO_MAX)
 local panelW = svn("panelW", CONFIG.PANEL_ANCHO_INICIAL)
 local panelH = svn("panelH", CONFIG.PANEL_ALTO_INICIAL)
-local panelStepIdx = math.clamp(math.floor(svn("panelStepIdx", 3)), 1, #CONFIG.PANEL_PASOS)
+local panelStepIdx = math.clamp(math.floor(svn("panelStepIdx", CONFIG.PANEL_PASO_INICIAL)), 1, #CONFIG.PANEL_PASOS)
 
 local valueFilter = svb("valueFilter", CONFIG.VALOR_FILTRO_INICIAL)
 local valueMin = math.max(0, math.floor(svn("valueMin", CONFIG.VALOR_MIN_INICIAL)))
@@ -292,16 +299,6 @@ local closed = false
 local dirty = false
 local refreshUI
 
-local function clampRouteSel()
-    if #routeList == 0 then
-        routeSel = 1
-    elseif routeSel > #routeList then
-        routeSel = #routeList
-    elseif routeSel < 1 then
-        routeSel = 1
-    end
-end
-
 local function markDirty()
     dirty = true
 end
@@ -316,7 +313,9 @@ local function saveConfig()
         lang = lang,
         seaIndex = seaIndex,
         islandIndex = islandIndex,
-        routeList = routeList,
+        route = route,
+        routeWait = routeWait,
+        routeDefaultWait = routeDefaultWait,
         mode = mode,
         capacity = capacity,
         waitOnBoat = waitOnBoat,
@@ -356,8 +355,17 @@ local function seaName(sea)
     return lang == "en" and sea.key or sea.es
 end
 
+local function routeKey(sea, isl)
+    return sea.key .. "|" .. isl.en
+end
+
+-- Segundos que se queda en una isla de la ruta
+local function waitForKey(key)
+    return routeWait[key] or routeDefaultWait
+end
+
 ---------------------------------------------------------------
--- PROPIEDADES DEL COFRE
+-- PROPIEDADES DEL COFRE (CargoSize, Value, Rarity)
 ---------------------------------------------------------------
 local function getChestProp(obj, name)
     local v = obj:GetAttribute(name)
@@ -376,7 +384,7 @@ local function getCargoSize(obj)
 end
 
 ---------------------------------------------------------------
--- FILTROS
+-- FILTROS DE VALOR Y RAREZA
 ---------------------------------------------------------------
 local function rarityIndex(r)
     if r == nil then return nil end
@@ -476,7 +484,7 @@ local function matchesIsland(obj, targets)
 end
 
 local function getIsland(sea, isl)
-    local key = sea.key .. "|" .. isl.en
+    local key = routeKey(sea, isl)
     local cached = islandCache[key]
     if cached and cached.Parent then
         return cached
@@ -546,16 +554,16 @@ local function islandTop(island)
     return island.Position + Vector3.new(0, island.Size.Y / 2 + 5, 0)
 end
 
--- Convierte la ruta guardada en { sea, isl, wait }
+-- Convierte la ruta (claves) en { sea, isl, key } en el orden elegido
 local function resolveRoute()
     local list = {}
-    for _, e in ipairs(routeList) do
-        local seaKey, en = string.match(e.k, "^(.-)|(.*)$")
+    for _, s in ipairs(route) do
+        local seaKey, en = string.match(s, "^(.-)|(.*)$")
         local sea = seaKey and SEA_BY_KEY[seaKey]
         if sea then
             for _, isl in ipairs(sea.islas) do
                 if isl.en == en then
-                    table.insert(list, { sea = sea, isl = isl, wait = e.w })
+                    table.insert(list, { sea = sea, isl = isl, key = s })
                     break
                 end
             end
@@ -564,18 +572,11 @@ local function resolveRoute()
     return list
 end
 
-local function addIslandToRoute(sea, isl)
-    local key = sea.key .. "|" .. isl.en
-    for _, e in ipairs(routeList) do
-        if e.k == key then
-            setStatus("Esa isla ya está en la ruta")
-            return
-        end
+local function routeHas(key)
+    for _, s in ipairs(route) do
+        if s == key then return true end
     end
-    table.insert(routeList, { k = key, w = CONFIG.TIEMPO_ISLA_INICIAL })
-    routeSel = #routeList
-    markDirty()
-    setStatus("Agregada: " .. islandName(isl) .. " (" .. #routeList .. " en la ruta)")
+    return false
 end
 
 ---------------------------------------------------------------
@@ -843,7 +844,7 @@ local function getShipTop(ship)
 end
 
 ---------------------------------------------------------------
--- BÓVEDA
+-- BÓVEDA (CargoVisuals)
 ---------------------------------------------------------------
 local function chestsOn(ship)
     local cargo = ship and ship:FindFirstChild("CargoVisuals")
@@ -960,7 +961,10 @@ local function openVault()
 end
 
 ---------------------------------------------------------------
--- RECOLECCIÓN: recorre los cofres que cumplen el filtro
+-- RECOLECCIÓN: recorre los cofres y recoge los que cumplen el filtro
+-- island: Instance o nil (nil = todo el mapa)
+-- predicate: función(chest) -> bool
+-- devuelve cuántos cofres recogió
 ---------------------------------------------------------------
 local function collectPass(island, predicate)
     local treasure = getTreasureFolder()
@@ -1026,56 +1030,6 @@ local function collectPass(island, predicate)
 end
 
 ---------------------------------------------------------------
--- RUTA: cada isla tiene su propio tiempo de búsqueda
----------------------------------------------------------------
-local function runRoute()
-    local entries = resolveRoute()
-    if #entries == 0 then
-        setStatus("La ruta está vacía: agrega islas en la pestaña Mares")
-        return
-    end
-
-    local total = 0
-    for _, e in ipairs(entries) do
-        if closed or not auto then return end
-
-        local name = islandName(e.isl)
-        local island = getIsland(e.sea, e.isl)
-        if not island then
-            setStatus("No encuentro " .. name)
-        else
-            local root = getRoot()
-            if root and not isInsideIsland(island, root.Position) then
-                setStatus("Yendo a " .. name .. "...")
-                moveTo(islandTop(island))
-            end
-
-            local t0 = os.clock()
-            while true do
-                if closed or not auto then return end
-                local left = math.max(0, math.ceil(e.wait - (os.clock() - t0)))
-                setStatus(string.format("Buscando en %s (%ds)", name, left))
-
-                local n = collectPass(island, passesRouteFilters)
-                total += n
-
-                if closed or not auto then return end
-                if os.clock() - t0 >= e.wait then break end
-                if n == 0 then task.wait(1) end
-            end
-        end
-    end
-
-    if total == 0 and auto and not closed then
-        setStatus("Ruta sin cofres, reinicio en " .. CONFIG.ESPERA_RUTA_VACIA .. " s")
-        local t0 = os.clock()
-        while os.clock() - t0 < CONFIG.ESPERA_RUTA_VACIA and auto and not closed do
-            task.wait(0.5)
-        end
-    end
-end
-
----------------------------------------------------------------
 -- CICLO PRINCIPAL
 ---------------------------------------------------------------
 local function collectCycle()
@@ -1104,11 +1058,55 @@ local function collectCycle()
         return
     end
 
+    -- Modo ruta: se queda en cada isla el tiempo configurado buscando la rareza elegida
     if routeMode then
-        runRoute()
+        local entries = resolveRoute()
+        if #entries == 0 then
+            setStatus("La ruta está vacía: agrega islas o un mar en la pestaña Isla")
+            return
+        end
+
+        local total = 0
+        for _, e in ipairs(entries) do
+            if closed or not auto then return end
+
+            local secs = waitForKey(e.key)
+            local name = islandName(e.isl)
+            local island = getIsland(e.sea, e.isl)
+
+            if not island then
+                setStatus("No encuentro " .. name)
+            else
+                local root = getRoot()
+                if root and not isInsideIsland(island, root.Position) then
+                    setStatus("Yendo a " .. name .. "...")
+                    moveTo(islandTop(island))
+                end
+
+                local deadline = os.clock() + secs
+                while os.clock() < deadline and auto and not closed do
+                    local remaining = math.ceil(deadline - os.clock())
+                    setStatus("Buscando rareza en " .. name .. " (" .. remaining .. " s)")
+                    local n = collectPass(island, passesRouteFilters)
+                    total += n
+                    if n == 0 then
+                        task.wait(0.5)
+                    end
+                end
+            end
+        end
+
+        if total == 0 and auto and not closed then
+            setStatus("Ruta sin cofres, reinicio en " .. CONFIG.ESPERA_RUTA .. " s")
+            local t0 = os.clock()
+            while os.clock() - t0 < CONFIG.ESPERA_RUTA and auto and not closed do
+                task.wait(0.5)
+            end
+        end
         return
     end
 
+    -- Modo isla única
     if islandMode then
         local sea = currentSea()
         local isl = currentIsland()
@@ -1130,6 +1128,7 @@ local function collectCycle()
         return
     end
 
+    -- Todo el mapa
     collectPass(nil, passesNormalFilters)
     if auto then
         setStatus("Buscando cofres...")
@@ -1139,997 +1138,944 @@ end
 ---------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------
-do
-    local PALETTE = {
-        bg = Color3.fromRGB(18, 20, 28),
-        card = Color3.fromRGB(30, 33, 46),
-        track = Color3.fromRGB(46, 50, 68),
-        accent = Color3.fromRGB(110, 150, 255),
-        green = Color3.fromRGB(80, 200, 130),
-        red = Color3.fromRGB(225, 85, 95),
-        text = Color3.fromRGB(240, 242, 250),
-        muted = Color3.fromRGB(140, 146, 170),
-    }
+local PALETTE = {
+    bg = Color3.fromRGB(18, 20, 28),
+    card = Color3.fromRGB(30, 33, 46),
+    track = Color3.fromRGB(46, 50, 68),
+    accent = Color3.fromRGB(110, 150, 255),
+    green = Color3.fromRGB(80, 200, 130),
+    red = Color3.fromRGB(225, 85, 95),
+    text = Color3.fromRGB(240, 242, 250),
+    muted = Color3.fromRGB(140, 146, 170),
+}
 
-    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-    local camera = Workspace.CurrentCamera or Workspace:WaitForChild("CurrentCamera")
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local camera = Workspace.CurrentCamera or Workspace:WaitForChild("CurrentCamera")
 
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "CofresUI"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.Parent = playerGui
+local gui = Instance.new("ScreenGui")
+gui.Name = "CofresUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = playerGui
 
-    local function corner(parent, radius)
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, radius)
-        c.Parent = parent
+local function corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius)
+    c.Parent = parent
+end
+
+local function stroke(parent, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.Parent = parent
+end
+
+local function label(parent, text, size, color, bold)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextSize = size
+    l.TextColor3 = color
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Center
+    l.Parent = parent
+    return l
+end
+
+local function button(parent, text, size, color)
+    local b = Instance.new("TextButton")
+    b.Size = size
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = PALETTE.text
+    b.TextSize = 12
+    b.Font = Enum.Font.GothamBold
+    b.AutoButtonColor = true
+    b.BorderSizePixel = 0
+    b.Parent = parent
+    corner(b, 8)
+    return b
+end
+
+local function listLayout(parent, padding, horizontal)
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, padding)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    if horizontal then
+        l.FillDirection = Enum.FillDirection.Horizontal
+    end
+    l.Parent = parent
+    return l
+end
+
+local function padding(frame, x, y)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, x)
+    p.PaddingRight = UDim.new(0, x)
+    p.PaddingTop = UDim.new(0, y or x)
+    p.PaddingBottom = UDim.new(0, y or x)
+    p.Parent = frame
+end
+
+local function rowFrame(parent, order)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -4, 0, 34)
+    f.BackgroundColor3 = PALETTE.card
+    f.BorderSizePixel = 0
+    f.LayoutOrder = order
+    f.Parent = parent
+    corner(f, 8)
+    return f
+end
+
+local function checkRow(parent, text, order, initial, onChange)
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -4, 0, 34)
+    row.BackgroundColor3 = PALETTE.card
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.LayoutOrder = order
+    row.Parent = parent
+    corner(row, 8)
+
+    local lbl = label(row, text, 12, PALETTE.text, false)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.Size = UDim2.new(1, -44, 1, 0)
+
+    local box = Instance.new("Frame")
+    box.Size = UDim2.fromOffset(18, 18)
+    box.Position = UDim2.new(1, -28, 0.5, -9)
+    box.BorderSizePixel = 0
+    box.Parent = row
+    corner(box, 5)
+    stroke(box, PALETTE.muted, 1, 0.2)
+
+    local tick = label(box, "✓", 13, PALETTE.text, true)
+    tick.Size = UDim2.new(1, 0, 1, 0)
+    tick.TextXAlignment = Enum.TextXAlignment.Center
+
+    local state = initial
+    local function paint()
+        box.BackgroundColor3 = state and PALETTE.green or PALETTE.track
+        tick.Visible = state
     end
 
-    local function stroke(parent, color, thickness, transparency)
-        local s = Instance.new("UIStroke")
-        s.Color = color
-        s.Thickness = thickness or 1
-        s.Transparency = transparency or 0
-        s.Parent = parent
-    end
-
-    local function label(parent, text, size, color, bold)
-        local l = Instance.new("TextLabel")
-        l.BackgroundTransparency = 1
-        l.Text = text
-        l.TextSize = size
-        l.TextColor3 = color
-        l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-        l.TextXAlignment = Enum.TextXAlignment.Left
-        l.TextYAlignment = Enum.TextYAlignment.Center
-        l.Parent = parent
-        return l
-    end
-
-    local function button(parent, text, size, color)
-        local b = Instance.new("TextButton")
-        b.Size = size
-        b.BackgroundColor3 = color
-        b.Text = text
-        b.TextColor3 = PALETTE.text
-        b.TextSize = 12
-        b.Font = Enum.Font.GothamBold
-        b.AutoButtonColor = true
-        b.BorderSizePixel = 0
-        b.Parent = parent
-        corner(b, 8)
-        return b
-    end
-
-    local function listLayout(parent, padding, horizontal)
-        local l = Instance.new("UIListLayout")
-        l.Padding = UDim.new(0, padding)
-        l.SortOrder = Enum.SortOrder.LayoutOrder
-        if horizontal then
-            l.FillDirection = Enum.FillDirection.Horizontal
-        end
-        l.Parent = parent
-        return l
-    end
-
-    local function padding(frame, x, y)
-        local p = Instance.new("UIPadding")
-        p.PaddingLeft = UDim.new(0, x)
-        p.PaddingRight = UDim.new(0, x)
-        p.PaddingTop = UDim.new(0, y or x)
-        p.PaddingBottom = UDim.new(0, y or x)
-        p.Parent = frame
-    end
-
-    local function rowFrame(parent, order)
-        local f = Instance.new("Frame")
-        f.Size = UDim2.new(1, -4, 0, 34)
-        f.BackgroundColor3 = PALETTE.card
-        f.BorderSizePixel = 0
-        f.LayoutOrder = order
-        f.Parent = parent
-        corner(f, 8)
-        return f
-    end
-
-    -- Casilla: getState/setState conectan la fila con la variable real
-    local checks = {}
-    local function checkRow(parent, text, order, getState, setState)
-        local row = Instance.new("TextButton")
-        row.Size = UDim2.new(1, -4, 0, 34)
-        row.BackgroundColor3 = PALETTE.card
-        row.BorderSizePixel = 0
-        row.Text = ""
-        row.AutoButtonColor = false
-        row.LayoutOrder = order
-        row.Parent = parent
-        corner(row, 8)
-
-        local lbl = label(row, text, 12, PALETTE.text, false)
-        lbl.Position = UDim2.new(0, 10, 0, 0)
-        lbl.Size = UDim2.new(1, -44, 1, 0)
-
-        local box = Instance.new("Frame")
-        box.Size = UDim2.fromOffset(18, 18)
-        box.Position = UDim2.new(1, -28, 0.5, -9)
-        box.BorderSizePixel = 0
-        box.Parent = row
-        corner(box, 5)
-        stroke(box, PALETTE.muted, 1, 0.2)
-
-        local tick = label(box, "✓", 13, PALETTE.text, true)
-        tick.Size = UDim2.new(1, 0, 1, 0)
-        tick.TextXAlignment = Enum.TextXAlignment.Center
-
-        local function paint()
-            local on = getState()
-            box.BackgroundColor3 = on and PALETTE.green or PALETTE.track
-            tick.Visible = on
-        end
-
-        row.Activated:Connect(function()
-            setState(not getState())
-            paint()
-            if refreshUI then refreshUI() end
-        end)
-
+    row.Activated:Connect(function()
+        state = not state
         paint()
-        local c = { refresh = paint }
-        table.insert(checks, c)
-        return c
-    end
+        onChange(state)
+    end)
 
-    -- ◀ texto ▶
-    local function arrowRow(parent, order, getText, onPrev, onNext)
-        local row = rowFrame(parent, order)
+    paint()
+    return { refresh = paint }
+end
 
-        local prev = button(row, "◀", UDim2.fromOffset(34, 28), PALETTE.track)
-        prev.Position = UDim2.new(0, 3, 0.5, -14)
-        local nxt = button(row, "▶", UDim2.fromOffset(34, 28), PALETTE.track)
-        nxt.Position = UDim2.new(1, -37, 0.5, -14)
+local function arrowRow(parent, order, getText, onPrev, onNext)
+    local row = rowFrame(parent, order)
 
-        local lbl = label(row, "", 12, PALETTE.text, true)
-        lbl.TextXAlignment = Enum.TextXAlignment.Center
-        lbl.Position = UDim2.new(0, 42, 0, 0)
-        lbl.Size = UDim2.new(1, -84, 1, 0)
-        lbl.TextTruncate = Enum.TextTruncate.AtEnd
+    local prev = button(row, "◀", UDim2.fromOffset(34, 28), PALETTE.track)
+    prev.Position = UDim2.new(0, 3, 0.5, -14)
+    local nxt = button(row, "▶", UDim2.fromOffset(34, 28), PALETTE.track)
+    nxt.Position = UDim2.new(1, -37, 0.5, -14)
 
-        prev.Activated:Connect(onPrev)
-        nxt.Activated:Connect(onNext)
+    local lbl = label(row, "", 12, PALETTE.text, true)
+    lbl.TextXAlignment = Enum.TextXAlignment.Center
+    lbl.Position = UDim2.new(0, 42, 0, 0)
+    lbl.Size = UDim2.new(1, -84, 1, 0)
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
 
-        return { refresh = function() lbl.Text = getText() end }
-    end
+    prev.Activated:Connect(onPrev)
+    nxt.Activated:Connect(onNext)
 
-    local function stepperRow(parent, order, getText, onMinus, onPlus)
-        local row = rowFrame(parent, order)
+    return { refresh = function() lbl.Text = getText() end }
+end
 
-        local lbl = label(row, "", 12, PALETTE.text, true)
-        lbl.Position = UDim2.new(0, 10, 0, 0)
-        lbl.Size = UDim2.new(1, -86, 1, 0)
+local function stepperRow(parent, order, getText, onMinus, onPlus)
+    local row = rowFrame(parent, order)
 
-        local minus = button(row, "−", UDim2.fromOffset(34, 28), PALETTE.track)
-        minus.Position = UDim2.new(1, -76, 0.5, -14)
-        minus.TextSize = 16
-        local plus = button(row, "+", UDim2.fromOffset(34, 28), PALETTE.track)
-        plus.Position = UDim2.new(1, -38, 0.5, -14)
-        plus.TextSize = 16
+    local lbl = label(row, "", 12, PALETTE.text, true)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.Size = UDim2.new(1, -86, 1, 0)
 
-        minus.Activated:Connect(onMinus)
-        plus.Activated:Connect(onPlus)
+    local minus = button(row, "−", UDim2.fromOffset(34, 28), PALETTE.track)
+    minus.Position = UDim2.new(1, -76, 0.5, -14)
+    minus.TextSize = 16
+    local plus = button(row, "+", UDim2.fromOffset(34, 28), PALETTE.track)
+    plus.Position = UDim2.new(1, -38, 0.5, -14)
+    plus.TextSize = 16
 
-        return { refresh = function() lbl.Text = getText() end }
-    end
+    minus.Activated:Connect(onMinus)
+    plus.Activated:Connect(onPlus)
 
-    -- Caja escribible con − y +
-    local function numberRow(parent, order, name, getVal, setVal, getStep, boxWidth)
-        local row = rowFrame(parent, order)
-        boxWidth = boxWidth or 64
+    return { refresh = function() lbl.Text = getText() end }
+end
 
-        local lbl = label(row, name, 12, PALETTE.text, true)
-        lbl.Position = UDim2.new(0, 10, 0, 0)
-        lbl.Size = UDim2.new(1, -(boxWidth + 90), 1, 0)
+local function numberRow(parent, order, name, getVal, setVal, getStep, boxWidth)
+    local row = rowFrame(parent, order)
+    boxWidth = boxWidth or 64
 
-        local minus = button(row, "−", UDim2.fromOffset(30, 28), PALETTE.track)
-        minus.Position = UDim2.new(1, -(boxWidth + 76), 0.5, -14)
-        minus.TextSize = 16
+    local lbl = label(row, name, 12, PALETTE.text, true)
+    lbl.Position = UDim2.new(0, 10, 0, 0)
+    lbl.Size = UDim2.new(1, -(boxWidth + 90), 1, 0)
 
-        local box = Instance.new("TextBox")
-        box.Size = UDim2.fromOffset(boxWidth, 28)
-        box.Position = UDim2.new(1, -(boxWidth + 42), 0.5, -14)
-        box.BackgroundColor3 = PALETTE.bg
-        box.BorderSizePixel = 0
-        box.TextColor3 = PALETTE.text
-        box.Font = Enum.Font.GothamBold
-        box.TextSize = 12
-        box.ClearTextOnFocus = false
+    local minus = button(row, "−", UDim2.fromOffset(30, 28), PALETTE.track)
+    minus.Position = UDim2.new(1, -(boxWidth + 76), 0.5, -14)
+    minus.TextSize = 16
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.fromOffset(boxWidth, 28)
+    box.Position = UDim2.new(1, -(boxWidth + 42), 0.5, -14)
+    box.BackgroundColor3 = PALETTE.bg
+    box.BorderSizePixel = 0
+    box.TextColor3 = PALETTE.text
+    box.Font = Enum.Font.GothamBold
+    box.TextSize = 12
+    box.ClearTextOnFocus = false
+    box.Text = tostring(getVal())
+    box.Parent = row
+    corner(box, 6)
+
+    local plus = button(row, "+", UDim2.fromOffset(30, 28), PALETTE.track)
+    plus.Position = UDim2.new(1, -38, 0.5, -14)
+    plus.TextSize = 16
+
+    minus.Activated:Connect(function()
+        setVal(getVal() - getStep())
+    end)
+    plus.Activated:Connect(function()
+        setVal(getVal() + getStep())
+    end)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then
+            setVal(math.floor(n + 0.5))
+        end
         box.Text = tostring(getVal())
-        box.Parent = row
-        corner(box, 6)
+    end)
 
-        local plus = button(row, "+", UDim2.fromOffset(30, 28), PALETTE.track)
-        plus.Position = UDim2.new(1, -38, 0.5, -14)
-        plus.TextSize = 16
-
-        minus.Activated:Connect(function()
-            setVal(getVal() - getStep())
-        end)
-        plus.Activated:Connect(function()
-            setVal(getVal() + getStep())
-        end)
-        box.FocusLost:Connect(function()
-            local n = tonumber(box.Text)
-            if n then
-                setVal(math.floor(n + 0.5))
+    return {
+        refresh = function()
+            if not box:IsFocused() then
+                box.Text = tostring(getVal())
             end
-            box.Text = tostring(getVal())
-        end)
+        end,
+    }
+end
 
-        return {
-            refresh = function()
-                if not box:IsFocused() then
-                    box.Text = tostring(getVal())
+local function makeDraggable(handle, frame)
+    local dragging, startInput, startPos = false, nil, nil
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            startInput = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
                 end
-            end,
-        }
-    end
-
-    local function makeDraggable(handle, frame)
-        local dragging, startInput, startPos = false, nil, nil
-        handle.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.Touch
-                or input.UserInputType == Enum.UserInputType.MouseButton1 then
-                dragging = true
-                startInput = input.Position
-                startPos = frame.Position
-                input.Changed:Connect(function()
-                    if input.UserInputState == Enum.UserInputState.End then
-                        dragging = false
-                    end
-                end)
-            end
-        end)
-        UserInputService.InputChanged:Connect(function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.Touch
-                or input.UserInputType == Enum.UserInputType.MouseMovement) then
-                local d = input.Position - startInput
-                frame.Position = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset + d.X,
-                    startPos.Y.Scale, startPos.Y.Offset + d.Y
-                )
-            end
-        end)
-    end
-
-    -- Panel principal
-    local main = Instance.new("Frame")
-    main.Name = "Main"
-    main.AnchorPoint = Vector2.new(0.5, 0.5)
-    main.Position = UDim2.new(0.5, 0, 0.5, 0)
-    main.BackgroundColor3 = PALETTE.bg
-    main.BorderSizePixel = 0
-    main.ClipsDescendants = true
-    main.Parent = gui
-    corner(main, 16)
-    stroke(main, PALETTE.accent, 1, 0.5)
-
-    local content = Instance.new("Frame")
-    content.Name = "Content"
-    content.Position = UDim2.new(0, 0, 0, 0)
-    content.BackgroundTransparency = 1
-    content.Parent = main
-
-    local contentScale = Instance.new("UIScale")
-    contentScale.Parent = content
-
-    local function applyPanelSize()
-        panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, CONFIG.PANEL_MAX)
-        panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, CONFIG.PANEL_MAX)
-        main.Size = UDim2.fromOffset(panelW, panelH)
-        local s = math.min(panelW / BASE_W, panelH / BASE_H)
-        contentScale.Scale = s
-        content.Size = UDim2.fromOffset(panelW / s, panelH / s)
-    end
-
-    local header = Instance.new("Frame")
-    header.Size = UDim2.new(1, 0, 0, 44)
-    header.BackgroundTransparency = 1
-    header.Parent = content
-
-    local title = label(header, "Cofres", 15, PALETTE.text, true)
-    title.Position = UDim2.new(0, 14, 0, 6)
-    title.Size = UDim2.new(1, -100, 0, 18)
-
-    local subtitle = label(header, statusText, 10, PALETTE.muted, false)
-    subtitle.Position = UDim2.new(0, 14, 0, 24)
-    subtitle.Size = UDim2.new(1, -100, 0, 14)
-    subtitle.TextTruncate = Enum.TextTruncate.AtEnd
-
-    local minBtn = button(header, "—", UDim2.fromOffset(30, 30), PALETTE.card)
-    minBtn.Position = UDim2.new(1, -72, 0, 7)
-    local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), PALETTE.red)
-    closeBtn.Position = UDim2.new(1, -36, 0, 7)
-
-    local statCard = Instance.new("Frame")
-    statCard.Position = UDim2.new(0, 10, 0, 48)
-    statCard.Size = UDim2.new(1, -20, 0, 54)
-    statCard.BackgroundColor3 = PALETTE.card
-    statCard.BorderSizePixel = 0
-    statCard.Parent = content
-    corner(statCard, 12)
-
-    label(statCard, "RECOGIDOS", 9, PALETTE.muted, true).Position = UDim2.new(0, 12, 0, 7)
-    local countLabel = label(statCard, "0", 18, PALETTE.green, true)
-    countLabel.Position = UDim2.new(0, 12, 0, 19)
-    countLabel.Size = UDim2.new(0.5, -12, 0, 24)
-
-    label(statCard, "ESPACIO", 9, PALETTE.muted, true).Position = UDim2.new(0.5, 0, 0, 7)
-    local vaultLabel = label(statCard, "0/0", 18, PALETTE.accent, true)
-    vaultLabel.Position = UDim2.new(0.5, 0, 0, 19)
-    vaultLabel.Size = UDim2.new(0.5, -12, 0, 24)
-
-    local barTrack = Instance.new("Frame")
-    barTrack.Position = UDim2.new(0, 10, 1, -11)
-    barTrack.Size = UDim2.new(1, -20, 0, 5)
-    barTrack.BackgroundColor3 = PALETTE.track
-    barTrack.BorderSizePixel = 0
-    barTrack.Parent = statCard
-    corner(barTrack, 3)
-
-    local barFill = Instance.new("Frame")
-    barFill.Size = UDim2.new(0, 0, 1, 0)
-    barFill.BackgroundColor3 = PALETTE.accent
-    barFill.BorderSizePixel = 0
-    barFill.Parent = barTrack
-    corner(barFill, 3)
-
-    -- Pestañas (6)
-    local tabRow = Instance.new("Frame")
-    tabRow.Position = UDim2.new(0, 10, 0, 110)
-    tabRow.Size = UDim2.new(1, -20, 0, 30)
-    tabRow.BackgroundTransparency = 1
-    tabRow.Parent = content
-    listLayout(tabRow, 2, true)
-
-    local tabNames = { "Cofres", "Mares", "Ruta", "Bóveda", "Filtros", "Panel" }
-    local tabButtons = {}
-    for i, name in ipairs(tabNames) do
-        local b = button(tabRow, name, UDim2.new(1 / #tabNames, -2, 1, 0), PALETTE.card)
-        b.TextSize = 10
-        b.LayoutOrder = i
-        tabButtons[i] = b
-    end
-
-    local pageArea = Instance.new("Frame")
-    pageArea.Position = UDim2.new(0, 10, 0, 148)
-    pageArea.Size = UDim2.new(1, -20, 1, -158)
-    pageArea.BackgroundTransparency = 1
-    pageArea.Parent = content
-
-    local pages = {}
-    local function newPage()
-        local p = Instance.new("ScrollingFrame")
-        p.Size = UDim2.new(1, 0, 1, 0)
-        p.BackgroundTransparency = 1
-        p.BorderSizePixel = 0
-        p.ScrollBarThickness = 3
-        p.ScrollBarImageColor3 = PALETTE.accent
-        p.CanvasSize = UDim2.new(0, 0, 0, 0)
-        p.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        p.Visible = false
-        p.Parent = pageArea
-        listLayout(p, 6)
-        padding(p, 2, 2)
-        table.insert(pages, p)
-        return p
-    end
-
-    local pageCofres = newPage()
-    local pageMares = newPage()
-    local pageRuta = newPage()
-    local pageBoveda = newPage()
-    local pageFiltros = newPage()
-    local pagePanel = newPage()
-
-    local function showTab(index)
-        for i, p in ipairs(pages) do
-            p.Visible = (i == index)
+            end)
         end
-        for i, b in ipairs(tabButtons) do
-            b.BackgroundColor3 = (i == index) and PALETTE.accent or PALETTE.card
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local d = input.Position - startInput
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
         end
-    end
+    end)
+end
 
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.AnchorPoint = Vector2.new(0.5, 0.5)
+main.Position = UDim2.new(0.5, 0, 0.5, 0)
+main.BackgroundColor3 = PALETTE.bg
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+corner(main, 16)
+stroke(main, PALETTE.accent, 1, 0.5)
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Position = UDim2.new(0, 0, 0, 0)
+content.BackgroundTransparency = 1
+content.Parent = main
+
+local contentScale = Instance.new("UIScale")
+contentScale.Parent = content
+
+local function applyPanelSize()
+    panelW = math.clamp(panelW, CONFIG.PANEL_MIN_ANCHO, CONFIG.PANEL_MAX)
+    panelH = math.clamp(panelH, CONFIG.PANEL_MIN_ALTO, CONFIG.PANEL_MAX)
+    main.Size = UDim2.fromOffset(panelW, panelH)
+
+    local s = math.min(panelW / BASE_W, panelH / BASE_H)
+    contentScale.Scale = s
+    content.Size = UDim2.fromOffset(panelW / s, panelH / s)
+end
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 44)
+header.BackgroundTransparency = 1
+header.Parent = content
+
+local title = label(header, "Cofres", 15, PALETTE.text, true)
+title.Position = UDim2.new(0, 14, 0, 6)
+title.Size = UDim2.new(1, -100, 0, 18)
+
+local subtitle = label(header, statusText, 10, PALETTE.muted, false)
+subtitle.Position = UDim2.new(0, 14, 0, 24)
+subtitle.Size = UDim2.new(1, -100, 0, 14)
+subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+
+local minBtn = button(header, "—", UDim2.fromOffset(30, 30), PALETTE.card)
+minBtn.Position = UDim2.new(1, -72, 0, 7)
+local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), PALETTE.red)
+closeBtn.Position = UDim2.new(1, -36, 0, 7)
+
+local statCard = Instance.new("Frame")
+statCard.Position = UDim2.new(0, 10, 0, 48)
+statCard.Size = UDim2.new(1, -20, 0, 54)
+statCard.BackgroundColor3 = PALETTE.card
+statCard.BorderSizePixel = 0
+statCard.Parent = content
+corner(statCard, 12)
+
+local recLbl = label(statCard, "RECOGIDOS", 9, PALETTE.muted, true)
+recLbl.Position = UDim2.new(0, 12, 0, 7)
+recLbl.Size = UDim2.new(0.5, -12, 0, 12)
+
+local countLabel = label(statCard, "0", 18, PALETTE.green, true)
+countLabel.Position = UDim2.new(0, 12, 0, 19)
+countLabel.Size = UDim2.new(0.5, -12, 0, 24)
+
+local spaceLbl = label(statCard, "ESPACIO", 9, PALETTE.muted, true)
+spaceLbl.Position = UDim2.new(0.5, 0, 0, 7)
+spaceLbl.Size = UDim2.new(0.5, -12, 0, 12)
+
+local vaultLabel = label(statCard, "0/0", 18, PALETTE.accent, true)
+vaultLabel.Position = UDim2.new(0.5, 0, 0, 19)
+vaultLabel.Size = UDim2.new(0.5, -12, 0, 24)
+
+local barTrack = Instance.new("Frame")
+barTrack.Position = UDim2.new(0, 10, 1, -11)
+barTrack.Size = UDim2.new(1, -20, 0, 5)
+barTrack.BackgroundColor3 = PALETTE.track
+barTrack.BorderSizePixel = 0
+barTrack.Parent = statCard
+corner(barTrack, 3)
+
+local barFill = Instance.new("Frame")
+barFill.Size = UDim2.new(0, 0, 1, 0)
+barFill.BackgroundColor3 = PALETTE.accent
+barFill.BorderSizePixel = 0
+barFill.Parent = barTrack
+corner(barFill, 3)
+
+local tabRow = Instance.new("Frame")
+tabRow.Position = UDim2.new(0, 10, 0, 110)
+tabRow.Size = UDim2.new(1, -20, 0, 30)
+tabRow.BackgroundTransparency = 1
+tabRow.Parent = content
+listLayout(tabRow, 3, true)
+
+local tabNames = { "Cofres", "Isla", "Bóveda", "Filtros", "Panel" }
+local tabButtons = {}
+for i, name in ipairs(tabNames) do
+    local b = button(tabRow, name, UDim2.new(0.2, -3, 1, 0), PALETTE.card)
+    b.TextSize = 11
+    b.LayoutOrder = i
+    tabButtons[i] = b
+end
+
+local pageArea = Instance.new("Frame")
+pageArea.Position = UDim2.new(0, 10, 0, 148)
+pageArea.Size = UDim2.new(1, -20, 1, -158)
+pageArea.BackgroundTransparency = 1
+pageArea.Parent = content
+
+local pages = {}
+local function newPage()
+    local p = Instance.new("ScrollingFrame")
+    p.Size = UDim2.new(1, 0, 1, 0)
+    p.BackgroundTransparency = 1
+    p.BorderSizePixel = 0
+    p.ScrollBarThickness = 3
+    p.ScrollBarImageColor3 = PALETTE.accent
+    p.CanvasSize = UDim2.new(0, 0, 0, 0)
+    p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    p.Visible = false
+    p.Parent = pageArea
+    listLayout(p, 6)
+    padding(p, 2, 2)
+    table.insert(pages, p)
+    return p
+end
+
+local pageCofres = newPage()
+local pageIsla = newPage()
+local pageBoveda = newPage()
+local pageFiltros = newPage()
+local pagePanel = newPage()
+
+local function showTab(index)
+    for i, p in ipairs(pages) do
+        p.Visible = (i == index)
+    end
     for i, b in ipairs(tabButtons) do
-        b.Activated:Connect(function() showTab(i) end)
+        b.BackgroundColor3 = (i == index) and PALETTE.accent or PALETTE.card
     end
+end
 
-    ---------------------------------------------------------------
-    -- PESTAÑA COFRES
-    ---------------------------------------------------------------
-    checkRow(pageCofres, "Recolección automática", 1,
-        function() return auto end,
-        function(v)
-            auto = v
-            setStatus(v and "Buscando cofres..." or "Recolección apagada")
-        end)
+for i, b in ipairs(tabButtons) do
+    b.Activated:Connect(function() showTab(i) end)
+end
 
-    checkRow(pageCofres, "Ir al barco y volver", 2,
-        function() return returnToSpot end,
-        function(v)
-            returnToSpot = v
-            markDirty()
-            setStatus(v and "Volverá a tu posición tras guardar" or "Se quedará en el barco tras guardar")
-        end)
+---------------------------------------------------------------
+-- PESTAÑA COFRES
+---------------------------------------------------------------
+checkRow(pageCofres, "Recolección automática", 1, auto, function(v)
+    auto = v
+    setStatus(v and "Buscando cofres..." or "Recolección apagada")
+end)
 
-    checkRow(pageCofres, "Solo cofres de otros jugadores", 3,
-        function() return onlyOthers end,
-        function(v)
-            onlyOthers = v
-            markDirty()
-            setStatus(v and "Modo: solo cofres de otros" or "Modo: no tomar cofres de otros")
-        end)
+checkRow(pageCofres, "Ir al barco y volver", 2, returnToSpot, function(v)
+    returnToSpot = v
+    markDirty()
+    setStatus(v and "Volverá a tu posición tras guardar" or "Se quedará en el barco tras guardar")
+end)
 
-    local modeRow = Instance.new("Frame")
-    modeRow.Size = UDim2.new(1, -4, 0, 32)
-    modeRow.BackgroundTransparency = 1
-    modeRow.LayoutOrder = 4
-    modeRow.Parent = pageCofres
-    listLayout(modeRow, 6, true)
+checkRow(pageCofres, "Solo cofres de otros jugadores", 3, onlyOthers, function(v)
+    onlyOthers = v
+    markDirty()
+    setStatus(v and "Modo: solo cofres de otros" or "Modo: no tomar cofres de otros")
+end)
 
-    local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
-    local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+local modeRow = Instance.new("Frame")
+modeRow.Size = UDim2.new(1, -4, 0, 32)
+modeRow.BackgroundTransparency = 1
+modeRow.LayoutOrder = 4
+modeRow.Parent = pageCofres
+listLayout(modeRow, 6, true)
 
-    local function cycleTarget(step)
-        local opts = buildTargetOptions()
-        local idx = 1
-        for i, v in ipairs(opts) do
-            if v == targetLabel then
-                idx = i
-                break
-            end
-        end
-        idx = idx + step
-        if idx < 1 then idx = #opts end
-        if idx > #opts then idx = 1 end
-        targetLabel = opts[idx]
-        markDirty()
-        if #opts == 1 then
-            setStatus("Solo veo tu barco: acércate a otros barcos para que aparezcan")
-        else
-            setStatus("Destino: " .. targetLabel)
+local tpBtn = button(modeRow, "⚡ Teletransporte", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+local glideBtn = button(modeRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+
+local function cycleTarget(step)
+    local opts = buildTargetOptions()
+    local idx = 1
+    for i, v in ipairs(opts) do
+        if v == targetLabel then
+            idx = i
+            break
         end
     end
+    idx = idx + step
+    if idx < 1 then idx = #opts end
+    if idx > #opts then idx = 1 end
+    targetLabel = opts[idx]
+    markDirty()
 
-    local destRow = arrowRow(pageCofres, 5,
-        function() return "Destino: " .. targetLabel end,
-        function() cycleTarget(-1) end,
-        function() cycleTarget(1) end
-    )
-
-    local destNote = label(pageCofres, "", 10, PALETTE.muted, false)
-    destNote.LayoutOrder = 6
-    destNote.Size = UDim2.new(1, -4, 0, 30)
-    destNote.TextWrapped = true
-    destNote.TextYAlignment = Enum.TextYAlignment.Top
-
-    local waitStepper = stepperRow(pageCofres, 7,
-        function() return "Espera en barco: " .. waitOnBoat .. " s" end,
-        function()
-            waitOnBoat = math.max(0, waitOnBoat - 1)
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function()
-            waitOnBoat = math.min(CONFIG.ESPERA_BARCO_MAX, waitOnBoat + 1)
-            markDirty()
-            if refreshUI then refreshUI() end
-        end
-    )
-
-    ---------------------------------------------------------------
-    -- PESTAÑA MARES: elegir mar con cuadrícula, isla con lista
-    ---------------------------------------------------------------
-    local islandCheck = checkRow(pageMares, "Recolectar por isla", 1,
-        function() return islandMode end,
-        function(v)
-            islandMode = v
-            if v then routeMode = false end
-            markDirty()
-            setStatus(v and ("Modo isla: " .. islandName(currentIsland())) or "Modo isla apagado")
-        end)
-
-    local langRow = arrowRow(pageMares, 2,
-        function() return lang == "es" and "Idioma: Español" or "Language: English" end,
-        function()
-            lang = (lang == "es") and "en" or "es"
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function()
-            lang = (lang == "es") and "en" or "es"
-            markDirty()
-            if refreshUI then refreshUI() end
-        end
-    )
-
-    local seaGridFrame = Instance.new("Frame")
-    seaGridFrame.Size = UDim2.new(1, -4, 0, 0)
-    seaGridFrame.AutomaticSize = Enum.AutomaticSize.Y
-    seaGridFrame.BackgroundTransparency = 1
-    seaGridFrame.LayoutOrder = 3
-    seaGridFrame.Parent = pageMares
-
-    local grid = Instance.new("UIGridLayout")
-    grid.CellSize = UDim2.new(0.5, -4, 0, 28)
-    grid.CellPadding = UDim2.fromOffset(6, 6)
-    grid.SortOrder = Enum.SortOrder.LayoutOrder
-    grid.Parent = seaGridFrame
-
-    local seaButtons = {}
-    for i, sea in ipairs(SEAS) do
-        local b = button(seaGridFrame, seaName(sea), UDim2.fromOffset(10, 28), PALETTE.card)
-        b.TextSize = 11
-        b.LayoutOrder = i
-        b.Activated:Connect(function()
-            seaIndex = i
-            islandIndex = 1
-            markDirty()
-            if refreshUI then refreshUI() end
-        end)
-        seaButtons[i] = b
+    if #opts == 1 then
+        setStatus("Solo veo tu barco: acércate a otros barcos para que aparezcan")
+    else
+        setStatus("Destino: " .. targetLabel)
     end
+end
 
-    local islandHeader = label(pageMares, "", 11, PALETTE.muted, true)
-    islandHeader.LayoutOrder = 10
-    islandHeader.Size = UDim2.new(1, -4, 0, 18)
+local destRow = arrowRow(pageCofres, 5,
+    function() return "Destino: " .. targetLabel end,
+    function() cycleTarget(-1) end,
+    function() cycleTarget(1) end
+)
 
-    local islandRowsFrame = Instance.new("Frame")
-    islandRowsFrame.Size = UDim2.new(1, -4, 0, 0)
-    islandRowsFrame.AutomaticSize = Enum.AutomaticSize.Y
-    islandRowsFrame.BackgroundTransparency = 1
-    islandRowsFrame.LayoutOrder = 11
-    islandRowsFrame.Parent = pageMares
-    listLayout(islandRowsFrame, 4)
+local destNote = label(pageCofres, "", 10, PALETTE.muted, false)
+destNote.LayoutOrder = 6
+destNote.Size = UDim2.new(1, -4, 0, 30)
+destNote.TextWrapped = true
+destNote.TextYAlignment = Enum.TextYAlignment.Top
 
-    local islandRowEntries = {}
-    local builtSeaIndex = nil
-
-    local function rebuildIslandRows()
-        for _, e in ipairs(islandRowEntries) do
-            e.row:Destroy()
-        end
-        islandRowEntries = {}
-
-        local sea = currentSea()
-        for i, isl in ipairs(sea.islas) do
-            local row = Instance.new("Frame")
-            row.Size = UDim2.new(1, 0, 0, 34)
-            row.BackgroundTransparency = 1
-            row.LayoutOrder = i
-            row.Parent = islandRowsFrame
-
-            local nameBtn = button(row, islandName(isl), UDim2.new(1, -84, 1, 0), PALETTE.track)
-            nameBtn.Position = UDim2.new(0, 0, 0, 0)
-            nameBtn.TextXAlignment = Enum.TextXAlignment.Left
-            nameBtn.TextSize = 11
-            nameBtn.Activated:Connect(function()
-                islandIndex = i
-                markDirty()
-                if refreshUI then refreshUI() end
-            end)
-
-            local addBtn = button(row, "＋ Ruta", UDim2.new(0, 78, 1, 0), PALETTE.accent)
-            addBtn.Position = UDim2.new(1, -78, 0, 0)
-            addBtn.TextSize = 11
-            addBtn.Activated:Connect(function()
-                addIslandToRoute(sea, isl)
-                if refreshUI then refreshUI() end
-            end)
-
-            table.insert(islandRowEntries, { row = row, btn = nameBtn, i = i })
-        end
-        builtSeaIndex = seaIndex
+local waitStepper = stepperRow(pageCofres, 7,
+    function() return "Espera en barco: " .. waitOnBoat .. " s" end,
+    function()
+        waitOnBoat = math.max(0, waitOnBoat - 1)
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        waitOnBoat = math.min(CONFIG.ESPERA_BARCO_MAX, waitOnBoat + 1)
+        markDirty()
+        refreshUI()
     end
+)
 
-    local islandNote = label(pageMares, "", 10, PALETTE.muted, false)
-    islandNote.LayoutOrder = 12
-    islandNote.Size = UDim2.new(1, -4, 0, 30)
-    islandNote.TextWrapped = true
-    islandNote.TextYAlignment = Enum.TextYAlignment.Top
+---------------------------------------------------------------
+-- PESTAÑA ISLA
+---------------------------------------------------------------
+checkRow(pageIsla, "Recolectar por isla", 1, islandMode, function(v)
+    islandMode = v
+    if v then routeMode = false end
+    markDirty()
+    setStatus(v and ("Modo isla: " .. islandName(currentIsland())) or "Modo isla apagado")
+end)
 
-    ---------------------------------------------------------------
-    -- PESTAÑA RUTA
-    ---------------------------------------------------------------
-    local routeCheck = checkRow(pageRuta, "Buscar rareza en la ruta", 1,
-        function() return routeMode end,
-        function(v)
-            routeMode = v
-            if v then islandMode = false end
-            markDirty()
-            setStatus(v and "Modo ruta: busco rareza en cada isla" or "Modo ruta apagado")
-        end)
+checkRow(pageIsla, "Buscar rareza en la ruta", 2, routeMode, function(v)
+    routeMode = v
+    if v then islandMode = false end
+    markDirty()
+    setStatus(v and "Modo ruta: busco rareza en cada isla de la ruta" or "Modo ruta apagado")
+end)
 
-    local routeSelRow = arrowRow(pageRuta, 2,
-        function()
-            if #routeList == 0 then return "Ruta vacía" end
-            local e = resolveRoute()[routeSel]
-            local name = e and islandName(e.isl) or routeList[routeSel].k
-            return routeSel .. "/" .. #routeList .. ": " .. name
-        end,
-        function()
-            if #routeList == 0 then return end
-            routeSel = routeSel - 1
-            if routeSel < 1 then routeSel = #routeList end
-            if refreshUI then refreshUI() end
-        end,
-        function()
-            if #routeList == 0 then return end
-            routeSel = routeSel + 1
-            if routeSel > #routeList then routeSel = 1 end
-            if refreshUI then refreshUI() end
-        end
-    )
-
-    local routeWaitRow = numberRow(pageRuta, 3, "Tiempo aquí (s)",
-        function()
-            clampRouteSel()
-            local e = routeList[routeSel]
-            return e and e.w or 0
-        end,
-        function(v)
-            clampRouteSel()
-            local e = routeList[routeSel]
-            if not e then return end
-            e.w = math.clamp(v, 0, CONFIG.TIEMPO_ISLA_MAX)
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function() return 1 end,
-        64
-    )
-
-    local moveRow = Instance.new("Frame")
-    moveRow.Size = UDim2.new(1, -4, 0, 32)
-    moveRow.BackgroundTransparency = 1
-    moveRow.LayoutOrder = 4
-    moveRow.Parent = pageRuta
-    listLayout(moveRow, 6, true)
-
-    local upBtn = button(moveRow, "▲ Subir", UDim2.new(1 / 3, -4, 1, 0), PALETTE.card)
-    local downBtn = button(moveRow, "▼ Bajar", UDim2.new(1 / 3, -4, 1, 0), PALETTE.card)
-    local removeBtn = button(moveRow, "✕ Quitar", UDim2.new(1 / 3, -4, 1, 0), PALETTE.red)
-
-    upBtn.Activated:Connect(function()
-        clampRouteSel()
-        if routeSel > 1 then
-            routeList[routeSel], routeList[routeSel - 1] = routeList[routeSel - 1], routeList[routeSel]
-            routeSel = routeSel - 1
-            markDirty()
-            if refreshUI then refreshUI() end
-        end
-    end)
-
-    downBtn.Activated:Connect(function()
-        clampRouteSel()
-        if routeSel < #routeList then
-            routeList[routeSel], routeList[routeSel + 1] = routeList[routeSel + 1], routeList[routeSel]
-            routeSel = routeSel + 1
-            markDirty()
-            if refreshUI then refreshUI() end
-        end
-    end)
-
-    removeBtn.Activated:Connect(function()
-        clampRouteSel()
-        if #routeList > 0 then
-            table.remove(routeList, routeSel)
-            clampRouteSel()
-            markDirty()
-            setStatus("Isla quitada de la ruta")
-        end
-    end)
-
-    local clearRouteBtn = button(pageRuta, "🗑 Limpiar ruta", UDim2.new(1, -4, 0, 34), PALETTE.card)
-    clearRouteBtn.LayoutOrder = 5
-    clearRouteBtn.Activated:Connect(function()
-        routeList = {}
-        routeSel = 1
+local langRow = arrowRow(pageIsla, 3,
+    function()
+        return lang == "es" and "Idioma: Español" or "Language: English"
+    end,
+    function()
+        lang = (lang == "es") and "en" or "es"
         markDirty()
-        setStatus("Ruta limpia")
-    end)
-
-    local routeInfo = label(pageRuta, "", 10, PALETTE.muted, false)
-    routeInfo.LayoutOrder = 6
-    routeInfo.Size = UDim2.new(1, -4, 0, 60)
-    routeInfo.TextWrapped = true
-    routeInfo.TextYAlignment = Enum.TextYAlignment.Top
-
-    ---------------------------------------------------------------
-    -- PESTAÑA BÓVEDA
-    ---------------------------------------------------------------
-    local capStepper = stepperRow(pageBoveda, 1,
-        function() return "Espacio de bóveda: " .. capacity end,
-        function()
-            capacity = math.max(1, capacity - 1)
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function()
-            capacity = math.min(CONFIG.CAPACIDAD_MAX, capacity + 1)
-            markDirty()
-            if refreshUI then refreshUI() end
-        end
-    )
-
-    local vaultInfo = label(pageBoveda, "", 11, PALETTE.muted, false)
-    vaultInfo.LayoutOrder = 2
-    vaultInfo.Size = UDim2.new(1, -4, 0, 30)
-    vaultInfo.TextWrapped = true
-    vaultInfo.TextYAlignment = Enum.TextYAlignment.Top
-
-    local emptyBtn = button(pageBoveda, "🏦 Vaciar bóveda ahora", UDim2.new(1, -4, 0, 36), PALETTE.accent)
-    emptyBtn.LayoutOrder = 3
-    emptyBtn.Activated:Connect(function()
-        manualOpenRequested = true
-        setStatus("Se vaciará la bóveda en el próximo ciclo")
-    end)
-
-    ---------------------------------------------------------------
-    -- PESTAÑA FILTROS
-    ---------------------------------------------------------------
-    checkRow(pageFiltros, "Filtrar por valor (Value)", 1,
-        function() return valueFilter end,
-        function(v)
-            valueFilter = v
-            markDirty()
-            setStatus(v and ("Solo cofres con valor ≥ " .. valueMin) or "Filtro de valor apagado")
-        end)
-
-    local valueRow = numberRow(pageFiltros, 2, "Valor mín.",
-        function() return valueMin end,
-        function(v)
-            valueMin = math.max(0, v)
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function() return CONFIG.VALOR_PASO end,
-        78
-    )
-
-    checkRow(pageFiltros, "Filtrar por rareza (Rarity)", 3,
-        function() return rarityFilter end,
-        function(v)
-            rarityFilter = v
-            markDirty()
-            setStatus(v and ("Solo cofres desde " .. CONFIG.RAREZAS[rarityMinIdx]) or "Filtro de rareza apagado")
-        end)
-
-    local rarityRow = arrowRow(pageFiltros, 4,
-        function()
-            return "Mínima: " .. CONFIG.RAREZAS[rarityMinIdx] .. " (" .. rarityMinIdx .. "/" .. #CONFIG.RAREZAS .. ")"
-        end,
-        function()
-            rarityMinIdx = rarityMinIdx - 1
-            if rarityMinIdx < 1 then rarityMinIdx = #CONFIG.RAREZAS end
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function()
-            rarityMinIdx = rarityMinIdx + 1
-            if rarityMinIdx > #CONFIG.RAREZAS then rarityMinIdx = 1 end
-            markDirty()
-            if refreshUI then refreshUI() end
-        end
-    )
-
-    local filterNote = label(pageFiltros, "", 10, PALETTE.muted, false)
-    filterNote.LayoutOrder = 5
-    filterNote.Size = UDim2.new(1, -4, 0, 56)
-    filterNote.TextWrapped = true
-    filterNote.TextYAlignment = Enum.TextYAlignment.Top
-
-    ---------------------------------------------------------------
-    -- PESTAÑA PANEL
-    ---------------------------------------------------------------
-    local function currentStep()
-        return CONFIG.PANEL_PASOS[panelStepIdx]
+        refreshUI()
+    end,
+    function()
+        lang = (lang == "es") and "en" or "es"
+        markDirty()
+        refreshUI()
     end
+)
 
-    local function setPanelW(v)
-        panelW = v
-        applyPanelSize()
+local seaRow = arrowRow(pageIsla, 4,
+    function()
+        return seaName(currentSea()) .. " (" .. seaIndex .. "/" .. #SEAS .. ")"
+    end,
+    function()
+        seaIndex = seaIndex - 1
+        if seaIndex < 1 then seaIndex = #SEAS end
+        islandIndex = 1
         markDirty()
-        if refreshUI then refreshUI() end
-    end
-
-    local function setPanelH(v)
-        panelH = v
-        applyPanelSize()
+        refreshUI()
+    end,
+    function()
+        seaIndex = seaIndex + 1
+        if seaIndex > #SEAS then seaIndex = 1 end
+        islandIndex = 1
         markDirty()
-        if refreshUI then refreshUI() end
+        refreshUI()
     end
+)
 
-    local widthRow = numberRow(pagePanel, 1, "Ancho", function() return panelW end, setPanelW, currentStep, 64)
-    local heightRow = numberRow(pagePanel, 2, "Alto", function() return panelH end, setPanelH, currentStep, 64)
+local islandRow = arrowRow(pageIsla, 5,
+    function()
+        local isl = currentIsland()
+        return islandName(isl) .. " (" .. islandIndex .. "/" .. #currentSea().islas .. ")"
+    end,
+    function()
+        local count = #currentSea().islas
+        islandIndex = islandIndex - 1
+        if islandIndex < 1 then islandIndex = count end
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        local count = #currentSea().islas
+        islandIndex = islandIndex + 1
+        if islandIndex > count then islandIndex = 1 end
+        markDirty()
+        refreshUI()
+    end
+)
 
-    local stepSelector = arrowRow(pagePanel, 3,
-        function() return "Paso de − y +: " .. currentStep() .. " px" end,
-        function()
-            panelStepIdx = panelStepIdx - 1
-            if panelStepIdx < 1 then panelStepIdx = #CONFIG.PANEL_PASOS end
-            markDirty()
-            if refreshUI then refreshUI() end
-        end,
-        function()
-            panelStepIdx = panelStepIdx + 1
-            if panelStepIdx > #CONFIG.PANEL_PASOS then panelStepIdx = 1 end
-            markDirty()
-            if refreshUI then refreshUI() end
+-- Botones de ruta: isla o mar completo
+local routeButtons = Instance.new("Frame")
+routeButtons.Size = UDim2.new(1, -4, 0, 32)
+routeButtons.BackgroundTransparency = 1
+routeButtons.LayoutOrder = 6
+routeButtons.Parent = pageIsla
+listLayout(routeButtons, 6, true)
+
+local addIslandBtn = button(routeButtons, "➕ Isla", UDim2.new(0.333, -4, 1, 0), PALETTE.card)
+local addSeaBtn = button(routeButtons, "🌊 Mar completo", UDim2.new(0.333, -4, 1, 0), PALETTE.card)
+local removeBtn = button(routeButtons, "🗑 Quitar isla", UDim2.new(0.333, -4, 1, 0), PALETTE.card)
+
+addIslandBtn.Activated:Connect(function()
+    local key = routeKey(currentSea(), currentIsland())
+    if routeHas(key) then
+        setStatus("Esa isla ya está en la ruta")
+        return
+    end
+    table.insert(route, key)
+    markDirty()
+    setStatus("Agregada: " .. islandName(currentIsland()))
+end)
+
+addSeaBtn.Activated:Connect(function()
+    local added = 0
+    for _, isl in ipairs(currentSea().islas) do
+        local key = routeKey(currentSea(), isl)
+        if not routeHas(key) then
+            table.insert(route, key)
+            added += 1
         end
-    )
+    end
+    markDirty()
+    setStatus("Mar " .. seaName(currentSea()) .. ": " .. added .. " islas agregadas a la ruta")
+end)
 
-    local resetBtn = button(pagePanel, "↺ Tamaño por defecto", UDim2.new(1, -4, 0, 36), PALETTE.card)
-    resetBtn.LayoutOrder = 4
-    resetBtn.Activated:Connect(function()
-        panelW = CONFIG.PANEL_ANCHO_INICIAL
-        panelH = CONFIG.PANEL_ALTO_INICIAL
-        applyPanelSize()
+removeBtn.Activated:Connect(function()
+    local key = routeKey(currentSea(), currentIsland())
+    for i, s in ipairs(route) do
+        if s == key then
+            table.remove(route, i)
+            markDirty()
+            setStatus("Quitada: " .. islandName(currentIsland()))
+            return
+        end
+    end
+    setStatus("Esa isla no está en la ruta")
+end)
+
+local clearRow = Instance.new("Frame")
+clearRow.Size = UDim2.new(1, -4, 0, 32)
+clearRow.BackgroundTransparency = 1
+clearRow.LayoutOrder = 7
+clearRow.Parent = pageIsla
+listLayout(clearRow, 6, true)
+
+local clearRouteBtn = button(clearRow, "🧹 Limpiar ruta", UDim2.new(1, 0, 1, 0), PALETTE.card)
+clearRouteBtn.Activated:Connect(function()
+    route = {}
+    markDirty()
+    setStatus("Ruta limpia")
+end)
+
+-- Tiempo de la isla seleccionada dentro de la ruta
+local routeTimeStepper = stepperRow(pageIsla, 8,
+    function()
+        return "Tiempo en esta isla: " .. waitForKey(routeKey(currentSea(), currentIsland())) .. " s"
+    end,
+    function()
+        local key = routeKey(currentSea(), currentIsland())
+        local v = math.max(CONFIG.TIEMPO_ISLA_MIN, waitForKey(key) - CONFIG.TIEMPO_ISLA_PASO)
+        routeWait[key] = v
         markDirty()
-        if refreshUI then refreshUI() end
-    end)
-
-    local panelNote = label(pagePanel,
-        "Escribe el ancho y el alto en la caja, o usa − y +. La configuración se guarda sola.",
-        10, PALETTE.muted, false)
-    panelNote.LayoutOrder = 5
-    panelNote.Size = UDim2.new(1, -4, 0, 40)
-    panelNote.TextWrapped = true
-    panelNote.TextYAlignment = Enum.TextYAlignment.Top
-
-    ---------------------------------------------------------------
-    -- Modo de viaje, minimizar y cerrar
-    ---------------------------------------------------------------
-    tpBtn.Activated:Connect(function()
-        mode = "TP"
+        refreshUI()
+    end,
+    function()
+        local key = routeKey(currentSea(), currentIsland())
+        local v = math.min(CONFIG.TIEMPO_ISLA_MAX, waitForKey(key) + CONFIG.TIEMPO_ISLA_PASO)
+        routeWait[key] = v
         markDirty()
-        if refreshUI then refreshUI() end
-    end)
+        refreshUI()
+    end
+)
 
-    glideBtn.Activated:Connect(function()
-        mode = "DESLIZAR"
+-- Tiempo por defecto para islas sin tiempo propio
+local defaultTimeStepper = stepperRow(pageIsla, 9,
+    function()
+        return "Tiempo por defecto: " .. routeDefaultWait .. " s"
+    end,
+    function()
+        routeDefaultWait = math.max(CONFIG.TIEMPO_ISLA_MIN, routeDefaultWait - CONFIG.TIEMPO_ISLA_PASO)
         markDirty()
-        if refreshUI then refreshUI() end
-    end)
+        refreshUI()
+    end,
+    function()
+        routeDefaultWait = math.min(CONFIG.TIEMPO_ISLA_MAX, routeDefaultWait + CONFIG.TIEMPO_ISLA_PASO)
+        markDirty()
+        refreshUI()
+    end
+)
 
-    local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
-    mini.TextSize = 20
-    mini.Visible = false
-    stroke(mini, PALETTE.accent, 1, 0.3)
-    makeDraggable(mini, mini)
+local routeNote = label(pageIsla, "", 10, PALETTE.muted, false)
+routeNote.LayoutOrder = 10
+routeNote.Size = UDim2.new(1, -4, 0, 70)
+routeNote.TextWrapped = true
+routeNote.TextYAlignment = Enum.TextYAlignment.Top
 
-    minBtn.Activated:Connect(function()
-        main.Visible = false
-        mini.Position = UDim2.fromOffset(main.AbsolutePosition.X, main.AbsolutePosition.Y)
-        mini.Visible = true
-    end)
+local islandNote = label(pageIsla, "", 10, PALETTE.muted, false)
+islandNote.LayoutOrder = 11
+islandNote.Size = UDim2.new(1, -4, 0, 30)
+islandNote.TextWrapped = true
+islandNote.TextYAlignment = Enum.TextYAlignment.Top
 
-    mini.Activated:Connect(function()
-        mini.Visible = false
-        main.Visible = true
-    end)
+---------------------------------------------------------------
+-- PESTAÑA BÓVEDA
+---------------------------------------------------------------
+local capStepper = stepperRow(pageBoveda, 1,
+    function() return "Espacio de bóveda: " .. capacity end,
+    function()
+        capacity = math.max(1, capacity - 1)
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        capacity = math.min(CONFIG.CAPACIDAD_MAX, capacity + 1)
+        markDirty()
+        refreshUI()
+    end
+)
 
-    closeBtn.Activated:Connect(function()
-        closed = true
-        auto = false
-        saveConfig()
-        gui:Destroy()
-    end)
+local vaultInfo = label(pageBoveda, "", 11, PALETTE.muted, false)
+vaultInfo.LayoutOrder = 2
+vaultInfo.Size = UDim2.new(1, -4, 0, 30)
+vaultInfo.TextWrapped = true
+vaultInfo.TextYAlignment = Enum.TextYAlignment.Top
 
-    makeDraggable(header, main)
+local emptyBtn = button(pageBoveda, "🏦 Vaciar bóveda ahora", UDim2.new(1, -4, 0, 36), PALETTE.accent)
+emptyBtn.LayoutOrder = 3
+emptyBtn.Activated:Connect(function()
+    manualOpenRequested = true
+    setStatus("Se vaciará la bóveda en el próximo ciclo")
+end)
+
+---------------------------------------------------------------
+-- PESTAÑA FILTROS
+---------------------------------------------------------------
+checkRow(pageFiltros, "Filtrar por valor (Value)", 1, valueFilter, function(v)
+    valueFilter = v
+    markDirty()
+    setStatus(v and ("Solo cofres con valor ≥ " .. valueMin) or "Filtro de valor apagado")
+end)
+
+local valueRow = numberRow(pageFiltros, 2, "Valor mín.",
+    function() return valueMin end,
+    function(v)
+        valueMin = math.max(0, v)
+        markDirty()
+        refreshUI()
+    end,
+    function() return CONFIG.VALOR_PASO end,
+    78
+)
+
+checkRow(pageFiltros, "Filtrar por rareza (Rarity)", 3, rarityFilter, function(v)
+    rarityFilter = v
+    markDirty()
+    setStatus(v and ("Solo cofres desde " .. CONFIG.RAREZAS[rarityMinIdx]) or "Filtro de rareza apagado")
+end)
+
+local rarityRow = arrowRow(pageFiltros, 4,
+    function()
+        return "Mínima: " .. CONFIG.RAREZAS[rarityMinIdx] .. " (" .. rarityMinIdx .. "/" .. #CONFIG.RAREZAS .. ")"
+    end,
+    function()
+        rarityMinIdx = rarityMinIdx - 1
+        if rarityMinIdx < 1 then rarityMinIdx = #CONFIG.RAREZAS end
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        rarityMinIdx = rarityMinIdx + 1
+        if rarityMinIdx > #CONFIG.RAREZAS then rarityMinIdx = 1 end
+        markDirty()
+        refreshUI()
+    end
+)
+
+local filterNote = label(pageFiltros, "", 10, PALETTE.muted, false)
+filterNote.LayoutOrder = 5
+filterNote.Size = UDim2.new(1, -4, 0, 56)
+filterNote.TextWrapped = true
+filterNote.TextYAlignment = Enum.TextYAlignment.Top
+
+---------------------------------------------------------------
+-- PESTAÑA PANEL
+---------------------------------------------------------------
+local function currentStep()
+    return CONFIG.PANEL_PASOS[panelStepIdx]
+end
+
+local function setPanelW(v)
+    panelW = v
     applyPanelSize()
-    camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() end)
-
-    ---------------------------------------------------------------
-    -- ACTUALIZAR UI
-    ---------------------------------------------------------------
-    refreshUI = function()
-        local used = usedSpace()
-        subtitle.Text = statusText
-        countLabel.Text = tostring(collectedCount)
-        vaultLabel.Text = used .. "/" .. capacity
-        barFill.Size = UDim2.new(math.clamp(used / math.max(capacity, 1), 0, 1), 0, 1, 0)
-
-        tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
-        glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
-
-        for _, c in ipairs(checks) do
-            c.refresh()
-        end
-
-        destRow.refresh()
-        local m = shipMemory[targetLabel]
-        if targetLabel == MINE_LABEL then
-            destNote.Text = "Los cofres se guardan en tu barco."
-        elseif m then
-            local estado = (m.ship and m.ship.Parent) and "cargado" or "recordado (se cargará al ir)"
-            destNote.Text = "Barco: " .. (m.shipName or "?") .. " · " .. estado
-        else
-            destNote.Text = "Aún no he visto este barco en esta sesión."
-        end
-        waitStepper.refresh()
-
-        -- Mares
-        langRow.refresh()
-        for i, b in ipairs(seaButtons) do
-            b.Text = seaName(SEAS[i])
-            b.BackgroundColor3 = (i == seaIndex) and PALETTE.accent or PALETTE.card
-        end
-        if builtSeaIndex ~= seaIndex then
-            rebuildIslandRows()
-        end
-        islandHeader.Text = seaName(currentSea()) .. " · elige una isla"
-        for _, e in ipairs(islandRowEntries) do
-            local selected = (e.i == islandIndex)
-            e.btn.BackgroundColor3 = selected and PALETTE.accent or PALETTE.track
-        end
-        islandNote.Text = "Seleccionada: " .. islandName(currentIsland())
-            .. (islandMode and " (modo isla activo)." or ". Activa 'Recolectar por isla' para trabajar solo ahí.")
-
-        -- Ruta
-        clampRouteSel()
-        routeSelRow.refresh()
-        routeWaitRow.refresh()
-        local entries = resolveRoute()
-        local names, totalSec = {}, 0
-        for _, e in ipairs(entries) do
-            table.insert(names, islandName(e.isl) .. " (" .. e.wait .. "s)")
-            totalSec += e.wait
-        end
-        routeInfo.Text = "Orden: " .. (#names > 0 and table.concat(names, " → ") or "vacía")
-            .. "\nTiempo total aprox.: " .. math.floor(totalSec / 60) .. " min " .. (totalSec % 60) .. " s"
-
-        -- Bóveda
-        capStepper.refresh()
-        vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
-
-        -- Filtros
-        valueRow.refresh()
-        rarityRow.refresh()
-        filterNote.Text = "Valor: recoge cofres con Value ≥ " .. valueMin
-            .. (valueFilter and " (activo)" or " (apagado)")
-            .. ". Rareza: desde " .. CONFIG.RAREZAS[rarityMinIdx]
-            .. (rarityFilter and " (activo)" or " (apagado)")
-            .. ". En modo ruta, la rareza siempre se aplica."
-
-        -- Panel
-        widthRow.refresh()
-        heightRow.refresh()
-        stepSelector.refresh()
-    end
-
-    showTab(1)
-
-    task.spawn(function()
-        while not closed do
-            if dirty then
-                dirty = false
-                saveConfig()
-            end
-
-            if manualOpenRequested then
-                manualOpenRequested = false
-                pcall(openVault)
-            elseif auto then
-                local ok, err = pcall(collectCycle)
-                if not ok then
-                    setStatus("Error: " .. tostring(err))
-                end
-            end
-            if refreshUI then refreshUI() end
-            task.wait(1)
-        end
-    end)
-
+    markDirty()
     refreshUI()
 end
+
+local function setPanelH(v)
+    panelH = v
+    applyPanelSize()
+    markDirty()
+    refreshUI()
+end
+
+local widthRow = numberRow(pagePanel, 1, "Ancho",
+    function() return panelW end,
+    setPanelW,
+    currentStep,
+    64
+)
+
+local heightRow = numberRow(pagePanel, 2, "Alto",
+    function() return panelH end,
+    setPanelH,
+    currentStep,
+    64
+)
+
+local stepSelector = arrowRow(pagePanel, 3,
+    function() return "Paso de − y +: " .. currentStep() .. " px" end,
+    function()
+        panelStepIdx = panelStepIdx - 1
+        if panelStepIdx < 1 then panelStepIdx = #CONFIG.PANEL_PASOS end
+        markDirty()
+        refreshUI()
+    end,
+    function()
+        panelStepIdx = panelStepIdx + 1
+        if panelStepIdx > #CONFIG.PANEL_PASOS then panelStepIdx = 1 end
+        markDirty()
+        refreshUI()
+    end
+)
+
+local resetBtn = button(pagePanel, "↺ Tamaño por defecto", UDim2.new(1, -4, 0, 36), PALETTE.card)
+resetBtn.LayoutOrder = 4
+resetBtn.Activated:Connect(function()
+    panelW = CONFIG.PANEL_ANCHO_INICIAL
+    panelH = CONFIG.PANEL_ALTO_INICIAL
+    applyPanelSize()
+    markDirty()
+    refreshUI()
+end)
+
+local panelNote = label(pagePanel,
+    "Escribe el ancho y el alto en la caja, o usa − y +. La configuración se guarda sola.",
+    10, PALETTE.muted, false)
+panelNote.LayoutOrder = 5
+panelNote.Size = UDim2.new(1, -4, 0, 40)
+panelNote.TextWrapped = true
+panelNote.TextYAlignment = Enum.TextYAlignment.Top
+
+local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
+mini.TextSize = 20
+mini.Visible = false
+stroke(mini, PALETTE.accent, 1, 0.3)
+makeDraggable(mini, mini)
+
+makeDraggable(header, main)
+
+applyPanelSize()
+
+---------------------------------------------------------------
+-- ACTUALIZAR UI
+---------------------------------------------------------------
+refreshUI = function()
+    local used = usedSpace()
+    subtitle.Text = statusText
+    countLabel.Text = tostring(collectedCount)
+    vaultLabel.Text = used .. "/" .. capacity
+    barFill.Size = UDim2.new(math.clamp(used / math.max(capacity, 1), 0, 1), 0, 1, 0)
+
+    tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
+    glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
+
+    destRow.refresh()
+    local m = shipMemory[targetLabel]
+    if targetLabel == MINE_LABEL then
+        destNote.Text = "Los cofres se guardan en tu barco."
+    elseif m then
+        local estado = (m.ship and m.ship.Parent) and "cargado" or "recordado (se cargará al ir)"
+        destNote.Text = "Barco: " .. (m.shipName or "?") .. " · " .. estado
+    else
+        destNote.Text = "Aún no he visto este barco en esta sesión."
+    end
+
+    waitStepper.refresh()
+
+    langRow.refresh()
+    seaRow.refresh()
+    islandRow.refresh()
+    routeTimeStepper.refresh()
+    defaultTimeStepper.refresh()
+
+    local entries = resolveRoute()
+    local parts = {}
+    for _, e in ipairs(entries) do
+        table.insert(parts, islandName(e.isl) .. " (" .. waitForKey(e.key) .. " s)")
+    end
+    routeNote.Text = "Ruta (" .. #entries .. " islas): "
+        .. (#parts > 0 and table.concat(parts, " → ") or "vacía")
+
+    islandNote.Text = islandMode
+        and ("Irá a " .. islandName(currentIsland()) .. " y solo recogerá cofres de esa isla.")
+        or (routeMode and "Recorrerá la ruta en orden; en cada isla se queda el tiempo indicado buscando la rareza."
+            or "Activa una de las dos opciones de arriba para trabajar por isla.")
+
+    capStepper.refresh()
+    vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
+
+    valueRow.refresh()
+    rarityRow.refresh()
+    filterNote.Text = "Valor: recoge cofres con Value ≥ " .. valueMin
+        .. (valueFilter and " (activo)" or " (apagado)")
+        .. ". Rareza: desde " .. CONFIG.RAREZAS[rarityMinIdx]
+        .. (rarityFilter and " (activo)" or " (apagado)")
+        .. ". En modo ruta, la rareza siempre se aplica."
+
+    widthRow.refresh()
+    heightRow.refresh()
+    stepSelector.refresh()
+end
+
+tpBtn.Activated:Connect(function()
+    mode = "TP"
+    markDirty()
+    refreshUI()
+end)
+
+glideBtn.Activated:Connect(function()
+    mode = "DESLIZAR"
+    markDirty()
+    refreshUI()
+end)
+
+minBtn.Activated:Connect(function()
+    main.Visible = false
+    mini.Position = UDim2.fromOffset(main.AbsolutePosition.X, main.AbsolutePosition.Y)
+    mini.Visible = true
+end)
+
+mini.Activated:Connect(function()
+    mini.Visible = false
+    main.Visible = true
+end)
+
+closeBtn.Activated:Connect(function()
+    closed = true
+    auto = false
+    saveConfig()
+    gui:Destroy()
+end)
+
+showTab(1)
+
+task.spawn(function()
+    while not closed do
+        if dirty then
+            dirty = false
+            saveConfig()
+        end
+
+        if manualOpenRequested then
+            manualOpenRequested = false
+            pcall(openVault)
+        elseif auto then
+            local ok, err = pcall(collectCycle)
+            if not ok then
+                setStatus("Error: " .. tostring(err))
+            end
+        end
+        refreshUI()
+        task.wait(1)
+    end
+end)
+
+refreshUI()
