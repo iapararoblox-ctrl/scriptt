@@ -1,5 +1,5 @@
 -- Caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
--- Altura y lado por boss, botín de World.Dynamic.Loot llevado al barco
+-- Botín de World.Dynamic.Loot llevado al barco con el mismo flujo que el script de cofres
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -18,10 +18,10 @@ local CONFIG = {
     ESPERA_CARGA_BOSS = 20,
     ESPERA_ATAQUE = 0.15,
     ESPERA_RESPAWN = 3,
-    ESPERA_BOTIN = 12,          -- segundos máximos esperando que aparezca el botín
+    ESPERA_BOTIN = 12,
     CAPACIDAD = 81,
     ALTURA_COFRE = 3,
-    ALTURA_BARCO = 3,
+    ALTURA_BARCO = 0,
     ESPERA_POSICION = 0.25,
     ESPERA_RECOGER = 0.3,
     INTENTOS_RECOGER = 2,
@@ -53,9 +53,10 @@ local kills = 0
 local botinRecogido = 0
 local statusText = "Listo"
 local objetivoCF = nil
+local cachedShip = nil
 
 ---------------------------------------------------------------
--- AJUSTES (altura y lado por boss, botón de botín), guardados en archivo
+-- AJUSTES (altura y lado por boss, botón de botín) guardados en archivo
 ---------------------------------------------------------------
 local ajustes = {}
 pcall(function()
@@ -183,10 +184,17 @@ local function getIsla(nombre)
     return nil
 end
 
+local function islandTop(island)
+    if island:IsA("Model") then
+        local cf, size = island:GetBoundingBox()
+        return cf.Position + Vector3.new(0, size.Y / 2 + 5, 0)
+    end
+    return island.Position + Vector3.new(0, island.Size.Y / 2 + 5, 0)
+end
+
 ---------------------------------------------------------------
 -- BOSS
 ---------------------------------------------------------------
--- Centro de las piezas de la carpeta del boss (o centro del modelo si no hay piezas)
 local function posicionBoss(b)
     local boss = getPath(b.ruta)
     if not boss then return nil, nil end
@@ -211,7 +219,6 @@ local function posicionBoss(b)
     return suma / n, boss
 end
 
--- true si el boss murió (o ya no existe en el Workspace)
 local function bossMuerto(ref)
     if not ref or not ref.Parent then return true end
     local hum = ref:FindFirstChildWhichIsA("Humanoid", true)
@@ -222,36 +229,73 @@ local function bossMuerto(ref)
 end
 
 ---------------------------------------------------------------
--- BARCO Y BÓVEDA
+-- BARCO (misma lógica que el script de cofres)
 ---------------------------------------------------------------
-local function esMiBarco(ship)
-    local nombre, id = LocalPlayer.Name, tostring(LocalPlayer.UserId)
+local function isMyShip(ship)
+    local name = LocalPlayer.Name
+    local displayName = LocalPlayer.DisplayName
+    local userId = tostring(LocalPlayer.UserId)
+
     for _, attr in ipairs({ "Owner", "OwnerName", "OwnerId", "Player", "PlayerName", "UserId" }) do
         local v = ship:GetAttribute(attr)
         if v ~= nil then
             local s = tostring(v)
-            if s == nombre or s == LocalPlayer.DisplayName or s == id then return true end
+            if s == name or s == displayName or s == userId then
+                return true
+            end
         end
     end
-    return ship.Name == nombre or ship.Name:find(id, 1, true) ~= nil
+
+    for _, d in ipairs(ship:GetDescendants()) do
+        if d:IsA("ObjectValue") and d.Value == LocalPlayer then
+            return true
+        elseif d:IsA("StringValue") and (d.Value == name or d.Value == userId) then
+            return true
+        elseif (d:IsA("IntValue") or d:IsA("NumberValue")) and tostring(d.Value) == userId then
+            return true
+        end
+    end
+
+    if ship.Name == name or ship.Name == displayName then
+        return true
+    end
+    if ship.Name:find(userId, 1, true) then
+        return true
+    end
+    return false
 end
 
-local function miBarco()
+local function getMyShip()
+    if cachedShip and cachedShip.Parent then
+        return cachedShip
+    end
+    cachedShip = nil
+
     local ships = getPath({ "World", "Dynamic", "Ships" })
     if not ships then return nil end
-    for _, s in ipairs(ships:GetChildren()) do
-        if s:IsA("Folder") then
-            for _, d in ipairs(s:GetChildren()) do
-                if (d:IsA("Model") or d:IsA("BasePart")) and esMiBarco(d) then return d end
+
+    for _, child in ipairs(ships:GetChildren()) do
+        local candidates = {}
+        if child:IsA("Model") or child:IsA("BasePart") then
+            table.insert(candidates, child)
+        elseif child:IsA("Folder") then
+            for _, d in ipairs(child:GetChildren()) do
+                if d:IsA("Model") or d:IsA("BasePart") then
+                    table.insert(candidates, d)
+                end
             end
-        elseif (s:IsA("Model") or s:IsA("BasePart")) and esMiBarco(s) then
-            return s
+        end
+        for _, c in ipairs(candidates) do
+            if isMyShip(c) then
+                cachedShip = c
+                return c
+            end
         end
     end
     return nil
 end
 
-local function getCargoSize(obj)
+local function getChestSize(obj)
     local v = obj:GetAttribute("CargoSize")
     if v == nil then
         local child = obj:FindFirstChild("CargoSize")
@@ -261,11 +305,12 @@ local function getCargoSize(obj)
 end
 
 local function usedSpaceOn(barco)
+    if not barco then return 0 end
     local total = 0
     local cargo = barco:FindFirstChild("CargoVisuals")
     if cargo then
         for _, c in ipairs(cargo:GetChildren()) do
-            if c:IsA("Model") then total += getCargoSize(c) end
+            if c:IsA("Model") then total += getChestSize(c) end
         end
     end
     return total
@@ -305,10 +350,9 @@ local function listaBotin(loot)
     return lista
 end
 
--- Espera a que el botín aparezca tras la muerte del boss
 local function esperarBotin(loot)
     local t0 = os.clock()
-    while not closed and os.clock() - t0 < CONFIG.ESPERA_BOTIN do
+    while not closed and cazando and os.clock() - t0 < CONFIG.ESPERA_BOTIN do
         local lista = listaBotin(loot)
         if #lista > 0 then return lista end
         task.wait(0.5)
@@ -323,7 +367,7 @@ local function recogerBotin()
         return
     end
 
-    local barco = miBarco()
+    local barco = getMyShip()
     if not barco then
         setStatus("No encuentro tu barco")
         return
@@ -343,22 +387,20 @@ local function recogerBotin()
         local item, prompt = entry.item, entry.prompt
 
         if prompt:IsDescendantOf(Workspace) then
-            local size = getCargoSize(item)
+            local size = getChestSize(item)
             if usedSpaceOn(barco) + size > CONFIG.CAPACIDAD then
                 setStatus("Bóveda llena: vacíala para seguir")
                 break
             end
 
             local padre = prompt.Parent
-            local anchorPos
-            if padre and padre:IsA("Attachment") then
-                anchorPos = padre.WorldPosition
-            else
-                anchorPos = posOf(item)
-            end
+            local anchorPos = (padre and padre:IsA("Attachment")) and padre.WorldPosition or posOf(item)
 
             if anchorPos then
-                -- 1) Ir encima del botín y activar el prompt
+                -- Igual que el script de cofres: usedBefore se toma antes de recoger
+                local usedBefore = usedSpaceOn(barco)
+
+                -- 1) Ir al botín y activar el prompt
                 setStatus("Recogiendo " .. item.Name .. "...")
                 tpTo(CFrame.new(anchorPos + Vector3.new(0, CONFIG.ALTURA_COFRE, 0)))
 
@@ -377,34 +419,41 @@ local function recogerBotin()
                     if not prompt:IsDescendantOf(Workspace) then break end
                 end
 
-                -- 2) Llevarlo al barco y confirmar en la bóveda
-                local antes = usedSpaceOn(barco)
-                setStatus("Llevando " .. item.Name .. " al barco...")
+                -- 2) Apagar el flotar y llevarlo al barco
+                setHover(false)
+                setStatus("Guardando " .. item.Name .. " en tu barco...")
                 tpTo(CFrame.new(getShipTop(barco)))
 
                 local t1 = os.clock()
-                while os.clock() - t1 < CONFIG.ESPERA_GUARDADO and usedSpaceOn(barco) <= antes do
+                local guardado = false
+                while os.clock() - t1 < CONFIG.ESPERA_GUARDADO do
+                    if usedSpaceOn(barco) > usedBefore then
+                        guardado = true
+                        break
+                    end
                     task.wait(0.25)
                 end
 
-                recogidos += 1
-                botinRecogido += 1
-                if usedSpaceOn(barco) <= antes then
-                    setStatus(item.Name .. " sin confirmar en bóveda")
+                if guardado then
+                    recogidos += 1
+                    botinRecogido += 1
+                else
+                    setStatus("El botín no se guardó: revisa que estés sobre el barco")
                     task.wait(0.5)
                 end
+                setHover(true)
             end
         end
     end
 
-    setStatus("Botín recogido: " .. recogidos)
+    setStatus("Botín guardado: " .. recogidos)
 end
 
 ---------------------------------------------------------------
 -- CAZA
 ---------------------------------------------------------------
 local function cazar(b)
-    -- 1) TP a la isla y quedarse flotando
+    -- 1) TP a la isla
     setStatus("TP a " .. b.isla .. " (" .. b.mar .. ")...")
     local isla = getIsla(b.isla)
     if not isla then
@@ -434,7 +483,7 @@ local function cazar(b)
         return
     end
 
-    -- 3) Atacar. Guarda la referencia: si el boss se borra al morir, también cuenta como muerte
+    -- 3) Atacar
     local murio = false
     while not closed and cazando do
         local p, bo = posicionBoss(b)
@@ -462,13 +511,20 @@ local function cazar(b)
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
-    -- Soltar al boss; el personaje se queda flotando en su lugar
+    -- 4) Soltar al boss y alejarse de él
     objetivoCF = nil
 
-    -- 4) Boss muerto: recoger botín
     if murio and cazando and not closed then
         kills += 1
         setStatus(b.nombre .. " derrotado (" .. kills .. ")")
+
+        -- Subir a la parte alta de la isla para despegarse del boss
+        local isla2 = getIsla(b.isla)
+        if isla2 then
+            tpTo(CFrame.new(islandTop(isla2) + Vector3.new(0, 10, 0)))
+        end
+        setHover(true)
+
         if botinActivo() then
             task.wait(1)
             recogerBotin()
