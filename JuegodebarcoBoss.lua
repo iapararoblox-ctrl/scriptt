@@ -1,5 +1,5 @@
 -- Caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
--- Parche: seguimiento desconectable (startFollow/stopFollow), más tiempos de botín
+-- Detección de muerte por varias señales + botín por fuerza bruta
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -18,12 +18,12 @@ local CONFIG = {
     ESPERA_CARGA_BOSS = 20,
     ESPERA_ATAQUE = 0.15,
     ESPERA_RESPAWN = 3,
-    ESPERA_INICIAL_BOTIN = 8,   -- segundos tras morir el boss antes de buscar botín
-    ESPERA_BARCO = 3,           -- segundos encima del barco para que se guarde
+    ESPERA_INICIAL_BOTIN = 8,
+    ESPERA_BARCO = 3,
     ALTURA_BOTIN = 3,
     ALTURA_BARCO = 0,
     INTENTOS_PROMPT = 5,
-    MAX_INTENTOS_BOTIN = 5,     -- si un botín no desaparece tras esto, se salta
+    MAX_INTENTOS_BOTIN = 5,
     DEBUG = true,
 }
 
@@ -232,15 +232,6 @@ local function posicionBoss(b)
     return suma / n, boss
 end
 
-local function bossMuerto(ref)
-    if not ref or not ref.Parent then return true end
-    local hum = ref:FindFirstChildWhichIsA("Humanoid", true)
-    if hum and hum.Health <= 0 then return true end
-    local hp = ref:GetAttribute("Health")
-    if type(hp) == "number" and hp <= 0 then return true end
-    return false
-end
-
 ---------------------------------------------------------------
 -- BARCO
 ---------------------------------------------------------------
@@ -319,7 +310,7 @@ local function getShipTop(barco)
 end
 
 ---------------------------------------------------------------
--- BOTÍN: fuerza bruta
+-- BOTÍN
 -- Loot > Treasure_xxx > Base > PromptAttachment > TreasurePrompt
 ---------------------------------------------------------------
 local function findPrompt(item)
@@ -331,6 +322,14 @@ local function findPrompt(item)
         if d:IsA("ProximityPrompt") then return d end
     end
     return nil
+end
+
+local function listaBotin(loot)
+    local lista = {}
+    for _, c in ipairs(loot:GetChildren()) do
+        if findPrompt(c) then table.insert(lista, c) end
+    end
+    return lista
 end
 
 local function recogerBotin()
@@ -372,7 +371,6 @@ local function recogerBotin()
             intentosPorItem[item] = (intentosPorItem[item] or 0) + 1
             setStatus("Botín: " .. item.Name .. " (" .. intentosPorItem[item] .. ")")
 
-            -- 1) TP encima del botín y activar el prompt varias veces
             local att = prompt.Parent
             local pos = (att and att:IsA("Attachment")) and att.WorldPosition or posOf(item)
             if pos then
@@ -388,7 +386,6 @@ local function recogerBotin()
                 end
             end
 
-            -- 2) TP encima del barco y esperar a que se guarde
             tpTo(CFrame.new(getShipTop(barco)))
             task.wait(CONFIG.ESPERA_BARCO)
 
@@ -401,6 +398,44 @@ local function recogerBotin()
 
     setHover(true)
     setStatus("Botín procesado: " .. recogidos)
+end
+
+---------------------------------------------------------------
+-- DETECCIÓN DE MUERTE (varias señales; devuelve el motivo o nil)
+---------------------------------------------------------------
+local function motivoMuerte(b, ref, lootAntes, teniaParte)
+    if not ref or not ref.Parent then
+        return "el boss desapareció del Workspace"
+    end
+
+    local hum = ref:FindFirstChildWhichIsA("Humanoid", true)
+    if hum and hum.Health <= 0 then
+        return "Humanoid.Health = 0"
+    end
+
+    for _, attr in ipairs({ "Health", "HP", "Hp" }) do
+        local v = ref:GetAttribute(attr)
+        if type(v) == "number" and v <= 0 then
+            return "atributo " .. attr .. " = 0"
+        end
+    end
+
+    for _, attr in ipairs({ "Dead", "IsDead", "Died" }) do
+        if ref:GetAttribute(attr) == true then
+            return "atributo " .. attr
+        end
+    end
+
+    if teniaParte and not ref:FindFirstChild(b.parte) then
+        return "la carpeta " .. b.parte .. " ya no existe"
+    end
+
+    local loot = getPath({ "World", "Dynamic", "Loot" })
+    if loot and #listaBotin(loot) > lootAntes then
+        return "apareció botín nuevo en Loot"
+    end
+
+    return nil
 end
 
 ---------------------------------------------------------------
@@ -419,12 +454,12 @@ local function cazar(b)
     setHover(true)
     task.wait(CONFIG.ESPERA_STREAMING)
 
-    -- 2) Esperar al boss
+    -- 2) Esperar al boss vivo
     local ref
     local t0 = os.clock()
     while not closed and cazando and os.clock() - t0 < CONFIG.ESPERA_CARGA_BOSS do
         local p, bo = posicionBoss(b)
-        if p and not bossMuerto(bo) then
+        if p and bo and not motivoMuerte(b, bo, math.huge, false) then
             ref = bo
             break
         end
@@ -437,14 +472,21 @@ local function cazar(b)
         return
     end
 
-    -- 3) Atacar
+    -- 3) Atacar y vigilar la muerte
+    local lootRef = getPath({ "World", "Dynamic", "Loot" })
+    local lootAntes = lootRef and #listaBotin(lootRef) or 0
+    local teniaParte = ref:FindFirstChild(b.parte) ~= nil
+    local motivo = nil
+
     startFollow()
-    local murio = false
     while not closed and cazando do
         local p, bo = posicionBoss(b)
         if bo then ref = bo end
-        if not p or bossMuerto(ref) then
-            murio = true
+
+        motivo = motivoMuerte(b, ref, lootAntes, teniaParte)
+        if motivo then break end
+        if not p then
+            motivo = "no encuentro la ruta del boss"
             break
         end
 
@@ -466,12 +508,13 @@ local function cazar(b)
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
-    -- 4) Boss muerto: soltar al personaje primero
+    -- 4) Soltar al personaje del boss
     stopFollow()
 
-    if murio and cazando and not closed then
+    if motivo and cazando and not closed then
         kills += 1
-        setStatus(b.nombre .. " derrotado (" .. kills .. ")")
+        setStatus(b.nombre .. " derrotado (" .. motivo .. ")")
+        print("[BOSS] " .. b.nombre .. " derrotado. Motivo: " .. motivo)
 
         local isla2 = getIsla(b.isla)
         if isla2 then
@@ -530,134 +573,4 @@ local function construirUI()
         Active = true,
         Draggable = true,
     }, gui)
-    mk("UICorner", { CornerRadius = UDim.new(0, 8) }, main)
-
-    mk("TextLabel", {
-        Size = UDim2.new(1, -28, 0, 14), Position = UDim2.new(0, 6, 0, 4),
-        BackgroundTransparency = 1, Text = "Bosses", TextColor3 = TEXT,
-        TextSize = 11, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-    }, main)
-
-    statusLbl = mk("TextLabel", {
-        Size = UDim2.new(1, -12, 0, 12), Position = UDim2.new(0, 6, 0, 18),
-        BackgroundTransparency = 1, TextColor3 = MUTED, TextSize = 8,
-        Font = Enum.Font.Gotham, TextTruncate = Enum.TextTruncate.AtEnd,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }, main)
-
-    local function boton(pos, size, color, textSize, onClick)
-        local b = mk("TextButton", {
-            Position = pos, Size = size, BackgroundColor3 = color,
-            TextColor3 = TEXT, TextSize = textSize, Font = Enum.Font.GothamBold, BorderSizePixel = 0,
-        }, main)
-        mk("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
-        b.Activated:Connect(onClick)
-        return b
-    end
-
-    local function fila(y, onMinus, onPlus, txtMinus, txtPlus)
-        boton(UDim2.new(0, 6, 0, y), UDim2.fromOffset(34, 20), CARD, 10, onMinus).Text = txtMinus
-        boton(UDim2.new(1, -40, 0, y), UDim2.fromOffset(34, 20), CARD, 10, onPlus).Text = txtPlus
-        return mk("TextLabel", {
-            Position = UDim2.new(0, 42, 0, y), Size = UDim2.new(1, -84, 0, 20),
-            BackgroundTransparency = 1, TextColor3 = TEXT, TextSize = 9,
-            Font = Enum.Font.GothamBold, Text = "",
-        }, main)
-    end
-
-    bossBtn = boton(UDim2.new(0, 6, 0, 34), UDim2.new(1, -12, 0, 22), CARD, 9, function()
-        bossIndex = bossIndex % #BOSSES + 1
-    end)
-
-    toggleBtn = boton(UDim2.new(0, 6, 0, 60), UDim2.new(1, -12, 0, 26), GREEN, 10, function()
-        cazando = not cazando
-        if not cazando then
-            stopFollow()
-            setHover(false)
-            setStatus("Caza detenida")
-        end
-    end)
-
-    alturaLbl = fila(90,
-        function()
-            local a = ajusteDe(BOSSES[bossIndex])
-            a.altura = math.max(CONFIG.ALTURA_MIN, a.altura - CONFIG.PASO)
-            guardarAjustes()
-        end,
-        function()
-            local a = ajusteDe(BOSSES[bossIndex])
-            a.altura = math.min(CONFIG.ALTURA_MAX, a.altura + CONFIG.PASO)
-            guardarAjustes()
-        end,
-        "▼", "▲")
-
-    ladoLbl = fila(114,
-        function()
-            local a = ajusteDe(BOSSES[bossIndex])
-            a.lado = math.max(CONFIG.LADO_MIN, a.lado - CONFIG.PASO)
-            guardarAjustes()
-        end,
-        function()
-            local a = ajusteDe(BOSSES[bossIndex])
-            a.lado = math.min(CONFIG.LADO_MAX, a.lado + CONFIG.PASO)
-            guardarAjustes()
-        end,
-        "◀", "▶")
-
-    botinBtn = boton(UDim2.new(0, 6, 0, 138), UDim2.new(1, -12, 0, 20), CARD, 9, function()
-        ajustes._botin = not botinActivo()
-        guardarAjustes()
-    end)
-
-    killsLbl = mk("TextLabel", {
-        Size = UDim2.new(1, -12, 0, 12), Position = UDim2.new(0, 6, 0, 162),
-        BackgroundTransparency = 1, TextColor3 = TEXT, TextSize = 8, Font = Enum.Font.Gotham,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }, main)
-
-    local closeBtn = boton(UDim2.new(1, -20, 0, 3), UDim2.fromOffset(17, 17), RED, 9, function()
-        closed = true
-        cazando = false
-        stopFollow()
-        setHover(false)
-        gui:Destroy()
-    end)
-    closeBtn.Text = "✕"
-end
-
-local okUI, errUI = pcall(construirUI)
-if not okUI then
-    warn("[BOSS] No se pudo crear la UI: " .. tostring(errUI))
-end
-
----------------------------------------------------------------
--- BUCLE PRINCIPAL
----------------------------------------------------------------
-task.spawn(function()
-    while not closed do
-        local b = BOSSES[bossIndex]
-        if bossBtn then
-            local a = ajusteDe(b)
-            bossBtn.Text = b.nombre
-            toggleBtn.Text = cazando and "■ Parar" or "▶ Cazar"
-            toggleBtn.BackgroundColor3 = cazando and RED or GREEN
-            alturaLbl.Text = "Altura: " .. a.altura
-            ladoLbl.Text = "Lado: " .. a.lado
-            botinBtn.Text = "Botín: " .. (botinActivo() and "ON" or "OFF")
-            botinBtn.BackgroundColor3 = botinActivo() and GREEN or CARD
-            statusLbl.Text = statusText
-            killsLbl.Text = "Derrotados: " .. kills .. " · Botín: " .. botinRecogido
-        end
-
-        if cazando then
-            local ok, err = pcall(cazar, b)
-            if not ok then
-                stopFollow()
-                setStatus("Error: " .. tostring(err))
-                task.wait(2)
-            end
-        else
-            task.wait(0.3)
-        end
-    end
-end)
+    mk("UICorner", { CornerRadius = UDim.new(0, 8) },
