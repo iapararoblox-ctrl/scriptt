@@ -1,5 +1,5 @@
 -- Caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
--- Recolección de botín por fuerza bruta: TP al botín -> activar prompt -> TP al barco -> repetir
+-- Parche: seguimiento desconectable (startFollow/stopFollow), más tiempos de botín
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -18,12 +18,12 @@ local CONFIG = {
     ESPERA_CARGA_BOSS = 20,
     ESPERA_ATAQUE = 0.15,
     ESPERA_RESPAWN = 3,
-    ESPERA_INICIAL_BOTIN = 4,   -- segundos tras morir el boss antes de buscar botín
-    ESPERA_BARCO = 2,           -- segundos encima del barco para que se guarde
+    ESPERA_INICIAL_BOTIN = 8,   -- segundos tras morir el boss antes de buscar botín
+    ESPERA_BARCO = 3,           -- segundos encima del barco para que se guarde
     ALTURA_BOTIN = 3,
     ALTURA_BARCO = 0,
     INTENTOS_PROMPT = 5,
-    MAX_INTENTOS_BOTIN = 3,     -- si un botín no desaparece tras esto, se salta
+    MAX_INTENTOS_BOTIN = 5,     -- si un botín no desaparece tras esto, se salta
     DEBUG = true,
 }
 
@@ -50,7 +50,6 @@ local closed = false
 local kills = 0
 local botinRecogido = 0
 local statusText = "Listo"
-local objetivoCF = nil
 local cachedShip = nil
 
 ---------------------------------------------------------------
@@ -120,15 +119,31 @@ local function tpTo(cf)
     task.wait(0.2)
 end
 
--- Solo mientras hay un boss vivo: deja al personaje en el objetivo
-RunService.Heartbeat:Connect(function()
-    if not objetivoCF then return end
-    local root = getRoot()
-    if root then
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.CFrame = objetivoCF
+---------------------------------------------------------------
+-- SEGUIMIENTO (se conecta y desconecta)
+---------------------------------------------------------------
+local followConn = nil
+local followCF = nil
+
+function startFollow()
+    if followConn then return end
+    followConn = RunService.Heartbeat:Connect(function()
+        if not followCF then return end
+        local root = getRoot()
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.CFrame = followCF
+        end
+    end)
+end
+
+function stopFollow()
+    followCF = nil
+    if followConn then
+        followConn:Disconnect()
+        followConn = nil
     end
-end)
+end
 
 local HOVER = "BossHover"
 local function setHover(on)
@@ -339,7 +354,6 @@ local function recogerBotin()
     local vacios = 0
 
     while not closed and cazando do
-        -- Siguiente botín con prompt que no hayamos rendido
         local item, prompt
         for _, c in ipairs(loot:GetChildren()) do
             local p = findPrompt(c)
@@ -351,7 +365,7 @@ local function recogerBotin()
 
         if not item then
             vacios += 1
-            if vacios >= 3 then break end
+            if vacios >= 10 then break end
             task.wait(1)
         else
             vacios = 0
@@ -424,6 +438,7 @@ local function cazar(b)
     end
 
     -- 3) Atacar
+    startFollow()
     local murio = false
     while not closed and cazando do
         local p, bo = posicionBoss(b)
@@ -434,7 +449,7 @@ local function cazar(b)
         end
 
         local a = ajusteDe(b)
-        objetivoCF = CFrame.lookAt(
+        followCF = CFrame.lookAt(
             p + Vector3.new(a.lado, a.altura, CONFIG.DISTANCIA),
             p
         )
@@ -451,14 +466,13 @@ local function cazar(b)
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
-    -- 4) Soltar al boss
-    objetivoCF = nil
+    -- 4) Boss muerto: soltar al personaje primero
+    stopFollow()
 
     if murio and cazando and not closed then
         kills += 1
         setStatus(b.nombre .. " derrotado (" .. kills .. ")")
 
-        -- Despegarse del boss: subir a la parte alta de la isla
         local isla2 = getIsla(b.isla)
         if isla2 then
             tpTo(CFrame.new(islandTop(isla2) + Vector3.new(0, 10, 0)))
@@ -520,7 +534,7 @@ local function construirUI()
 
     mk("TextLabel", {
         Size = UDim2.new(1, -28, 0, 14), Position = UDim2.new(0, 6, 0, 4),
-        BackgroundTransparency = 1, Text = "Bosses v4", TextColor3 = TEXT,
+        BackgroundTransparency = 1, Text = "Bosses", TextColor3 = TEXT,
         TextSize = 11, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
     }, main)
 
@@ -558,7 +572,7 @@ local function construirUI()
     toggleBtn = boton(UDim2.new(0, 6, 0, 60), UDim2.new(1, -12, 0, 26), GREEN, 10, function()
         cazando = not cazando
         if not cazando then
-            objetivoCF = nil
+            stopFollow()
             setHover(false)
             setStatus("Caza detenida")
         end
@@ -604,7 +618,7 @@ local function construirUI()
     local closeBtn = boton(UDim2.new(1, -20, 0, 3), UDim2.fromOffset(17, 17), RED, 9, function()
         closed = true
         cazando = false
-        objetivoCF = nil
+        stopFollow()
         setHover(false)
         gui:Destroy()
     end)
@@ -638,7 +652,7 @@ task.spawn(function()
         if cazando then
             local ok, err = pcall(cazar, b)
             if not ok then
-                objetivoCF = nil
+                stopFollow()
                 setStatus("Error: " .. tostring(err))
                 task.wait(2)
             end
