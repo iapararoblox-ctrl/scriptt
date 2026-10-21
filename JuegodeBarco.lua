@@ -1,5 +1,6 @@
 -- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + mares/islas (español/inglés) + filtros + COMBATE AUTOMÁTICO
 -- + PUNTO DE ENTREGA (automático o manual) + POSICIÓN GUARDADA DE PANEL Y BURBUJA
+-- + PUNTO MANUAL DEL TESORERO (para vaciar la bóveda) + VALIDACIÓN Y DIAGNÓSTICO DE TAMAÑOS DE COFRES
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -9,7 +10,7 @@ local LocalPlayer = Players.LocalPlayer
 
 -- Todo el combate vive en esta tabla para no pasar el límite de 200 variables locales
 local CB = {}
--- Punto de entrega y posiciones de la UI viven aquí por el mismo motivo
+-- Punto de entrega, tesorero, tamaños y posiciones de la UI viven aquí por el mismo motivo
 local EX = {}
 
 ---------------------------------------------------------------
@@ -152,6 +153,10 @@ local CONFIG = {
     PUNTO_MODO_INICIAL = "AUTO",   -- "AUTO" = parte alta del centro del barco (como antes), "MANUAL" = el punto que tú fijes
     PUNTO_DISTANCIA_MAX = 150,     -- máximo de studs entre tú y el barco al fijar el punto
 
+    -- PUNTO DEL TESORERO (para vaciar la bóveda)
+    TESORERO_MODO_INICIAL = "AUTO", -- "AUTO" = va al NPC tesorero, "MANUAL" = va al punto que tú fijes
+    CONTADOR_JUEGO_INICIAL = true,  -- usa el contador de espacio del propio barco si el juego lo tiene
+
     VALOR_FILTRO_INICIAL = false,
     VALOR_MIN_INICIAL = 10000,
     VALOR_PASO = 1000,
@@ -196,6 +201,10 @@ local MINE_LABEL = "Mi barco"
 local HOVER_NAME = "CofresHover"
 
 CB.ENEMY_ALL, CB.ENEMY_LAND, CB.ENEMY_SHIP = "*ALL", "*LAND", "*SHIP"
+
+-- Nombres exactos que usa el juego (si los tiene) para el espacio de la bóveda del barco
+EX.USED_KEYS = { "CargoUsed", "UsedCargo", "CargoSpaceUsed", "CargoCount", "CurrentCargo", "UsedSpace" }
+EX.CAP_KEYS = { "CargoCapacity", "MaxCargo", "CargoMax", "CargoSpace", "CargoSlots", "MaxCargoSize" }
 
 ---------------------------------------------------------------
 -- CARGAR CONFIGURACIÓN GUARDADA
@@ -317,6 +326,26 @@ if EX.dropMode == "MANUAL" and not EX.dropOffset then
     EX.dropMode = "AUTO"
 end
 
+-- Punto del tesorero (donde te paras para vaciar la bóveda)
+-- brokerMode: "AUTO" (va al NPC tesorero) o "MANUAL" (va al punto que tú fijaste, posición fija del mundo)
+EX.brokerMode = saved.brokerMode
+if EX.brokerMode ~= "MANUAL" and EX.brokerMode ~= "AUTO" then
+    EX.brokerMode = CONFIG.TESORERO_MODO_INICIAL
+end
+EX.brokerPos = nil
+if type(saved.brokerPos) == "table" then
+    local x, y, z = tonumber(saved.brokerPos[1]), tonumber(saved.brokerPos[2]), tonumber(saved.brokerPos[3])
+    if x and y and z then
+        EX.brokerPos = Vector3.new(x, y, z)
+    end
+end
+if EX.brokerMode == "MANUAL" and not EX.brokerPos then
+    EX.brokerMode = "AUTO"
+end
+
+-- Usar el contador de espacio del juego si el barco lo tiene
+EX.useGameCounter = svb("useGameCounter", CONFIG.CONTADOR_JUEGO_INICIAL)
+
 -- Posición guardada del panel {xScale, xOffset, yScale, yOffset} y de la burbuja {x, y}
 EX.mainPos = nil
 if type(saved.mainPos) == "table" then
@@ -395,6 +424,9 @@ local function saveConfig()
         attackHeight = CB.attackHeight,
         dropMode = EX.dropMode,
         dropOffset = EX.dropOffset and { EX.dropOffset.X, EX.dropOffset.Y, EX.dropOffset.Z } or nil,
+        brokerMode = EX.brokerMode,
+        brokerPos = EX.brokerPos and { EX.brokerPos.X, EX.brokerPos.Y, EX.brokerPos.Z } or nil,
+        useGameCounter = EX.useGameCounter,
         mainPos = EX.mainPos,
         miniPos = EX.miniPos,
     }
@@ -440,9 +472,42 @@ local function getChestProp(obj, name)
     return v
 end
 
+-- Convierte a número válido (acepta texto tipo "3"); rechaza nil, NaN, negativos y 0
+function EX.validSize(v)
+    local n = tonumber(v)
+    if n and n == n and n > 0 and n < math.huge then
+        return n
+    end
+    return nil
+end
+
+-- Lee el tamaño de un cofre mirando varios sitios. Devuelve (tamaño, de dónde lo sacó).
+-- "defecto" significa que NO se pudo leer y se usó TAMANO_POR_DEFECTO.
+function EX.readSize(chest)
+    local v = EX.validSize(chest:GetAttribute("CargoSize"))
+    if v then return v, "atributo" end
+
+    local child = chest:FindFirstChild("CargoSize")
+    if child and child:IsA("ValueBase") then
+        v = EX.validSize(child.Value)
+        if v then return v, "valor" end
+    end
+
+    for _, d in ipairs(chest:GetDescendants()) do
+        v = EX.validSize(d:GetAttribute("CargoSize"))
+        if v then return v, "interno" end
+        if d.Name == "CargoSize" and d:IsA("ValueBase") then
+            v = EX.validSize(d.Value)
+            if v then return v, "interno" end
+        end
+    end
+
+    return CONFIG.TAMANO_POR_DEFECTO, "defecto"
+end
+
 local function getCargoSize(obj)
-    local v = tonumber(getChestProp(obj, "CargoSize"))
-    return v or CONFIG.TAMANO_POR_DEFECTO
+    local size = EX.readSize(obj)
+    return size
 end
 
 ---------------------------------------------------------------
@@ -1009,13 +1074,16 @@ end
 
 ---------------------------------------------------------------
 -- BÓVEDA (CargoVisuals de cualquier barco)
+-- Se validan los cofres: solo Models, sin repetidos (por nombre) y con el tamaño leído de forma robusta.
 ---------------------------------------------------------------
 local function chestsOn(ship)
     local cargo = ship and ship:FindFirstChild("CargoVisuals")
     local list = {}
+    local seen = {}
     if cargo then
         for _, child in ipairs(cargo:GetChildren()) do
-            if child:IsA("Model") then
+            if child:IsA("Model") and child.Parent == cargo and not seen[child.Name] then
+                seen[child.Name] = true
                 table.insert(list, child)
             end
         end
@@ -1023,12 +1091,55 @@ local function chestsOn(ship)
     return list
 end
 
-local function usedSpaceOn(ship)
-    local total = 0
+-- Suma de tamaños de los cofres que hay en la bóveda (+ cuántos no tenían tamaño legible)
+function EX.countedSpaceOn(ship)
+    local total, unreadable, n = 0, 0, 0
     for _, chest in ipairs(chestsOn(ship)) do
-        total += getCargoSize(chest)
+        local size, src = EX.readSize(chest)
+        total += size
+        n += 1
+        if src == "defecto" then
+            unreadable += 1
+        end
     end
-    return total
+    return total, unreadable, n
+end
+
+-- Contador de espacio del propio juego (solo si el barco lo expone con un nombre conocido)
+function EX.gameCargo(ship)
+    if not ship then return nil, nil end
+    local used, cap
+    for _, k in ipairs(EX.USED_KEYS) do
+        local v = tonumber(getChestProp(ship, k))
+        if v then used = v break end
+    end
+    for _, k in ipairs(EX.CAP_KEYS) do
+        local v = tonumber(getChestProp(ship, k))
+        if v and v > 0 then cap = v break end
+    end
+    return used, cap
+end
+
+local function usedSpaceOn(ship)
+    if EX.useGameCounter then
+        local gameUsed = EX.gameCargo(ship)
+        if gameUsed then
+            return gameUsed
+        end
+    end
+    local counted = EX.countedSpaceOn(ship)
+    return counted
+end
+
+-- Capacidad que se usa de verdad: la del juego si existe (y está activado), si no la tuya
+function EX.capFor(ship)
+    if EX.useGameCounter then
+        local _, gameCap = EX.gameCargo(ship)
+        if gameCap then
+            return gameCap
+        end
+    end
+    return capacity
 end
 
 local function getStoredChests()
@@ -1037,6 +1148,63 @@ end
 
 local function usedSpace()
     return usedSpaceOn(getMyShip())
+end
+
+-- Imprime en la consola (F9 / consola del ejecutor) cada cofre de tu bóveda con su tamaño y de dónde se leyó
+function EX.diagnose()
+    local ship = getMyShip()
+    if not ship then
+        setStatus("No encuentro tu barco")
+        return
+    end
+    local cargo = ship:FindFirstChild("CargoVisuals")
+    if not cargo then
+        setStatus("Tu barco no tiene CargoVisuals")
+        return
+    end
+
+    print("[COFRES] ===== DIAGNÓSTICO DE BÓVEDA =====")
+    print("[COFRES] Barco:", ship:GetFullName())
+
+    local rawModels, ignored = 0, 0
+    for _, c in ipairs(cargo:GetChildren()) do
+        if c:IsA("Model") then
+            rawModels += 1
+        else
+            ignored += 1
+            print("[COFRES] Ignorado (no es Model):", c.ClassName, c.Name)
+        end
+    end
+
+    local total, unreadable = 0, 0
+    local list = chestsOn(ship)
+    for i, chest in ipairs(list) do
+        local size, src = EX.readSize(chest)
+        total += size
+        if src == "defecto" then unreadable += 1 end
+        print(string.format("[COFRES] %d) %s | tamaño=%s (%s) | rareza=%s | valor=%s",
+            i, chest.Name, tostring(size), src,
+            tostring(getChestProp(chest, "Rarity")), tostring(getChestProp(chest, "Value"))))
+    end
+
+    local duplicates = rawModels - #list
+    if duplicates > 0 then
+        print("[COFRES] Cofres repetidos (mismo nombre) descartados:", duplicates)
+    end
+
+    for k, v in pairs(ship:GetAttributes()) do
+        print("[COFRES] atributo del barco:", k, v)
+    end
+
+    local gu, gc = EX.gameCargo(ship)
+    print("[COFRES] Contado:", total, "| cofres:", #list, "| sin tamaño legible:", unreadable,
+        "| contador del juego:", tostring(gu), "/", tostring(gc))
+    print("[COFRES] =================================")
+
+    setStatus(string.format("Bóveda: %d cofres, %d espacios contados%s%s",
+        #list, total,
+        unreadable > 0 and (", " .. unreadable .. " sin tamaño") or "",
+        gu and (", juego: " .. gu) or ""))
 end
 
 ---------------------------------------------------------------
@@ -1104,24 +1272,85 @@ end
 
 ---------------------------------------------------------------
 -- TESORERO (solo abre los cofres de TU barco)
+--   AUTO   -> va al NPC tesorero (NPC_StarterPort_Broker)
+--   MANUAL -> va al punto del mundo que fijaste parado cerca del tesorero
 ---------------------------------------------------------------
-local function openVault()
-    setHover(false)
+function EX.brokerNPC()
     local dyn = getDynamic()
     local npcs = dyn and dyn:FindFirstChild("NPCs")
     local npc = npcs and npcs:FindFirstChild("NPC_StarterPort_Broker")
-    local hrp = npc and npc:FindFirstChild("HumanoidRootPart")
-    if not hrp then
+    return npc and npc:FindFirstChild("HumanoidRootPart")
+end
+
+-- Fija el punto del tesorero en tu posición actual (párate donde quieras entregar/abrir)
+function EX.setBrokerPointHere()
+    local root = getRoot()
+    if not root then
+        setStatus("No encuentro tu personaje")
+        return
+    end
+    EX.brokerPos = root.Position
+    EX.brokerMode = "MANUAL"
+    markDirty()
+    setStatus(string.format("Punto del tesorero fijado (%.0f, %.0f, %.0f)",
+        EX.brokerPos.X, EX.brokerPos.Y, EX.brokerPos.Z))
+end
+
+function EX.setBrokerMode(newMode)
+    if newMode == "MANUAL" and not EX.brokerPos then
+        setStatus("Aún no hay punto del tesorero: párate donde quieras y pulsa «Fijar aquí»")
+        return
+    end
+    EX.brokerMode = newMode
+    markDirty()
+    setStatus(newMode == "MANUAL" and "Tesorero: usará tu punto manual" or "Tesorero: irá al NPC")
+end
+
+-- Va al punto actual del tesorero para que veas dónde queda
+function EX.goToBrokerPoint()
+    local pos
+    if EX.brokerMode == "MANUAL" and EX.brokerPos then
+        pos = EX.brokerPos
+    else
+        local hrp = EX.brokerNPC()
+        pos = hrp and (hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
+    end
+    if not pos then
+        setStatus("No encuentro al tesorero")
+        return
+    end
+    setHover(false)
+    teleportTo(pos)
+    setStatus("Estás en el punto del tesorero")
+end
+
+local function openVault()
+    setHover(false)
+    local hrp = EX.brokerNPC()
+    local manual = EX.brokerMode == "MANUAL" and EX.brokerPos ~= nil
+
+    if not hrp and not manual then
         setStatus("No encuentro al tesorero")
         return
     end
 
-    setStatus("Yendo al tesorero...")
-    teleportTo(hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
+    if manual then
+        setStatus("Yendo a tu punto del tesorero...")
+        teleportTo(EX.brokerPos)
+    else
+        setStatus("Yendo al tesorero...")
+        teleportTo(hrp.Position + Vector3.new(0, CONFIG.ALTURA, 0))
+    end
 
-    local p1 = hrp:FindFirstChild("NPCPrompt_1")
+    local p1 = hrp and hrp:FindFirstChild("NPCPrompt_1")
     local prompt = p1 and p1:FindFirstChild("NPCPrompt")
     if prompt and prompt:IsA("ProximityPrompt") then
+        pcall(function()
+            prompt.RequiresLineOfSight = false
+            if prompt.MaxActivationDistance < 25 then
+                prompt.MaxActivationDistance = 25
+            end
+        end)
         pcall(fireproximityprompt, prompt)
         task.wait(CONFIG.ESPERA_TESORERO)
     end
@@ -1425,8 +1654,9 @@ local function collectCycle()
         return
     end
     local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
+    local cap = EX.capFor(dest)
 
-    if usedSpaceOn(dest) >= capacity then
+    if usedSpaceOn(dest) >= cap then
         if destIsMine then
             openVault()
         else
@@ -1463,15 +1693,16 @@ local function collectCycle()
             if not dest.Parent then
                 dest = getDestinationShip()
                 if not dest then return end
+                cap = EX.capFor(dest)
             end
 
             passed = passed + 1
             local size = getCargoSize(item)
 
-            if size > capacity then
+            if size > cap then
                 setStatus("Cofre más grande que la bóveda, lo salto")
             else
-                if usedSpaceOn(dest) + size > capacity then
+                if usedSpaceOn(dest) + size > cap then
                     if destIsMine then
                         openVault()
                     else
@@ -2130,9 +2361,9 @@ local capStepper = stepperRow(pageBoveda, 1,
     end
 )
 
-local vaultInfo = label(pageBoveda, "", 11, PALETTE.muted, false)
+local vaultInfo = label(pageBoveda, "", 10, PALETTE.muted, false)
 vaultInfo.LayoutOrder = 2
-vaultInfo.Size = UDim2.new(1, -4, 0, 30)
+vaultInfo.Size = UDim2.new(1, -4, 0, 62)
 vaultInfo.TextWrapped = true
 vaultInfo.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -2141,6 +2372,59 @@ emptyBtn.LayoutOrder = 3
 emptyBtn.Activated:Connect(function()
     manualOpenRequested = true
     setStatus("Se vaciará la bóveda en el próximo ciclo")
+end)
+
+-- Punto del tesorero: automático (NPC) o manual (el que fijes)
+EX.brokerRow = Instance.new("Frame")
+EX.brokerRow.Size = UDim2.new(1, -4, 0, 32)
+EX.brokerRow.BackgroundTransparency = 1
+EX.brokerRow.LayoutOrder = 4
+EX.brokerRow.Parent = pageBoveda
+listLayout(EX.brokerRow, 6, true)
+
+EX.brokerAutoBtn = button(EX.brokerRow, "🧑‍💼 Auto (NPC)", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+EX.brokerManualBtn = button(EX.brokerRow, "📍 Punto manual", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+
+EX.brokerPointRow = Instance.new("Frame")
+EX.brokerPointRow.Size = UDim2.new(1, -4, 0, 32)
+EX.brokerPointRow.BackgroundTransparency = 1
+EX.brokerPointRow.LayoutOrder = 5
+EX.brokerPointRow.Parent = pageBoveda
+listLayout(EX.brokerPointRow, 6, true)
+
+EX.brokerSetBtn = button(EX.brokerPointRow, "📌 Fijar aquí", UDim2.new(0.5, -3, 1, 0), PALETTE.track)
+EX.brokerGoBtn = button(EX.brokerPointRow, "🚶 Ir al punto", UDim2.new(0.5, -3, 1, 0), PALETTE.track)
+
+EX.brokerNote = label(pageBoveda, "", 10, PALETTE.muted, false)
+EX.brokerNote.LayoutOrder = 6
+EX.brokerNote.Size = UDim2.new(1, -4, 0, 58)
+EX.brokerNote.TextWrapped = true
+EX.brokerNote.TextYAlignment = Enum.TextYAlignment.Top
+
+EX.brokerAutoBtn.Activated:Connect(function()
+    EX.setBrokerMode("AUTO")
+end)
+EX.brokerManualBtn.Activated:Connect(function()
+    EX.setBrokerMode("MANUAL")
+end)
+EX.brokerSetBtn.Activated:Connect(function()
+    EX.setBrokerPointHere()
+end)
+EX.brokerGoBtn.Activated:Connect(function()
+    EX.goToBrokerPoint()
+end)
+
+-- Validación de tamaños
+EX.counterCheck = checkRow(pageBoveda, "Usar contador del juego si existe", 7, EX.useGameCounter, function(v)
+    EX.useGameCounter = v
+    markDirty()
+    setStatus(v and "Usará el contador de espacio del juego si el barco lo tiene" or "Contará los cofres uno por uno")
+end)
+
+EX.diagBtn = button(pageBoveda, "🔍 Diagnóstico de bóveda (consola)", UDim2.new(1, -4, 0, 36), PALETTE.card)
+EX.diagBtn.LayoutOrder = 8
+EX.diagBtn.Activated:Connect(function()
+    EX.diagnose()
 end)
 
 ---------------------------------------------------------------
@@ -2404,11 +2688,16 @@ EX.applySavedPositions()
 -- ACTUALIZAR UI
 ---------------------------------------------------------------
 refreshUI = function()
-    local used = usedSpace()
+    local myShip = getMyShip()
+    local counted, unreadable, chestCount = EX.countedSpaceOn(myShip)
+    local gameUsed, gameCap = EX.gameCargo(myShip)
+    local used = usedSpaceOn(myShip)
+    local cap = EX.capFor(myShip)
+
     subtitle.Text = statusText
     countLabel.Text = tostring(collectedCount)
-    vaultLabel.Text = used .. "/" .. capacity
-    barFill.Size = UDim2.new(math.clamp(used / math.max(capacity, 1), 0, 1), 0, 1, 0)
+    vaultLabel.Text = used .. "/" .. cap
+    barFill.Size = UDim2.new(math.clamp(used / math.max(cap, 1), 0, 1), 0, 1, 0)
 
     tpBtn.BackgroundColor3 = mode == "TP" and PALETTE.accent or PALETTE.card
     glideBtn.BackgroundColor3 = mode == "DESLIZAR" and PALETTE.accent or PALETTE.card
@@ -2448,7 +2737,39 @@ refreshUI = function()
         or "Activa la opción para recoger solo en la isla elegida."
 
     capStepper.refresh()
-    vaultInfo.Text = "Guardados en tu barco: " .. #getStoredChests() .. " cofres, " .. used .. " de " .. capacity .. " espacios."
+
+    -- Bóveda: lo contado cofre por cofre frente al contador del juego (si existe)
+    local info = "Cofres en tu barco: " .. chestCount .. " · espacio contado: " .. counted
+    if gameUsed then
+        info = info .. "\nContador del juego: " .. gameUsed .. (gameCap and ("/" .. gameCap) or "")
+            .. (EX.useGameCounter and " (en uso)" or " (sin usar)")
+        if gameUsed ~= counted then
+            info = info .. "\n⚠ No coincide con lo contado."
+        end
+    else
+        info = info .. "\nEl barco no expone contador propio: se usa lo contado."
+    end
+    if unreadable > 0 then
+        info = info .. "\n⚠ " .. unreadable .. " cofre(s) sin tamaño legible (cuentan como "
+            .. CONFIG.TAMANO_POR_DEFECTO .. ")."
+    end
+    vaultInfo.Text = info
+    EX.counterCheck.refresh()
+
+    -- Punto del tesorero
+    local brokerManualOn = EX.brokerMode == "MANUAL" and EX.brokerPos ~= nil
+    EX.brokerAutoBtn.BackgroundColor3 = brokerManualOn and PALETTE.card or PALETTE.accent
+    EX.brokerManualBtn.BackgroundColor3 = brokerManualOn and PALETTE.accent or PALETTE.card
+    if EX.brokerPos then
+        EX.brokerNote.Text = string.format("Punto del tesorero: %.0f, %.0f, %.0f. %s",
+            EX.brokerPos.X, EX.brokerPos.Y, EX.brokerPos.Z,
+            brokerManualOn and "Activo: al vaciar la bóveda irá a ese punto."
+                or "Inactivo: al vaciar la bóveda irá al NPC tesorero.")
+            .. "\nPara cambiarlo, párate donde quieras y pulsa «Fijar aquí»."
+    else
+        EX.brokerNote.Text = "Sin punto manual: al vaciar la bóveda irá al NPC tesorero."
+            .. "\nPárate junto al tesorero (o donde funcione) y pulsa «Fijar aquí»."
+    end
 
     valueRow.refresh()
     rarityRow.refresh()
