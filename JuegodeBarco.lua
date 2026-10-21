@@ -1,4 +1,5 @@
 -- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + mares/islas (español/inglés) + filtros + COMBATE AUTOMÁTICO
+-- + PUNTO DE ENTREGA (automático o manual) + POSICIÓN GUARDADA DE PANEL Y BURBUJA
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,6 +9,8 @@ local LocalPlayer = Players.LocalPlayer
 
 -- Todo el combate vive en esta tabla para no pasar el límite de 200 variables locales
 local CB = {}
+-- Punto de entrega y posiciones de la UI viven aquí por el mismo motivo
+local EX = {}
 
 ---------------------------------------------------------------
 -- MARES E ISLAS
@@ -145,6 +148,10 @@ local CONFIG = {
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
 
+    -- PUNTO DE ENTREGA EN EL BARCO
+    PUNTO_MODO_INICIAL = "AUTO",   -- "AUTO" = parte alta del centro del barco (como antes), "MANUAL" = el punto que tú fijes
+    PUNTO_DISTANCIA_MAX = 150,     -- máximo de studs entre tú y el barco al fijar el punto
+
     VALOR_FILTRO_INICIAL = false,
     VALOR_MIN_INICIAL = 10000,
     VALOR_PASO = 1000,
@@ -175,6 +182,9 @@ local CONFIG = {
     PANEL_MAX = 3000,
     PANEL_PASOS = { 1, 5, 10, 20, 50 },
     PANEL_PASO_INICIAL = 3,
+
+    BURBUJA_TAMANO = 48,               -- tamaño de la burbuja minimizada
+    ARRASTRE_MIN = 6,                  -- píxeles que hay que mover para que cuente como arrastre y no como toque
 
     CONFIG_ARCHIVO = "CofresConfig.json",
     DEBUG = true,
@@ -289,6 +299,40 @@ local rarityMinIdx = math.clamp(math.floor(svn("rarityMinIdx", CONFIG.RAREZA_MIN
 
 local targetLabel = svs("targetLabel", MINE_LABEL)
 
+-- Punto de entrega en el barco
+-- dropMode: "AUTO" (parte alta del centro, como siempre) o "MANUAL" (punto fijado por ti)
+-- dropOffset: posición del punto RELATIVA al barco (así te sigue aunque el barco se mueva o gire)
+EX.dropMode = saved.dropMode
+if EX.dropMode ~= "MANUAL" and EX.dropMode ~= "AUTO" then
+    EX.dropMode = CONFIG.PUNTO_MODO_INICIAL
+end
+EX.dropOffset = nil
+if type(saved.dropOffset) == "table" then
+    local x, y, z = tonumber(saved.dropOffset[1]), tonumber(saved.dropOffset[2]), tonumber(saved.dropOffset[3])
+    if x and y and z then
+        EX.dropOffset = Vector3.new(x, y, z)
+    end
+end
+if EX.dropMode == "MANUAL" and not EX.dropOffset then
+    EX.dropMode = "AUTO"
+end
+
+-- Posición guardada del panel {xScale, xOffset, yScale, yOffset} y de la burbuja {x, y}
+EX.mainPos = nil
+if type(saved.mainPos) == "table" then
+    local a, b, c, d = tonumber(saved.mainPos[1]), tonumber(saved.mainPos[2]), tonumber(saved.mainPos[3]), tonumber(saved.mainPos[4])
+    if a and b and c and d then
+        EX.mainPos = { a, b, c, d }
+    end
+end
+EX.miniPos = nil
+if type(saved.miniPos) == "table" then
+    local a, b = tonumber(saved.miniPos[1]), tonumber(saved.miniPos[2])
+    if a and b then
+        EX.miniPos = { a, b }
+    end
+end
+
 -- Combate
 CB.attackEnabled = false
 CB.attackByIsland = svb("attackByIsland", CONFIG.ATAQUE_POR_ISLA_INICIAL)
@@ -349,6 +393,10 @@ local function saveConfig()
         attackTarget = CB.attackTarget,
         attackDist = CB.attackDist,
         attackHeight = CB.attackHeight,
+        dropMode = EX.dropMode,
+        dropOffset = EX.dropOffset and { EX.dropOffset.X, EX.dropOffset.Y, EX.dropOffset.Z } or nil,
+        mainPos = EX.mainPos,
+        miniPos = EX.miniPos,
     }
     pcall(function()
         writefile(CONFIG.CONFIG_ARCHIVO, HttpService:JSONEncode(data))
@@ -883,6 +931,83 @@ local function getShipTop(ship)
 end
 
 ---------------------------------------------------------------
+-- PUNTO DE ENTREGA EN EL BARCO
+--   AUTO   -> parte alta del centro del barco (comportamiento de siempre)
+--   MANUAL -> el punto que fijaste parado en el barco (se guarda relativo al barco)
+---------------------------------------------------------------
+function EX.shipCFrame(ship)
+    if ship:IsA("Model") then
+        return ship:GetPivot()
+    end
+    return ship.CFrame
+end
+
+-- Posición en el mundo a la que hay que ir para guardar el cofre en "ship"
+function EX.dropPoint(ship)
+    if EX.dropMode == "MANUAL" and EX.dropOffset then
+        return EX.shipCFrame(ship):PointToWorldSpace(EX.dropOffset)
+    end
+    return getShipTop(ship)
+end
+
+-- Barco destino SOLO si ya está cargado (no te teletransporta a buscarlo)
+function EX.loadedDestShip()
+    if targetLabel == MINE_LABEL or targetLabel == "" then
+        return getMyShip()
+    end
+    local m = shipMemory[targetLabel]
+    if m and m.ship and m.ship.Parent then
+        return m.ship
+    end
+    return nil
+end
+
+-- Fija el punto en tu posición actual (debes estar parado en el barco destino)
+function EX.setPointHere()
+    local root = getRoot()
+    if not root then
+        setStatus("No encuentro tu personaje")
+        return
+    end
+    local ship = EX.loadedDestShip()
+    if not ship then
+        setStatus("No encuentro el barco destino cargado: acércate a él")
+        return
+    end
+    local rel = EX.shipCFrame(ship):PointToObjectSpace(root.Position)
+    if rel.Magnitude > CONFIG.PUNTO_DISTANCIA_MAX then
+        setStatus("Estás muy lejos del barco destino: párate sobre él")
+        return
+    end
+    EX.dropOffset = rel
+    EX.dropMode = "MANUAL"
+    markDirty()
+    setStatus(string.format("Punto manual fijado (%.1f, %.1f, %.1f)", rel.X, rel.Y, rel.Z))
+end
+
+function EX.setDropMode(newMode)
+    if newMode == "MANUAL" and not EX.dropOffset then
+        setStatus("Aún no hay punto manual: párate en el barco y pulsa «Fijar aquí»")
+        return
+    end
+    EX.dropMode = newMode
+    markDirty()
+    setStatus(newMode == "MANUAL" and "Entrega en tu punto manual" or "Entrega automática (centro del barco)")
+end
+
+-- Va al punto actual de entrega para que veas dónde queda
+function EX.goToPoint()
+    local ship = EX.loadedDestShip()
+    if not ship then
+        setStatus("No encuentro el barco destino cargado")
+        return
+    end
+    setHover(false)
+    teleportTo(EX.dropPoint(ship))
+    setStatus("Estás en el punto de entrega")
+end
+
+---------------------------------------------------------------
 -- BÓVEDA (CargoVisuals de cualquier barco)
 ---------------------------------------------------------------
 local function chestsOn(ship)
@@ -955,7 +1080,8 @@ local function storeOnBoat(usedBefore, dest)
     end
 
     setStatus("Guardando en " .. targetLabel .. "...")
-    teleportTo(getShipTop(dest))
+    -- Automático: parte alta del centro. Manual: el punto que fijaste.
+    teleportTo(EX.dropPoint(dest))
 
     local t0 = os.clock()
     while os.clock() - t0 < CONFIG.ESPERA_GUARDADO do
@@ -1617,17 +1743,24 @@ local function numberRow(parent, order, name, getVal, setVal, getStep, boxWidth)
     }
 end
 
-local function makeDraggable(handle, frame)
+-- Arrastrable. onEnd se llama al soltar (solo si se movió) para guardar la posición.
+-- Devuelve una tabla con "moved" para distinguir un arrastre de un simple toque.
+local function makeDraggable(handle, frame, onEnd)
     local dragging, startInput, startPos = false, nil, nil
+    local state = { moved = false }
     handle.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch
             or input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
+            state.moved = false
             startInput = input.Position
             startPos = frame.Position
             input.Changed:Connect(function()
                 if input.UserInputState == Enum.UserInputState.End then
                     dragging = false
+                    if state.moved and onEnd then
+                        onEnd()
+                    end
                 end
             end)
         end
@@ -1636,12 +1769,18 @@ local function makeDraggable(handle, frame)
         if dragging and (input.UserInputType == Enum.UserInputType.Touch
             or input.UserInputType == Enum.UserInputType.MouseMovement) then
             local d = input.Position - startInput
-            frame.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y
-            )
+            if not state.moved and d.Magnitude >= CONFIG.ARRASTRE_MIN then
+                state.moved = true
+            end
+            if state.moved then
+                frame.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y
+                )
+            end
         end
     end)
+    return state
 end
 
 local main = Instance.new("Frame")
@@ -1870,6 +2009,46 @@ local waitStepper = stepperRow(pageCofres, 7,
         refreshUI()
     end
 )
+
+-- Punto de entrega: automático (centro del barco) o manual (el que fijes)
+EX.dropRow = Instance.new("Frame")
+EX.dropRow.Size = UDim2.new(1, -4, 0, 32)
+EX.dropRow.BackgroundTransparency = 1
+EX.dropRow.LayoutOrder = 8
+EX.dropRow.Parent = pageCofres
+listLayout(EX.dropRow, 6, true)
+
+EX.autoPointBtn = button(EX.dropRow, "🎯 Auto (centro)", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+EX.manualPointBtn = button(EX.dropRow, "📍 Punto manual", UDim2.new(0.5, -3, 1, 0), PALETTE.card)
+
+EX.pointRow = Instance.new("Frame")
+EX.pointRow.Size = UDim2.new(1, -4, 0, 32)
+EX.pointRow.BackgroundTransparency = 1
+EX.pointRow.LayoutOrder = 9
+EX.pointRow.Parent = pageCofres
+listLayout(EX.pointRow, 6, true)
+
+EX.setPointBtn = button(EX.pointRow, "📌 Fijar aquí", UDim2.new(0.5, -3, 1, 0), PALETTE.track)
+EX.goPointBtn = button(EX.pointRow, "🚶 Ir al punto", UDim2.new(0.5, -3, 1, 0), PALETTE.track)
+
+EX.dropNote = label(pageCofres, "", 10, PALETTE.muted, false)
+EX.dropNote.LayoutOrder = 10
+EX.dropNote.Size = UDim2.new(1, -4, 0, 58)
+EX.dropNote.TextWrapped = true
+EX.dropNote.TextYAlignment = Enum.TextYAlignment.Top
+
+EX.autoPointBtn.Activated:Connect(function()
+    EX.setDropMode("AUTO")
+end)
+EX.manualPointBtn.Activated:Connect(function()
+    EX.setDropMode("MANUAL")
+end)
+EX.setPointBtn.Activated:Connect(function()
+    EX.setPointHere()
+end)
+EX.goPointBtn.Activated:Connect(function()
+    EX.goToPoint()
+end)
 
 ---------------------------------------------------------------
 -- PESTAÑA ISLA (mares)
@@ -2157,23 +2336,69 @@ resetBtn.Activated:Connect(function()
     refreshUI()
 end)
 
+-- Vuelve a poner el panel y la burbuja en su sitio de fábrica
+EX.resetPosBtn = button(pagePanel, "⌖ Centrar panel y burbuja", UDim2.new(1, -4, 0, 36), PALETTE.card)
+EX.resetPosBtn.LayoutOrder = 5
+
 local panelNote = label(pagePanel,
-    "Escribe el ancho y el alto en la caja, o usa − y +. La configuración se guarda sola.",
+    "Escribe el ancho y el alto en la caja, o usa − y +. El tamaño y la posición del panel y de la burbuja se guardan solos.",
     10, PALETTE.muted, false)
-panelNote.LayoutOrder = 5
-panelNote.Size = UDim2.new(1, -4, 0, 40)
+panelNote.LayoutOrder = 6
+panelNote.Size = UDim2.new(1, -4, 0, 52)
 panelNote.TextWrapped = true
 panelNote.TextYAlignment = Enum.TextYAlignment.Top
 
-local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(48, 48), PALETTE.card)
+local mini = button(gui, "🏴‍☠️", UDim2.fromOffset(CONFIG.BURBUJA_TAMANO, CONFIG.BURBUJA_TAMANO), PALETTE.card)
 mini.TextSize = 20
 mini.Visible = false
 stroke(mini, PALETTE.accent, 1, 0.3)
-makeDraggable(mini, mini)
 
-makeDraggable(header, main)
+-- Coloca el panel y la burbuja donde los dejaste (ajustado a la pantalla actual)
+function EX.applySavedPositions()
+    local vp = camera.ViewportSize
+    if vp.X < 100 or vp.Y < 100 then return end
+
+    if EX.mainPos then
+        local hx, hy = vp.X / 2 - 30, vp.Y / 2 - 30
+        main.Position = UDim2.new(
+            EX.mainPos[1], math.clamp(EX.mainPos[2], -hx, hx),
+            EX.mainPos[3], math.clamp(EX.mainPos[4], -hy, hy)
+        )
+    end
+
+    if EX.miniPos then
+        local size = CONFIG.BURBUJA_TAMANO
+        mini.Position = UDim2.fromOffset(
+            math.clamp(EX.miniPos[1], 0, math.max(vp.X - size, 0)),
+            math.clamp(EX.miniPos[2], 0, math.max(vp.Y - size, 0))
+        )
+    end
+end
+
+-- Arrastrar el panel por la cabecera y la burbuja por sí misma; al soltar se guarda la posición
+makeDraggable(header, main, function()
+    local p = main.Position
+    EX.mainPos = { p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset }
+    markDirty()
+end)
+
+EX.miniDrag = makeDraggable(mini, mini, function()
+    local p = mini.Position
+    EX.miniPos = { p.X.Offset, p.Y.Offset }
+    markDirty()
+end)
+
+EX.resetPosBtn.Activated:Connect(function()
+    EX.mainPos = nil
+    EX.miniPos = nil
+    main.Position = UDim2.new(0.5, 0, 0.5, 0)
+    mini.Position = UDim2.fromOffset(0, 0)
+    markDirty()
+    setStatus("Panel y burbuja centrados")
+end)
 
 applyPanelSize()
+EX.applySavedPositions()
 
 ---------------------------------------------------------------
 -- ACTUALIZAR UI
@@ -2198,6 +2423,21 @@ refreshUI = function()
         destNote.Text = "Barco: " .. (m.shipName or "?") .. " · " .. estado
     else
         destNote.Text = "Aún no he visto este barco en esta sesión."
+    end
+
+    -- Punto de entrega
+    local manualOn = EX.dropMode == "MANUAL" and EX.dropOffset ~= nil
+    EX.autoPointBtn.BackgroundColor3 = manualOn and PALETTE.card or PALETTE.accent
+    EX.manualPointBtn.BackgroundColor3 = manualOn and PALETTE.accent or PALETTE.card
+    if EX.dropOffset then
+        EX.dropNote.Text = string.format("Punto manual: %.1f, %.1f, %.1f (relativo al barco). %s",
+            EX.dropOffset.X, EX.dropOffset.Y, EX.dropOffset.Z,
+            manualOn and "Activo: los cofres se dejan en ese punto."
+                or "Inactivo: los cofres se dejan en el centro del barco.")
+            .. "\nPara cambiarlo, párate en el barco destino y pulsa «Fijar aquí»."
+    else
+        EX.dropNote.Text = "Sin punto manual: los cofres se dejan en el centro del barco."
+            .. "\nPárate en el lugar del barco que quieras y pulsa «Fijar aquí»."
     end
 
     waitStepper.refresh()
@@ -2247,11 +2487,18 @@ end)
 
 minBtn.Activated:Connect(function()
     main.Visible = false
-    mini.Position = UDim2.fromOffset(main.AbsolutePosition.X, main.AbsolutePosition.Y)
+    -- Si ya dejaste la burbuja en un sitio, se queda ahí. Si no, aparece donde estaba el panel.
+    if not EX.miniPos then
+        mini.Position = UDim2.fromOffset(main.AbsolutePosition.X, main.AbsolutePosition.Y)
+    end
     mini.Visible = true
 end)
 
 mini.Activated:Connect(function()
+    -- Si fue un arrastre (moviste la burbuja), no abre el panel
+    if EX.miniDrag and EX.miniDrag.moved then
+        return
+    end
     mini.Visible = false
     main.Visible = true
 end)
