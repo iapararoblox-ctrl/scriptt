@@ -1,4 +1,5 @@
--- Sesión de caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
+-- Caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
+-- Altura ajustable desde la UI + recolección de cofres de la isla tras matar al boss
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -6,10 +7,22 @@ local LocalPlayer = Players.LocalPlayer
 
 local CONFIG = {
     DISTANCIA = 4,              -- studs detrás del boss
-    ALTURA = 0,                 -- studs de altura sobre el boss
-    ESPERA_CARGA_BOSS = 20,     -- segundos esperando que aparezca el boss al llegar
+    ALTURA_INICIAL = 0,         -- altura de ataque inicial (la cambias con ▲ ▼)
+    ALTURA_MIN = -20,
+    ALTURA_MAX = 40,
+    PASO_ALTURA = 1,
+    ESPERA_STREAMING = 2,       -- segundos esperando que carguen los cofres al llegar a la isla
+    ESPERA_CARGA_BOSS = 20,     -- segundos esperando que aparezca el boss
     ESPERA_ATAQUE = 0.15,       -- segundos entre golpes
-    ESPERA_RESPAWN = 3,         -- segundos antes de buscar el boss tras morir
+    ESPERA_RESPAWN = 3,         -- segundos antes de buscar el boss otra vez
+    CAPACIDAD = 81,             -- espacio de tu bóveda en el barco
+    ALTURA_COFRE = 3,           -- studs sobre el cofre al recogerlo
+    ESPERA_POSICION = 0.25,     -- para que el servidor reciba tu posición antes de recoger
+    ESPERA_RECOGER = 0.3,
+    INTENTOS_RECOGER = 2,
+    ESPERA_GUARDADO = 3,        -- segundos máximos para confirmar que el cofre se guardó
+    MARGEN_ISLA = 60,
+    RADIO_ISLA_SIN_CAJA = 300,
     DEBUG = true,
 }
 
@@ -34,10 +47,10 @@ local bossIndex = 1
 local cazando = false
 local closed = false
 local kills = 0
+local cofresGuardados = 0
+local altura = CONFIG.ALTURA_INICIAL
 local statusText = "Listo"
-
--- Objetivo que el Heartbeat aplica cada frame (null = no seguir)
-local objetivoCF = nil
+local objetivoCF = nil   -- lo aplica el Heartbeat cada frame (nil = no seguir)
 
 ---------------------------------------------------------------
 -- UTILIDADES
@@ -61,63 +74,8 @@ local function getPath(parts)
 end
 
 local function posOf(obj)
-    if obj:IsA("Model") then
-        return obj:GetPivot().Position
-    end
+    if obj:IsA("Model") then return obj:GetPivot().Position end
     return obj.Position
-end
-
-local islaCache = {}
-local function getIsla(nombre)
-    local c = islaCache[nombre]
-    if c and c.Parent then return c end
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if (obj:IsA("Model") or obj:IsA("BasePart")) and obj.Name == nombre then
-            islaCache[nombre] = obj
-            return obj
-        end
-    end
-    return nil
-end
-
--- Posición del boss: centro de todas las piezas de la carpeta indicada.
--- Si la carpeta no tiene piezas, usa el centro del modelo del boss.
-local function posicionBoss(b)
-    local boss = getPath(b.ruta)
-    if not boss then return nil, nil end
-
-    local suma, n = Vector3.zero, 0
-    local carpeta = boss:FindFirstChild(b.parte)
-    if carpeta then
-        if carpeta:IsA("BasePart") then
-            suma += carpeta.Position
-            n += 1
-        elseif carpeta:IsA("Model") then
-            suma += carpeta:GetPivot().Position
-            n += 1
-        else
-            for _, d in ipairs(carpeta:GetDescendants()) do
-                if d:IsA("BasePart") then
-                    suma += d.Position
-                    n += 1
-                end
-            end
-        end
-    end
-
-    if n == 0 then
-        return boss:GetPivot().Position, boss
-    end
-    return suma / n, boss
-end
-
-local function bossVivo(boss)
-    if not boss or not boss.Parent then return false end
-    local hum = boss:FindFirstChildWhichIsA("Humanoid", true)
-    if hum and hum.Health <= 0 then return false end
-    local hp = boss:GetAttribute("Health")
-    if type(hp) == "number" and hp <= 0 then return false end
-    return true
 end
 
 local function tpTo(cf)
@@ -127,7 +85,7 @@ local function tpTo(cf)
     root.CFrame = cf
 end
 
--- Heartbeat: cada frame coloca al personaje en el objetivo actual
+-- Heartbeat: cada frame deja al personaje en el objetivo (sigue al boss)
 RunService.Heartbeat:Connect(function()
     if not objetivoCF then return end
     local root = getRoot()
@@ -174,6 +132,206 @@ local function fmt(v)
 end
 
 ---------------------------------------------------------------
+-- ISLAS
+---------------------------------------------------------------
+local islaCache = {}
+local function getIsla(nombre)
+    local c = islaCache[nombre]
+    if c and c.Parent then return c end
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if (obj:IsA("Model") or obj:IsA("BasePart")) and obj.Name == nombre then
+            islaCache[nombre] = obj
+            return obj
+        end
+    end
+    return nil
+end
+
+local function dentroIsla(isla, pos)
+    local m = CONFIG.MARGEN_ISLA
+    if isla:IsA("Model") then
+        local cf, size = isla:GetBoundingBox()
+        local rel = cf:PointToObjectSpace(pos)
+        if math.abs(rel.X) <= size.X / 2 + m and math.abs(rel.Z) <= size.Z / 2 + m then
+            return true
+        end
+        local flat = Vector3.new(cf.Position.X - pos.X, 0, cf.Position.Z - pos.Z)
+        return flat.Magnitude <= math.max(size.X, size.Z) / 2 + m
+    end
+    local flat = Vector3.new(isla.Position.X - pos.X, 0, isla.Position.Z - pos.Z)
+    return flat.Magnitude <= CONFIG.RADIO_ISLA_SIN_CAJA
+end
+
+---------------------------------------------------------------
+-- BOSS
+---------------------------------------------------------------
+-- Centro de todas las piezas de la carpeta del boss (o centro del modelo si no hay piezas)
+local function posicionBoss(b)
+    local boss = getPath(b.ruta)
+    if not boss then return nil, nil end
+
+    local suma, n = Vector3.zero, 0
+    local carpeta = boss:FindFirstChild(b.parte)
+    if carpeta then
+        if carpeta:IsA("BasePart") or carpeta:IsA("Model") then
+            suma += posOf(carpeta)
+            n += 1
+        else
+            for _, d in ipairs(carpeta:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    suma += d.Position
+                    n += 1
+                end
+            end
+        end
+    end
+
+    if n == 0 then return boss:GetPivot().Position, boss end
+    return suma / n, boss
+end
+
+local function bossVivo(boss)
+    if not boss or not boss.Parent then return false end
+    local hum = boss:FindFirstChildWhichIsA("Humanoid", true)
+    if hum and hum.Health <= 0 then return false end
+    local hp = boss:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return false end
+    return true
+end
+
+---------------------------------------------------------------
+-- BARCO Y COFRES
+---------------------------------------------------------------
+local function esMiBarco(ship)
+    local nombre, id = LocalPlayer.Name, tostring(LocalPlayer.UserId)
+    for _, attr in ipairs({ "Owner", "OwnerName", "OwnerId", "Player", "PlayerName", "UserId" }) do
+        local v = ship:GetAttribute(attr)
+        if v ~= nil then
+            local s = tostring(v)
+            if s == nombre or s == LocalPlayer.DisplayName or s == id then return true end
+        end
+    end
+    return ship.Name == nombre or ship.Name:find(id, 1, true) ~= nil
+end
+
+local function miBarco()
+    local dyn = getPath({ "World", "Dynamic" })
+    local ships = dyn and dyn:FindFirstChild("Ships")
+    if not ships then return nil end
+    for _, s in ipairs(ships:GetChildren()) do
+        if s:IsA("Folder") then
+            for _, d in ipairs(s:GetChildren()) do
+                if (d:IsA("Model") or d:IsA("BasePart")) and esMiBarco(d) then return d end
+            end
+        elseif (s:IsA("Model") or s:IsA("BasePart")) and esMiBarco(s) then
+            return s
+        end
+    end
+    return nil
+end
+
+-- Espacio usado en la bóveda del barco
+local function espacioUsado(barco)
+    local total = 0
+    local cargo = barco:FindFirstChild("CargoVisuals")
+    if cargo then
+        for _, c in ipairs(cargo:GetChildren()) do
+            if c:IsA("Model") then
+                total += tonumber(c:GetAttribute("CargoSize")) or 1
+            end
+        end
+    end
+    return total
+end
+
+-- Punto encima del barco donde se guardan los cofres
+local function topeBarco(barco)
+    local center, size
+    if barco:IsA("Model") then
+        center, size = barco:GetBoundingBox()
+    else
+        center, size = barco.CFrame, barco.Size
+    end
+    return CFrame.new(center.Position + Vector3.new(0, size.Y / 2 + 3, 0))
+end
+
+-- Recoge todos los cofres de la isla y los lleva al barco, uno por uno
+local function recogerCofresIsla(b)
+    local isla = getIsla(b.isla)
+    local treasure = getPath({ "World", "Dynamic", "Treasure" })
+    if not isla or not treasure then
+        setStatus("No encuentro la isla o el Treasure")
+        return
+    end
+
+    local barco = miBarco()
+    if not barco then
+        setStatus("No encuentro tu barco")
+        return
+    end
+
+    local saltados = {}
+    local recogidosAqui = 0
+
+    while not closed and cazando do
+        -- Busca el siguiente cofre de la isla que no hayamos intentado
+        local item, base, prompt
+        for _, c in ipairs(treasure:GetChildren()) do
+            local bs = c:FindFirstChild("Base")
+            local att = bs and bs:FindFirstChild("PromptAttachment")
+            local pr = att and att:FindFirstChild("TreasurePrompt")
+            if bs and pr and pr:IsA("ProximityPrompt") and not saltados[c] and dentroIsla(isla, bs.Position) then
+                item, base, prompt = c, bs, pr
+                break
+            end
+        end
+        if not item then break end
+
+        local size = tonumber(item:GetAttribute("CargoSize")) or 1
+        if espacioUsado(barco) + size > CONFIG.CAPACIDAD then
+            setStatus("Bóveda llena: vacíala y vuelve a empezar")
+            break
+        end
+
+        saltados[item] = true
+        setStatus("Recogiendo cofre (" .. size .. " espacio)...")
+
+        -- 1) Ir al cofre y recogerlo
+        local att = prompt.Parent
+        local pos = (att and att:IsA("Attachment")) and att.WorldPosition or base.Position
+        tpTo(CFrame.new(pos + Vector3.new(0, CONFIG.ALTURA_COFRE, 0)))
+        task.wait(CONFIG.ESPERA_POSICION)
+        pcall(function()
+            prompt.RequiresLineOfSight = false
+            if prompt.MaxActivationDistance < 25 then prompt.MaxActivationDistance = 25 end
+        end)
+        for _ = 1, CONFIG.INTENTOS_RECOGER do
+            pcall(fireproximityprompt, prompt)
+            task.wait(CONFIG.ESPERA_RECOGER)
+            if not prompt:IsDescendantOf(Workspace) then break end
+        end
+
+        -- 2) Llevarlo al barco y esperar a que se guarde
+        local antes = espacioUsado(barco)
+        setStatus("Llevando cofre al barco...")
+        tpTo(topeBarco(barco))
+        local t0 = os.clock()
+        while os.clock() - t0 < CONFIG.ESPERA_GUARDADO and espacioUsado(barco) <= antes do
+            task.wait(0.25)
+        end
+        if espacioUsado(barco) > antes then
+            recogidosAqui += 1
+            cofresGuardados += 1
+        else
+            setStatus("El cofre no se guardó, sigo con el siguiente")
+            task.wait(0.5)
+        end
+    end
+
+    setStatus("Cofres de la isla: " .. recogidosAqui .. " guardados")
+end
+
+---------------------------------------------------------------
 -- CAZA
 ---------------------------------------------------------------
 local function cazar(b)
@@ -187,8 +345,9 @@ local function cazar(b)
     end
     tpTo(CFrame.new(posOf(isla) + Vector3.new(0, 10, 0)))
     setHover(true)
+    task.wait(CONFIG.ESPERA_STREAMING)
 
-    -- 2) Esperar a que aparezca el boss
+    -- 2) Esperar al boss
     local pos, boss
     local t0 = os.clock()
     while not closed and cazando and os.clock() - t0 < CONFIG.ESPERA_CARGA_BOSS do
@@ -203,15 +362,12 @@ local function cazar(b)
         return
     end
 
-    -- 3) Seguir y atacar
+    -- 3) Seguir y atacar con la altura elegida
     while not closed and cazando do
         pos, boss = posicionBoss(b)
         if not pos or not bossVivo(boss) then break end
 
-        objetivoCF = CFrame.lookAt(
-            pos + Vector3.new(0, CONFIG.ALTURA, CONFIG.DISTANCIA),
-            pos
-        )
+        objetivoCF = CFrame.lookAt(pos + Vector3.new(0, altura, CONFIG.DISTANCIA), pos)
 
         local tool = herramienta()
         if not tool then
@@ -221,15 +377,17 @@ local function cazar(b)
         end
 
         pcall(function() tool:Activate() end)
-        setStatus("Atacando " .. b.nombre .. " en " .. fmt(pos))
+        setStatus("Atacando " .. b.nombre .. " (altura " .. altura .. ") en " .. fmt(pos))
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
     objetivoCF = nil
 
+    -- 4) Boss muerto: recoger los cofres de la isla
     if cazando and not closed and boss and not bossVivo(boss) then
         kills += 1
         setStatus(b.nombre .. " derrotado (" .. kills .. ")")
+        recogerCofresIsla(b)
         task.wait(CONFIG.ESPERA_RESPAWN)
     end
 end
@@ -266,13 +424,13 @@ local function crearGui()
     return gui
 end
 
-local bossBtn, toggleBtn, killsLbl, statusLbl
+local bossBtn, toggleBtn, killsLbl, statusLbl, alturaLbl
 
 local function construirUI()
     local gui = crearGui()
 
     local main = mk("Frame", {
-        Size = UDim2.fromOffset(150, 108),
+        Size = UDim2.fromOffset(150, 132),
         Position = UDim2.new(0, 8, 0.3, 0),
         BackgroundColor3 = BG,
         BorderSizePixel = 0,
@@ -317,8 +475,23 @@ local function construirUI()
         end
     end)
 
+    -- Fila de altura: ▼ valor ▲
+    boton(UDim2.new(0, 6, 0, 90), UDim2.fromOffset(34, 20), CARD, 10, function()
+        altura = math.max(CONFIG.ALTURA_MIN, altura - CONFIG.PASO_ALTURA)
+    end).Text = "▼"
+
+    alturaLbl = mk("TextLabel", {
+        Position = UDim2.new(0, 42, 0, 90), Size = UDim2.new(1, -84, 0, 20),
+        BackgroundTransparency = 1, TextColor3 = TEXT, TextSize = 9,
+        Font = Enum.Font.GothamBold, Text = "",
+    }, main)
+
+    boton(UDim2.new(1, -40, 0, 90), UDim2.fromOffset(34, 20), CARD, 10, function()
+        altura = math.min(CONFIG.ALTURA_MAX, altura + CONFIG.PASO_ALTURA)
+    end).Text = "▲"
+
     killsLbl = mk("TextLabel", {
-        Size = UDim2.new(1, -12, 0, 12), Position = UDim2.new(0, 6, 0, 90),
+        Size = UDim2.new(1, -12, 0, 12), Position = UDim2.new(0, 6, 0, 114),
         BackgroundTransparency = 1, TextColor3 = TEXT, TextSize = 8, Font = Enum.Font.Gotham,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, main)
@@ -348,8 +521,9 @@ task.spawn(function()
             bossBtn.Text = b.nombre
             toggleBtn.Text = cazando and "■ Parar" or "▶ Cazar"
             toggleBtn.BackgroundColor3 = cazando and RED or GREEN
+            alturaLbl.Text = "Altura: " .. altura
             statusLbl.Text = statusText
-            killsLbl.Text = "Derrotados: " .. kills
+            killsLbl.Text = "Derrotados: " .. kills .. " · Cofres: " .. cofresGuardados
         end
 
         if cazando then
@@ -359,6 +533,7 @@ task.spawn(function()
                 task.wait(2)
             end
         else
+            setHover(false)
             task.wait(0.3)
         end
     end
