@@ -1,5 +1,6 @@
 -- Recolección de cofres + barco + barco de otro jugador (con memoria de sesión) + tesorero + mares/islas (español/inglés) + filtros + COMBATE AUTOMÁTICO
 -- + PUNTO DE ENTREGA (automático o manual) + POSICIÓN GUARDADA DE PANEL Y BURBUJA
+-- + RECORRIDO DE TODAS LAS ISLAS DE UN MAR + RAREZA "Secret" (el filtro incluye la elegida y las superiores)
 -- + PUNTO MANUAL DEL TESORERO (para vaciar la bóveda) + VALIDACIÓN Y DIAGNÓSTICO DE TAMAÑOS DE COFRES
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -162,7 +163,7 @@ local CONFIG = {
     VALOR_PASO = 1000,
     RAREZA_FILTRO_INICIAL = false,
     RAREZA_MIN_INICIAL = 3,
-    RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine" },
+    RAREZAS = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Secret" },
 
     -- COMBATE
     PREFIJO_TIERRA = "Enemy_",         -- enemigos de tierra: Enemy_(nombre)
@@ -346,6 +347,9 @@ end
 -- Usar el contador de espacio del juego si el barco lo tiene
 EX.useGameCounter = svb("useGameCounter", CONFIG.CONTADOR_JUEGO_INICIAL)
 
+-- Recorrer todas las islas del mar elegido (una tras otra) buscando cofres que pasen tus filtros
+EX.sweepMode = svb("sweepMode", false)
+
 -- Posición guardada del panel {xScale, xOffset, yScale, yOffset} y de la burbuja {x, y}
 EX.mainPos = nil
 if type(saved.mainPos) == "table" then
@@ -427,6 +431,7 @@ local function saveConfig()
         brokerMode = EX.brokerMode,
         brokerPos = EX.brokerPos and { EX.brokerPos.X, EX.brokerPos.Y, EX.brokerPos.Z } or nil,
         useGameCounter = EX.useGameCounter,
+        sweepMode = EX.sweepMode,
         mainPos = EX.mainPos,
         miniPos = EX.miniPos,
     }
@@ -1383,8 +1388,8 @@ end
 ---------------------------------------------------------------
 -- ISLA: ir y quedarse flotando (lo usan cofres y combate)
 ---------------------------------------------------------------
-function CB.prepareIsland()
-    local entry = currentIslandEntry()
+function CB.prepareIsland(entryOverride)
+    local entry = entryOverride or currentIslandEntry()
     local island = getIsland(entry)
     if not island then
         setStatus("No encuentro la isla " .. islandDisplayName(entry))
@@ -1637,7 +1642,7 @@ end
 ---------------------------------------------------------------
 -- CICLO
 ---------------------------------------------------------------
-local function collectCycle()
+local function collectCycle(entryOverride)
     local treasure = getTreasureFolder()
     if not treasure then
         setStatus("No encuentro World.Dynamic.Treasure")
@@ -1666,8 +1671,10 @@ local function collectCycle()
     end
 
     local island
-    if islandMode then
-        island = CB.prepareIsland()
+    local useIsland = islandMode or entryOverride ~= nil
+    local islandLabel = islandDisplayName(entryOverride or currentIslandEntry())
+    if useIsland then
+        island = CB.prepareIsland(entryOverride)
         if not island then return end
     end
 
@@ -1716,7 +1723,7 @@ local function collectCycle()
 
                 setStatus("Recogiendo cofre (espacio " .. size .. ")...")
                 local usedBefore = usedSpaceOn(dest)
-                pickUpChest(base, prompt, islandMode and CONFIG.ALTURA_ISLA or nil, islandMode)
+                pickUpChest(base, prompt, useIsland and CONFIG.ALTURA_ISLA or nil, useIsland)
                 collectedCount += 1
 
                 setHover(false)
@@ -1727,19 +1734,31 @@ local function collectCycle()
                 if returnToSpot and returnCF then
                     setStatus("Volviendo a tu posición...")
                     teleportToCFrame(returnCF)
-                    if islandMode then hoverHere() end
+                    if useIsland then hoverHere() end
                 end
             end
         end
     end
 
     if auto then
-        if islandMode then
+        if useIsland then
             setStatus(string.format("%s: %d cofres en el mapa, %d en la isla, %d válidos con tus filtros",
-                currentIslandName(), seen, inside, passed))
+                islandLabel, seen, inside, passed))
         else
             setStatus("Buscando cofres...")
         end
+    end
+end
+
+-- Recorre TODAS las islas del mar elegido: va a cada una, recoge los cofres que pasen
+-- tus filtros (rareza, valor, dueño) y sigue con la siguiente. Al terminar, el ciclo principal repite.
+function EX.sweepCycle()
+    local group = ISLAND_GROUPS[diffIndex]
+    for i, entry in ipairs(group.islas) do
+        if closed or not auto then return end
+        setStatus(string.format("Recorriendo %s: isla %d/%d (%s)",
+            seaDisplayName(group), i, #group.islas, islandDisplayName(entry)))
+        collectCycle(entry)
     end
 end
 
@@ -2297,7 +2316,14 @@ checkRow(pageIsla, "Nombres en inglés (English)", 2, englishNames, function(v)
     setStatus(v and "Nombres de islas en inglés" or "Nombres de islas en español")
 end)
 
-local diffRow = arrowRow(pageIsla, 3,
+checkRow(pageIsla, "Recorrer TODAS las islas del mar", 3, EX.sweepMode, function(v)
+    EX.sweepMode = v
+    markDirty()
+    setStatus(v and ("Recorrerá todas las islas de " .. seaDisplayName(ISLAND_GROUPS[diffIndex]))
+        or "Recorrido de islas apagado")
+end)
+
+local diffRow = arrowRow(pageIsla, 4,
     function()
         return seaDisplayName(ISLAND_GROUPS[diffIndex]) .. " (" .. diffIndex .. "/" .. #ISLAND_GROUPS .. ")"
     end,
@@ -2317,7 +2343,7 @@ local diffRow = arrowRow(pageIsla, 3,
     end
 )
 
-local islandRow = arrowRow(pageIsla, 4,
+local islandRow = arrowRow(pageIsla, 5,
     function()
         local group = ISLAND_GROUPS[diffIndex]
         return islandDisplayName(group.islas[islandIndex]) .. " (" .. islandIndex .. "/" .. #group.islas .. ")"
@@ -2339,8 +2365,8 @@ local islandRow = arrowRow(pageIsla, 4,
 )
 
 local islandNote = label(pageIsla, "", 10, PALETTE.muted, false)
-islandNote.LayoutOrder = 5
-islandNote.Size = UDim2.new(1, -4, 0, 30)
+islandNote.LayoutOrder = 6
+islandNote.Size = UDim2.new(1, -4, 0, 58)
 islandNote.TextWrapped = true
 islandNote.TextYAlignment = Enum.TextYAlignment.Top
 
@@ -2450,12 +2476,12 @@ local valueRow = numberRow(pageFiltros, 2, "Valor mín.",
 checkRow(pageFiltros, "Filtrar por rareza (Rarity)", 3, rarityFilter, function(v)
     rarityFilter = v
     markDirty()
-    setStatus(v and ("Solo cofres desde " .. CONFIG.RAREZAS[rarityMinIdx]) or "Filtro de rareza apagado")
+    setStatus(v and ("Solo cofres " .. CONFIG.RAREZAS[rarityMinIdx] .. " o superiores") or "Filtro de rareza apagado")
 end)
 
 local rarityRow = arrowRow(pageFiltros, 4,
     function()
-        return "Mínima: " .. CONFIG.RAREZAS[rarityMinIdx] .. " (" .. rarityMinIdx .. "/" .. #CONFIG.RAREZAS .. ")"
+        return "Rareza ≥ " .. CONFIG.RAREZAS[rarityMinIdx] .. " (" .. rarityMinIdx .. "/" .. #CONFIG.RAREZAS .. ")"
     end,
     function()
         rarityMinIdx = rarityMinIdx - 1
@@ -2732,9 +2758,14 @@ refreshUI = function()
     waitStepper.refresh()
     diffRow.refresh()
     islandRow.refresh()
-    islandNote.Text = islandMode
-        and ("Irá a " .. currentIslandName() .. " (" .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. ") y solo recogerá cofres dentro de esa isla.")
-        or "Activa la opción para recoger solo en la isla elegida."
+    if EX.sweepMode then
+        islandNote.Text = "Recorrerá las " .. #ISLAND_GROUPS[diffIndex].islas .. " islas de "
+            .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. " una por una y recogerá los cofres que pasen tus filtros (pestaña Filtros). Tiene prioridad sobre «Recolectar por isla»."
+    elseif islandMode then
+        islandNote.Text = "Irá a " .. currentIslandName() .. " (" .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. ") y solo recogerá cofres dentro de esa isla."
+    else
+        islandNote.Text = "Activa «Recolectar por isla» (una isla) o «Recorrer TODAS las islas» (todo el mar elegido)."
+    end
 
     capStepper.refresh()
 
@@ -2775,7 +2806,7 @@ refreshUI = function()
     rarityRow.refresh()
     filterNote.Text = "Valor: recoge cofres con Value ≥ " .. valueMin
         .. (valueFilter and " (activo)" or " (apagado)")
-        .. ". Rareza: desde " .. CONFIG.RAREZAS[rarityMinIdx]
+        .. ". Rareza: " .. CONFIG.RAREZAS[rarityMinIdx] .. " y todas las superiores"
         .. (rarityFilter and " (activo)" or " (apagado)") .. "."
 
     -- Combate
@@ -2855,7 +2886,7 @@ task.spawn(function()
                 end
             end
             if auto and not closed then
-                local ok, err = pcall(collectCycle)
+                local ok, err = pcall(EX.sweepMode and EX.sweepCycle or collectCycle)
                 if not ok then
                     setHover(false)
                     setStatus("Error: " .. tostring(err))
