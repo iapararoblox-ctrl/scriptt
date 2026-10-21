@@ -1,5 +1,5 @@
 -- Caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
--- Botín de World.Dynamic.Loot llevado al barco con el mismo flujo que el script de cofres
+-- Botín de World.Dynamic.Loot llevado al barco; primero deposita el cofre que quede en la mano
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -327,6 +327,46 @@ local function getShipTop(barco)
 end
 
 ---------------------------------------------------------------
+-- COFRE EN LA MANO (el que suelta el boss o uno recogido)
+---------------------------------------------------------------
+local function cofreEnMano()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, c in ipairs(char:GetChildren()) do
+        if c:IsA("Tool") or c:IsA("Model") then
+            local tieneCarga = c:GetAttribute("CargoSize") ~= nil
+                or c:FindFirstChild("CargoSize") ~= nil
+            if tieneCarga or c.Name:find("Treasure") then
+                return c
+            end
+        end
+    end
+    return nil
+end
+
+-- Si tienes un cofre en la mano, lo llevas al barco antes de hacer cualquier otra cosa
+local function depositarEnMano(barco)
+    if not cofreEnMano() then return true end
+
+    setStatus("Llevando el cofre de la mano al barco...")
+    setHover(false)
+    local antes = usedSpaceOn(barco)
+    tpTo(CFrame.new(getShipTop(barco)))
+
+    local t0 = os.clock()
+    while os.clock() - t0 < CONFIG.ESPERA_GUARDADO do
+        if not cofreEnMano() or usedSpaceOn(barco) > antes then
+            task.wait(0.5)
+            return true
+        end
+        task.wait(0.25)
+    end
+
+    setStatus("El cofre de la mano no se guardó")
+    return false
+end
+
+---------------------------------------------------------------
 -- BOTÍN (World.Dynamic.Loot)
 -- Estructura: Loot > Treasure_xxx > Base > PromptAttachment > TreasurePrompt
 ---------------------------------------------------------------
@@ -373,6 +413,9 @@ local function recogerBotin()
         return
     end
 
+    -- Primero el cofre que traes en la mano
+    if not depositarEnMano(barco) then return end
+
     setStatus("Esperando el botín...")
     local lista = esperarBotin(loot)
     if #lista == 0 then
@@ -386,6 +429,9 @@ local function recogerBotin()
         if closed or not cazando then break end
         local item, prompt = entry.item, entry.prompt
 
+        -- Antes de cada recogida, deja el cofre que tengas en la mano
+        if not depositarEnMano(barco) then break end
+
         if prompt:IsDescendantOf(Workspace) then
             local size = getChestSize(item)
             if usedSpaceOn(barco) + size > CONFIG.CAPACIDAD then
@@ -397,9 +443,6 @@ local function recogerBotin()
             local anchorPos = (padre and padre:IsA("Attachment")) and padre.WorldPosition or posOf(item)
 
             if anchorPos then
-                -- Igual que el script de cofres: usedBefore se toma antes de recoger
-                local usedBefore = usedSpaceOn(barco)
-
                 -- 1) Ir al botín y activar el prompt
                 setStatus("Recogiendo " .. item.Name .. "...")
                 tpTo(CFrame.new(anchorPos + Vector3.new(0, CONFIG.ALTURA_COFRE, 0)))
@@ -419,33 +462,16 @@ local function recogerBotin()
                     if not prompt:IsDescendantOf(Workspace) then break end
                 end
 
-                -- 2) Apagar el flotar y llevarlo al barco
-                setHover(false)
-                setStatus("Guardando " .. item.Name .. " en tu barco...")
-                tpTo(CFrame.new(getShipTop(barco)))
-
-                local t1 = os.clock()
-                local guardado = false
-                while os.clock() - t1 < CONFIG.ESPERA_GUARDADO do
-                    if usedSpaceOn(barco) > usedBefore then
-                        guardado = true
-                        break
-                    end
-                    task.wait(0.25)
-                end
-
-                if guardado then
+                -- 2) Llevarlo al barco
+                if depositarEnMano(barco) then
                     recogidos += 1
                     botinRecogido += 1
-                else
-                    setStatus("El botín no se guardó: revisa que estés sobre el barco")
-                    task.wait(0.5)
                 end
-                setHover(true)
             end
         end
     end
 
+    setHover(true)
     setStatus("Botín guardado: " .. recogidos)
 end
 
@@ -511,14 +537,13 @@ local function cazar(b)
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
-    -- 4) Soltar al boss y alejarse de él
+    -- 4) Soltar al boss y subir a la parte alta de la isla
     objetivoCF = nil
 
     if murio and cazando and not closed then
         kills += 1
         setStatus(b.nombre .. " derrotado (" .. kills .. ")")
 
-        -- Subir a la parte alta de la isla para despegarse del boss
         local isla2 = getIsla(b.isla)
         if isla2 then
             tpTo(CFrame.new(islandTop(isla2) + Vector3.new(0, 10, 0)))
@@ -582,7 +607,7 @@ local function construirUI()
 
     mk("TextLabel", {
         Size = UDim2.new(1, -28, 0, 14), Position = UDim2.new(0, 6, 0, 4),
-        BackgroundTransparency = 1, Text = "Bosses v1", TextColor3 = TEXT,
+        BackgroundTransparency = 1, Text = "Bosses v2", TextColor3 = TEXT,
         TextSize = 11, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
     }, main)
 
