@@ -1,5 +1,5 @@
 -- Caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
--- Altura y lado por boss (guardados), botín de World.Dynamic.Loot recogido igual que el script de cofres
+-- Altura y lado por boss, botón de recolección de botín, botín de World.Dynamic.Loot al barco
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
@@ -12,21 +12,21 @@ local CONFIG = {
     ALTURA_MAX = 40,
     LADO_MIN = -30,
     LADO_MAX = 30,
-    PASO = 1,                   -- studs por pulsación
+    PASO = 1,
     ARCHIVO = "BossConfig.json",
     ESPERA_STREAMING = 2,       -- al llegar a la isla
     ESPERA_CARGA_BOSS = 20,     -- esperando que aparezca el boss
-    ESPERA_ATAQUE = 0.15,       -- entre golpes
-    ESPERA_RESPAWN = 3,         -- antes de buscar el boss otra vez
-    ESPERA_BOTIN = 2,           -- tras morir el boss, para que aparezca el botín
+    ESPERA_ATAQUE = 0.15,
+    ESPERA_RESPAWN = 3,
+    ESPERA_BOTIN = 7,          -- segundos máximos esperando que aparezca el botín tras morir el boss
     -- Botín (mismos valores que el script de cofres)
-    CAPACIDAD = 81,             -- espacio de la bóveda de tu barco
-    ALTURA_COFRE = 3,           -- studs sobre el cofre al recogerlo
-    ALTURA_BARCO = 3,           -- studs sobre el barco al guardar
-    ESPERA_POSICION = 0.25,     -- para que el servidor reciba tu posición antes de recoger
+    CAPACIDAD = 81,
+    ALTURA_COFRE = 3,
+    ALTURA_BARCO = 3,
+    ESPERA_POSICION = 0.25,
     ESPERA_RECOGER = 0.3,
     INTENTOS_RECOGER = 2,
-    ESPERA_GUARDADO = 3,        -- segundos máximos para confirmar que el cofre se guardó
+    ESPERA_GUARDADO = 3,
     DEBUG = true,
 }
 
@@ -51,12 +51,12 @@ local bossIndex = 1
 local cazando = false
 local closed = false
 local kills = 0
-local cofresGuardados = 0
+local botinRecogido = 0
 local statusText = "Listo"
 local objetivoCF = nil
 
 ---------------------------------------------------------------
--- AJUSTES POR BOSS (altura y lado), guardados en archivo
+-- AJUSTES (altura y lado por boss, y botón de botín), guardados en archivo
 ---------------------------------------------------------------
 local ajustes = {}
 pcall(function()
@@ -71,6 +71,10 @@ local function ajusteDe(b)
         ajustes[b.nombre] = { altura = 0, lado = 0 }
     end
     return ajustes[b.nombre]
+end
+
+local function botinActivo()
+    return ajustes._botin ~= false
 end
 
 local function guardarAjustes()
@@ -110,7 +114,6 @@ local function posOf(obj)
     return nil
 end
 
--- Teletransporte instantáneo (igual que el script de cofres)
 local function tpTo(cf)
     local root = getRoot()
     if not root then return end
@@ -119,7 +122,7 @@ local function tpTo(cf)
     task.wait(0.2)
 end
 
--- Cada frame deja al personaje en el objetivo (así sigue al boss)
+-- Cada frame deja al personaje en el objetivo (solo mientras hay un boss vivo)
 RunService.Heartbeat:Connect(function()
     if not objetivoCF then return end
     local root = getRoot()
@@ -209,17 +212,19 @@ local function posicionBoss(b)
     return suma / n, boss
 end
 
-local function bossVivo(boss)
-    if not boss or not boss.Parent then return false end
+-- true si el boss está muerto o ya no existe
+local function estaMuerto(boss)
+    if not boss or not boss.Parent then return true end
     local hum = boss:FindFirstChildWhichIsA("Humanoid", true)
-    if hum and hum.Health <= 0 then return false end
+    if hum and hum.Health <= 0 then return true end
     local hp = boss:GetAttribute("Health")
-    if type(hp) == "number" and hp <= 0 then return false end
-    return true
+    if type(hp) == "number" and hp <= 0 then return true end
+    if boss:GetAttribute("Dead") == true then return true end
+    return false
 end
 
 ---------------------------------------------------------------
--- BARCO Y BÓVEDA (igual que el script de cofres)
+-- BARCO Y BÓVEDA
 ---------------------------------------------------------------
 local function esMiBarco(ship)
     local nombre, id = LocalPlayer.Name, tostring(LocalPlayer.UserId)
@@ -248,19 +253,13 @@ local function miBarco()
     return nil
 end
 
-local function getChestProp(obj, name)
-    local v = obj:GetAttribute(name)
-    if v == nil then
-        local child = obj:FindFirstChild(name)
-        if child and child:IsA("ValueBase") then
-            v = child.Value
-        end
-    end
-    return v
-end
-
 local function getCargoSize(obj)
-    return tonumber(getChestProp(obj, "CargoSize")) or 1
+    local v = obj:GetAttribute("CargoSize")
+    if v == nil then
+        local child = obj:FindFirstChild("CargoSize")
+        if child and child:IsA("ValueBase") then v = child.Value end
+    end
+    return tonumber(v) or 1
 end
 
 local function chestsOn(barco)
@@ -268,9 +267,7 @@ local function chestsOn(barco)
     local cargo = barco and barco:FindFirstChild("CargoVisuals")
     if cargo then
         for _, c in ipairs(cargo:GetChildren()) do
-            if c:IsA("Model") then
-                table.insert(list, c)
-            end
+            if c:IsA("Model") then table.insert(list, c) end
         end
     end
     return list
@@ -284,7 +281,6 @@ local function usedSpaceOn(barco)
     return total
 end
 
--- Punto encima del barco donde se guardan los cofres
 local function getShipTop(barco)
     local center, size
     if barco:IsA("Model") then
@@ -296,11 +292,10 @@ local function getShipTop(barco)
 end
 
 ---------------------------------------------------------------
--- BOTÍN (World.Dynamic.Loot): recoger uno por uno y llevarlo al barco
+-- BOTÍN (World.Dynamic.Loot)
 ---------------------------------------------------------------
--- Busca el prompt del botín: primero la ruta de cofre (Base/PromptAttachment/TreasurePrompt),
--- si no existe, cualquier ProximityPrompt dentro
 local function findPrompt(item)
+    if item:IsA("ProximityPrompt") then return item end
     local base = item:FindFirstChild("Base")
     local att = base and base:FindFirstChild("PromptAttachment")
     local p = att and att:FindFirstChild("TreasurePrompt")
@@ -311,7 +306,31 @@ local function findPrompt(item)
     return nil
 end
 
-local function recogerBotin(b)
+-- Lista de botín con prompt activo: { item, prompt }
+local function listaBotin(loot)
+    local lista = {}
+    for _, c in ipairs(loot:GetChildren()) do
+        local p = findPrompt(c)
+        if p then table.insert(lista, { item = c, prompt = p }) end
+    end
+    return lista
+end
+
+-- Espera hasta que aparezca el botín (el juego puede tardar en soltarlo)
+local function esperarBotin(loot)
+    local t0 = os.clock()
+    while not closed and os.clock() - t0 < CONFIG.ESPERA_BOTIN do
+        local lista = listaBotin(loot)
+        if #lista > 0 then return lista end
+        task.wait(0.5)
+    end
+    return listaBotin(loot)
+end
+
+local function recogerBotin()
+    objetivoCF = nil
+    setHover(false)
+
     local loot = getPath({ "World", "Dynamic", "Loot" })
     if not loot then
         setStatus("No encuentro World.Dynamic.Loot")
@@ -324,77 +343,78 @@ local function recogerBotin(b)
         return
     end
 
-    local saltados = {}
-    local guardados = 0
+    setStatus("Esperando el botín...")
+    local lista = esperarBotin(loot)
+    if #lista == 0 then
+        setStatus("No apareció botín con prompt en Loot")
+        return
+    end
+    setStatus("Botín encontrado: " .. #lista)
 
-    while not closed and cazando do
-        local item, prompt
-        for _, c in ipairs(loot:GetChildren()) do
-            if not saltados[c] then
-                local p = findPrompt(c)
-                if p then
-                    item, prompt = c, p
-                    break
+    local recogidos = 0
+    for _, entry in ipairs(lista) do
+        if closed then break end
+        local item, prompt = entry.item, entry.prompt
+
+        -- Si el prompt ya no existe, el botín ya fue recogido o desapareció
+        if prompt:IsDescendantOf(Workspace) then
+            local size = getCargoSize(item)
+            if usedSpaceOn(barco) + size > CONFIG.CAPACIDAD then
+                setStatus("Bóveda llena: vacíala para seguir")
+                break
+            end
+
+            local padre = prompt.Parent
+            local anchorPos
+            if padre and padre:IsA("Attachment") then
+                anchorPos = padre.WorldPosition
+            elseif padre and padre:IsA("BasePart") then
+                anchorPos = padre.Position
+            else
+                anchorPos = posOf(item)
+            end
+
+            if anchorPos then
+                -- 1) Ir encima del botín y recogerlo
+                setStatus("Recogiendo " .. item.Name .. "...")
+                tpTo(CFrame.new(anchorPos + Vector3.new(0, CONFIG.ALTURA_COFRE, 0)))
+
+                pcall(function()
+                    prompt.RequiresLineOfSight = false
+                    if prompt.MaxActivationDistance < 25 then
+                        prompt.MaxActivationDistance = 25
+                    end
+                end)
+
+                task.wait(CONFIG.ESPERA_POSICION)
+
+                for _ = 1, CONFIG.INTENTOS_RECOGER do
+                    pcall(fireproximityprompt, prompt)
+                    task.wait(CONFIG.ESPERA_RECOGER)
+                    if not prompt:IsDescendantOf(Workspace) then break end
+                end
+
+                -- 2) Llevarlo al barco y esperar confirmación en la bóveda
+                local antes = usedSpaceOn(barco)
+                setStatus("Llevando " .. item.Name .. " al barco...")
+                tpTo(CFrame.new(getShipTop(barco)))
+
+                local t1 = os.clock()
+                while os.clock() - t1 < CONFIG.ESPERA_GUARDADO and usedSpaceOn(barco) <= antes do
+                    task.wait(0.25)
+                end
+
+                recogidos += 1
+                botinRecogido += 1
+                if usedSpaceOn(barco) <= antes then
+                    setStatus(item.Name .. " recogido (sin confirmar en bóveda)")
+                    task.wait(0.5)
                 end
             end
         end
-        if not item then break end
-        saltados[item] = true
-
-        local size = getCargoSize(item)
-        if usedSpaceOn(barco) + size > CONFIG.CAPACIDAD then
-            setStatus("Bóveda llena: vacíala para seguir")
-            break
-        end
-
-        -- 1) Ir encima del cofre y recogerlo (igual que el script de cofres)
-        local att = prompt.Parent
-        local anchorPos = (att and att:IsA("Attachment")) and att.WorldPosition or posOf(item)
-        if not anchorPos then
-            setStatus("No encuentro la posición de " .. item.Name)
-            continue
-        end
-
-        setStatus("Recogiendo cofre (" .. size .. " espacio)...")
-        tpTo(CFrame.new(anchorPos + Vector3.new(0, CONFIG.ALTURA_COFRE, 0)))
-
-        pcall(function()
-            prompt.RequiresLineOfSight = false
-            if prompt.MaxActivationDistance < 25 then
-                prompt.MaxActivationDistance = 25
-            end
-        end)
-
-        -- Deja que el servidor reciba tu nueva posición antes de activar el prompt
-        task.wait(CONFIG.ESPERA_POSICION)
-
-        for _ = 1, CONFIG.INTENTOS_RECOGER do
-            pcall(fireproximityprompt, prompt)
-            task.wait(CONFIG.ESPERA_RECOGER)
-            if not prompt:IsDescendantOf(Workspace) then break end
-        end
-
-        -- 2) Llevarlo al barco y confirmar que apareció en la bóveda
-        local antes = usedSpaceOn(barco)
-        setHover(false)
-        setStatus("Guardando en tu barco...")
-        tpTo(CFrame.new(getShipTop(barco)))
-
-        local t0 = os.clock()
-        while os.clock() - t0 < CONFIG.ESPERA_GUARDADO and usedSpaceOn(barco) <= antes do
-            task.wait(0.25)
-        end
-
-        if usedSpaceOn(barco) > antes then
-            guardados += 1
-            cofresGuardados += 1
-        else
-            setStatus("El cofre no se guardó, sigo con el siguiente")
-            task.wait(0.5)
-        end
     end
 
-    setStatus("Botín guardado en el barco: " .. guardados)
+    setStatus("Botín recogido: " .. recogidos)
 end
 
 ---------------------------------------------------------------
@@ -412,11 +432,12 @@ local function cazar(b)
     setHover(true)
     task.wait(CONFIG.ESPERA_STREAMING)
 
+    -- Espera a que aparezca el boss
     local pos, boss
     local t0 = os.clock()
     while not closed and cazando and os.clock() - t0 < CONFIG.ESPERA_CARGA_BOSS do
         pos, boss = posicionBoss(b)
-        if pos and bossVivo(boss) then break end
+        if pos and not estaMuerto(boss) then break end
         setStatus("Esperando a " .. b.nombre .. "...")
         task.wait(0.5)
     end
@@ -426,15 +447,18 @@ local function cazar(b)
         return
     end
 
-    -- Ataque: altura y lado se leen en cada golpe, así se aplican al instante
+    -- Ataque
+    local ultimoBoss = nil
     while not closed and cazando do
-        pos, boss = posicionBoss(b)
-        if not pos or not bossVivo(boss) then break end
+        local p, bo = posicionBoss(b)
+        if not p then break end
+        ultimoBoss = bo
+        if estaMuerto(bo) then break end
 
         local a = ajusteDe(b)
         objetivoCF = CFrame.lookAt(
-            pos + Vector3.new(a.lado, a.altura, CONFIG.DISTANCIA),
-            pos
+            p + Vector3.new(a.lado, a.altura, CONFIG.DISTANCIA),
+            p
         )
 
         local tool = herramienta()
@@ -445,19 +469,24 @@ local function cazar(b)
         end
 
         pcall(function() tool:Activate() end)
-        setStatus("Atacando " .. b.nombre .. " (" .. fmt(pos) .. ")")
+        setStatus("Atacando " .. b.nombre .. " (" .. fmt(p) .. ")")
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
+    -- Soltar al personaje del boss en cuanto termina el ataque
     objetivoCF = nil
 
-    if cazando and not closed and boss and not bossVivo(boss) then
+    local murio = ultimoBoss ~= nil and estaMuerto(ultimoBoss)
+    if murio and cazando and not closed then
         kills += 1
         setStatus(b.nombre .. " derrotado (" .. kills .. ")")
-        task.wait(CONFIG.ESPERA_BOTIN)
-        recogerBotin(b)
+        if botinActivo() then
+            task.wait(1)
+            recogerBotin()
+        end
         task.wait(CONFIG.ESPERA_RESPAWN)
     end
+    setHover(false)
 end
 
 ---------------------------------------------------------------
@@ -492,13 +521,13 @@ local function crearGui()
     return gui
 end
 
-local bossBtn, toggleBtn, killsLbl, statusLbl, alturaLbl, ladoLbl
+local bossBtn, toggleBtn, botinBtn, killsLbl, statusLbl, alturaLbl, ladoLbl
 
 local function construirUI()
     local gui = crearGui()
 
     local main = mk("Frame", {
-        Size = UDim2.fromOffset(150, 156),
+        Size = UDim2.fromOffset(150, 178),
         Position = UDim2.new(0, 8, 0.3, 0),
         BackgroundColor3 = BG,
         BorderSizePixel = 0,
@@ -579,8 +608,13 @@ local function construirUI()
         end,
         "◀", "▶")
 
+    botinBtn = boton(UDim2.new(0, 6, 0, 138), UDim2.new(1, -12, 0, 20), CARD, 9, function()
+        ajustes._botin = not botinActivo()
+        guardarAjustes()
+    end)
+
     killsLbl = mk("TextLabel", {
-        Size = UDim2.new(1, -12, 0, 12), Position = UDim2.new(0, 6, 0, 138),
+        Size = UDim2.new(1, -12, 0, 12), Position = UDim2.new(0, 6, 0, 162),
         BackgroundTransparency = 1, TextColor3 = TEXT, TextSize = 8, Font = Enum.Font.Gotham,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, main)
@@ -613,13 +647,16 @@ task.spawn(function()
             toggleBtn.BackgroundColor3 = cazando and RED or GREEN
             alturaLbl.Text = "Altura: " .. a.altura
             ladoLbl.Text = "Lado: " .. a.lado
+            botinBtn.Text = "Botín: " .. (botinActivo() and "ON" or "OFF")
+            botinBtn.BackgroundColor3 = botinActivo() and GREEN or CARD
             statusLbl.Text = statusText
-            killsLbl.Text = "Derrotados: " .. kills .. " · Botín: " .. cofresGuardados
+            killsLbl.Text = "Derrotados: " .. kills .. " · Botín: " .. botinRecogido
         end
 
         if cazando then
             local ok, err = pcall(cazar, b)
             if not ok then
+                objetivoCF = nil
                 setStatus("Error: " .. tostring(err))
                 task.wait(2)
             end
