@@ -582,7 +582,7 @@ local function construirUI()
 
     mk("TextLabel", {
         Size = UDim2.new(1, -28, 0, 14), Position = UDim2.new(0, 6, 0, 4),
-        BackgroundTransparency = 1, Text = "Bosses", TextColor3 = TEXT,
+        BackgroundTransparency = 1, Text = "Bosses v1", TextColor3 = TEXT,
         TextSize = 11, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
     }, main)
 
