@@ -1,14 +1,15 @@
 -- Sesión de caza de bosses (TP): HE IRON TYRANT y Celestial Serpent
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local CONFIG = {
-    DISTANCIA = 4,
-    ALTURA = 0,
-    ESPERA_CARGA_BOSS = 20,
-    ESPERA_ATAQUE = 0.15,
-    ESPERA_RESPAWN = 3,
+    DISTANCIA = 4,              -- studs detrás del boss
+    ALTURA = 0,                 -- studs de altura sobre el boss
+    ESPERA_CARGA_BOSS = 20,     -- segundos esperando que aparezca el boss al llegar
+    ESPERA_ATAQUE = 0.15,       -- segundos entre golpes
+    ESPERA_RESPAWN = 3,         -- segundos antes de buscar el boss tras morir
     DEBUG = true,
 }
 
@@ -34,6 +35,9 @@ local cazando = false
 local closed = false
 local kills = 0
 local statusText = "Listo"
+
+-- Objetivo que el Heartbeat aplica cada frame (null = no seguir)
+local objetivoCF = nil
 
 ---------------------------------------------------------------
 -- UTILIDADES
@@ -76,22 +80,35 @@ local function getIsla(nombre)
     return nil
 end
 
-local function getAnchor(boss, parteName)
-    local carpeta = boss:FindFirstChild(parteName)
-    if not carpeta then return nil end
-    if carpeta:IsA("Model") or carpeta:IsA("BasePart") then
-        return carpeta
-    end
-    local mejor, mejorVol = nil, -1
-    for _, d in ipairs(carpeta:GetDescendants()) do
-        if d:IsA("BasePart") then
-            local vol = d.Size.X * d.Size.Y * d.Size.Z
-            if vol > mejorVol then
-                mejor, mejorVol = d, vol
+-- Posición del boss: centro de todas las piezas de la carpeta indicada.
+-- Si la carpeta no tiene piezas, usa el centro del modelo del boss.
+local function posicionBoss(b)
+    local boss = getPath(b.ruta)
+    if not boss then return nil, nil end
+
+    local suma, n = Vector3.zero, 0
+    local carpeta = boss:FindFirstChild(b.parte)
+    if carpeta then
+        if carpeta:IsA("BasePart") then
+            suma += carpeta.Position
+            n += 1
+        elseif carpeta:IsA("Model") then
+            suma += carpeta:GetPivot().Position
+            n += 1
+        else
+            for _, d in ipairs(carpeta:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    suma += d.Position
+                    n += 1
+                end
             end
         end
     end
-    return mejor
+
+    if n == 0 then
+        return boss:GetPivot().Position, boss
+    end
+    return suma / n, boss
 end
 
 local function bossVivo(boss)
@@ -105,11 +122,20 @@ end
 
 local function tpTo(cf)
     local root = getRoot()
-    if not root then return false end
+    if not root then return end
     root.AssemblyLinearVelocity = Vector3.zero
     root.CFrame = cf
-    return true
 end
+
+-- Heartbeat: cada frame coloca al personaje en el objetivo actual
+RunService.Heartbeat:Connect(function()
+    if not objetivoCF then return end
+    local root = getRoot()
+    if root then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = objetivoCF
+    end
+end)
 
 local HOVER = "BossHover"
 local function setHover(on)
@@ -143,16 +169,15 @@ local function herramienta()
     return nil
 end
 
-local function cfAtaque(anchor)
-    local pos = posOf(anchor)
-    local p = pos + Vector3.new(0, CONFIG.ALTURA, CONFIG.DISTANCIA)
-    return CFrame.lookAt(p, pos)
+local function fmt(v)
+    return string.format("%.0f,%.0f,%.0f", v.X, v.Y, v.Z)
 end
 
 ---------------------------------------------------------------
 -- CAZA
 ---------------------------------------------------------------
 local function cazar(b)
+    -- 1) TP a la isla
     setStatus("TP a " .. b.isla .. " (" .. b.mar .. ")...")
     local isla = getIsla(b.isla)
     if not isla then
@@ -163,26 +188,30 @@ local function cazar(b)
     tpTo(CFrame.new(posOf(isla) + Vector3.new(0, 10, 0)))
     setHover(true)
 
-    local boss, anchor
+    -- 2) Esperar a que aparezca el boss
+    local pos, boss
     local t0 = os.clock()
     while not closed and cazando and os.clock() - t0 < CONFIG.ESPERA_CARGA_BOSS do
-        boss = getPath(b.ruta)
-        anchor = boss and getAnchor(boss, b.parte)
-        if anchor and bossVivo(boss) then break end
+        pos, boss = posicionBoss(b)
+        if pos and bossVivo(boss) then break end
         setStatus("Esperando a " .. b.nombre .. "...")
         task.wait(0.5)
     end
-
-    if not anchor then
-        setStatus(b.nombre .. " no apareció. Revisa la ruta o la carpeta " .. b.parte)
+    if not pos then
+        setStatus(b.nombre .. " no apareció en la ruta")
         task.wait(2)
         return
     end
 
+    -- 3) Seguir y atacar
     while not closed and cazando do
-        boss = getPath(b.ruta)
-        anchor = boss and getAnchor(boss, b.parte)
-        if not anchor or not bossVivo(boss) then break end
+        pos, boss = posicionBoss(b)
+        if not pos or not bossVivo(boss) then break end
+
+        objetivoCF = CFrame.lookAt(
+            pos + Vector3.new(0, CONFIG.ALTURA, CONFIG.DISTANCIA),
+            pos
+        )
 
         local tool = herramienta()
         if not tool then
@@ -191,11 +220,12 @@ local function cazar(b)
             break
         end
 
-        tpTo(cfAtaque(anchor))
-        setStatus("Atacando " .. b.nombre)
         pcall(function() tool:Activate() end)
+        setStatus("Atacando " .. b.nombre .. " en " .. fmt(pos))
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
+
+    objetivoCF = nil
 
     if cazando and not closed and boss and not bossVivo(boss) then
         kills += 1
@@ -281,6 +311,7 @@ local function construirUI()
     toggleBtn = boton(UDim2.new(0, 6, 0, 60), UDim2.new(1, -12, 0, 26), GREEN, 10, function()
         cazando = not cazando
         if not cazando then
+            objetivoCF = nil
             setHover(false)
             setStatus("Caza detenida")
         end
@@ -295,6 +326,7 @@ local function construirUI()
     local closeBtn = boton(UDim2.new(1, -20, 0, 3), UDim2.fromOffset(17, 17), RED, 9, function()
         closed = true
         cazando = false
+        objetivoCF = nil
         setHover(false)
         gui:Destroy()
     end)
@@ -327,7 +359,6 @@ task.spawn(function()
                 task.wait(2)
             end
         else
-            setHover(false)
             task.wait(0.3)
         end
     end
