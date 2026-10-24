@@ -1,28 +1,26 @@
 --[[
-    REMOTE CAPTURE + SCANNER + INFO ÚTIL v4 para Delta (Mobile/PC)
+    REMOTE CAPTURE + SCANNER + INFO ÚTIL v5 para Delta (Mobile/PC)
 
-    CAMBIO PRINCIPAL EN v4: el informe ya NO es un volcado de texto.
-    Ahora sale como DATOS en Lua (tablas), con rutas ya resueltas y listas para pegar en un script:
+    NOVEDADES v5
+      • SIN LÍMITES: ya no se recorta nada (grupos, filas, capturas, jerarquía, textos, atributos).
+        Única protección: máx. 2000 combinaciones de argumentos DISTINTAS por remote en la captura
+        (las demás se cuentan igualmente en `count`) para no agotar la memoria del juego.
+      • ORDENADO POR IMPORTANCIA: el informe empieza por lo más útil para escribir un script y acaba con lo menos útil.
+        INFO.index lista las secciones en ese orden (con cuántas filas tiene cada una) y dentro de cada
+        sección las filas van de más a menos importantes (campo `score`: palabras clave de acción, repetición,
+        cercanía a tu personaje, remotes capturados, etc.).
+      • NUEVAS SECCIONES: INFO.tags (CollectionService, con cuántos son Humanoid), INFO.spawns, INFO.server,
+        INFO.teams, INFO.players, INFO.gameAttrs, INFO.scripts (+ INFO.sources opcional con decompile).
+      • MÁS DATOS: remotes encontrados en todo el juego (no solo ReplicatedStorage) con un ejemplo de llamada capturada,
+        distancia (dist) a tu personaje, tags de cada objeto, firma de tipos de los argumentos (sig), etc.
 
-      INFO.meta       juego, PlaceId, StreamingEnabled, funciones del ejecutor
-      INFO.remotes    { path = <expresión Lua>, class, seen }
-      INFO.calls      acciones marcadas -> steps { code = "<remote>:FireServer(args)", ret, count, caller }
-      INFO.prompts    ProximityPrompts: action, object, hold, distance, example, pos
-      INFO.clicks     ClickDetectors
-      INFO.touch      objetos con TouchInterest (coleccionables, zonas, puertas)
-      INFO.npcs       Humanoids (enemigos/NPCs): pattern, health, attrs, example, parent, pos
-      INFO.attrs      objetos con atributos (IDs y datos)
-      INFO.tags       tags de CollectionService
-      INFO.screens / INFO.buttons / INFO.labels   interfaz de PlayerGui
-      INFO.me         posición, humanoid, atributos, valores, tools
-      INFO.workspaceTree / INFO.replicatedTree    jerarquía anidada (root + children)
-
-    Los objetos repetidos (Pen_3_12, Pen_4_1…) se agrupan con un `pattern` de string.match y un `parent`:
-      for _, o in ipairs(<parent>:GetChildren()) do if o.Name:match(pattern) then ... end end
+    ORDEN DEL INFORME (de más a menos importante)
+      1 calls · 2 remotes · 3 prompts · 4 npcs · 5 tags · 6 me · 7 touch · 8 clicks · 9 attrs ·
+      10 screens/buttons/labels · 11 spawns · 12 server/teams/players/gameAttrs · 13 scripts · 14 sources ·
+      15 replicatedTree · 16 workspaceTree
 
     Cada sección es independiente y el archivo entero es Lua válido (return INFO).
-    Cada sección se puede activar/desactivar. El informe sale por partes para copiar.
-
+    Se guarda COMPLETO en archivo; al copiar al portapapeles sale por partes (la parte 1 trae lo más importante).
     Nombre de archivo: escríbelo arriba (ej: mapa_zombies). Se añade .txt si no pones extensión.
     "No sobrescribir": si existe, guarda como nombre_2.txt, nombre_3.txt…  Carpetas: ver SAVE_DIRS
 ]]
@@ -30,12 +28,10 @@
 ----------------------------------------------------------------
 -- CONFIGURACIÓN
 ----------------------------------------------------------------
-local GUI_NAME   = "RemoteCaptureGUI"
-local MAX_CALLS  = 150
-local MAX_SCAN   = 60000
-local MAX_GROUPS = 250
-local MAX_INFO   = 300000   -- tamaño máximo del informe útil
-local PART_SIZE  = 15000    -- caracteres por parte al copiar (el portapapeles móvil no aguanta más)
+local GUI_NAME = "RemoteCaptureGUI"
+local MAX_DISTINCT = 2000                      -- protección de memoria: argumentos distintos por remote
+local PART_SIZES = { 15000, 30000, 60000, 120000 } -- caracteres por parte al copiar
+local DEPTHS = { 4, 6, 10, 99 }                -- profundidad de jerarquía (99 = ilimitada)
 -- Carpetas donde intentar guardar (en orden). La primera que funcione se usa.
 local SAVE_DIRS = {
     "/storage/emulated/0/Delta/Informaciónrecopilada",
@@ -53,10 +49,16 @@ local C = {
 
 -- Opciones (se cambian con botones en la interfaz)
 local opts = {
-    scrub = true,   -- ocultar nombres de usuario
-    safe = true,    -- no sobrescribir archivos
-    labels = false, -- incluir textos (labels) de la interfaz
-    sec = { remotes = true, caps = true, inter = true, gui = true, mine = true, hier = true },
+    scrub = true,    -- ocultar nombres de usuario
+    safe = true,     -- no sobrescribir archivos
+    labels = false,  -- incluir textos (labels) de la interfaz
+    src = false,     -- incluir el código decompilado de los scripts (pesado)
+    depthIdx = 3,    -- profundidad de jerarquía (índice en DEPTHS)
+    partIdx = 1,     -- tamaño de parte al copiar (índice en PART_SIZES)
+    sec = {
+        remotes = true, caps = true, inter = true, tags = true, gui = true,
+        mine = true, extra = true, scripts = true, hier = true,
+    },
 }
 
 ----------------------------------------------------------------
@@ -87,10 +89,44 @@ local old = guiParent:FindFirstChild(GUI_NAME)
 if old then old:Destroy() end
 
 ----------------------------------------------------------------
+-- ESTADO COMPARTIDO ENTRE EL MOTOR Y LA INTERFAZ
+----------------------------------------------------------------
+local running = true
+local connections = {}
+local function track(c) table.insert(connections, c) return c end
+
+local state = {
+    capturing = false, hide = true, seq = {}, map = {}, seen = {}, sample = {}, perRemote = {},
+    total = 0, calls = 0, marker = 0, dirty = true,
+}
+env.__RemoteCapture = state
+
+local scan = {
+    zone = 1,          -- 1 Workspace, 2 ReplicatedStorage, 3 ambos
+    mode = 1,          -- 1 Modelos, 2 Modelos+Carpetas, 3 Todo
+    hidePlayers = true,
+    report = "",
+    busy = false,
+    preview = "(nada todavía)",
+    status = "Pulsa «Escanear».",
+    zoneNames = { "Workspace", "ReplicatedStorage", "Workspace + ReplicatedStorage" },
+    modeNames = { "Solo Modelos", "Modelos + Carpetas", "Todo (cualquier objeto)" },
+}
+
+local info = {
+    busy = false, text = "", parts = {}, partIndex = 1,
+    status = "Pulsa «Recopilar».", preview = "(nada todavía)",
+}
+
+local API = {}   -- funciones del motor que usa la interfaz
+
+----------------------------------------------------------------
+-- MOTOR (en un bloque para no pasar el límite de variables locales)
+----------------------------------------------------------------
+do
+----------------------------------------------------------------
 -- UTILIDADES: serialización a Lua (datos listos para usar)
 ----------------------------------------------------------------
-local function clamp(n, lo, hi) return math.max(lo, math.min(hi, n)) end
-
 local function path(inst)
     local ok, p = pcall(function() return inst:GetFullName() end)
     return ok and p or tostring(inst)
@@ -112,10 +148,9 @@ local function isService(cn)
     return v
 end
 
--- string -> literal Lua ("..." con escapes)
+-- string -> literal Lua ("..." con escapes). Sin límite de longitud.
 local function q(s)
     s = tostring(s)
-    if #s > 300 then s = s:sub(1, 300) .. "…" end
     s = s:gsub('[%c"\\]', function(c)
         if c == "\n" then return "\\n"
         elseif c == '"' then return '\\"'
@@ -133,6 +168,8 @@ local function num(x)
     if s == "" or s == "-0" then return "0" end
     return s
 end
+
+local function sc(x) return num(math.floor(x + 0.5)) end
 
 -- Instancia -> expresión Lua exacta (game:GetService("X").A.B / workspace.A / ...LocalPlayer...)
 local function pathExpr(inst)
@@ -176,8 +213,8 @@ local function pathExpr(inst)
     return expr
 end
 
--- Valor cualquiera -> literal Lua
-local function lv(v, depth)
+-- Valor cualquiera -> literal Lua (sin límite de elementos; protege contra ciclos)
+local function lv(v, depth, seen)
     depth = depth or 0
     local t = typeof(v)
     if t == "string" then return q(v)
@@ -198,26 +235,24 @@ local function lv(v, depth)
     elseif t == "EnumItem" then return tostring(v)
     elseif t == "BrickColor" then return "BrickColor.new(" .. q(v.Name) .. ")"
     elseif t == "table" then
-        if depth >= 3 then return "{--[[…]]}" end
+        if depth >= 8 then return "{--[[…]]}" end
+        seen = seen or {}
+        if seen[v] then return "{--[[ciclo]]}" end
+        seen[v] = true
         local parts, len, isArr = {}, #v, true
         for k in pairs(v) do
             if type(k) ~= "number" or k < 1 or k > len or k % 1 ~= 0 then isArr = false break end
         end
         if isArr then
-            for i = 1, len do
-                if i > 25 then parts[#parts + 1] = "--[[…]]" break end
-                parts[#parts + 1] = lv(v[i], depth + 1)
-            end
+            for i = 1, len do parts[#parts + 1] = lv(v[i], depth + 1, seen) end
         else
-            local n = 0
             for k, val in pairs(v) do
-                n += 1
-                if n > 25 then parts[#parts + 1] = "--[[…]]" break end
                 local key = (type(k) == "string" and k:match("^[%a_][%w_]*$") and not KEYWORDS[k]) and k
-                    or ("[" .. lv(k, depth + 1) .. "]")
-                parts[#parts + 1] = key .. " = " .. lv(val, depth + 1)
+                    or ("[" .. lv(k, depth + 1, seen) .. "]")
+                parts[#parts + 1] = key .. " = " .. lv(val, depth + 1, seen)
             end
         end
+        seen[v] = nil
         return "{ " .. table.concat(parts, ", ") .. " }"
     else
         return "nil --[[" .. t .. "]]"
@@ -228,6 +263,13 @@ local function joinLv(t)
     local list = {}
     for i = 1, t.n do list[i] = lv(t[i], 0) end
     return table.concat(list, ", ")
+end
+
+-- Tipos de los argumentos: "string, number, Instance"
+local function sigOf(args)
+    local t = {}
+    for i = 1, args.n do t[i] = typeof(args[i]) end
+    return table.concat(t, ", ")
 end
 
 -- Long-bracket string (para guardar código Lua dentro de una tabla sin escapes)
@@ -316,13 +358,6 @@ local function scrub(s)
     return s
 end
 
--- Corta por líneas completas (el archivo sigue siendo Lua válido hasta ese punto)
-local function capText(text, max)
-    if #text <= max then return text end
-    local cut = text:sub(1, max):match("^(.*)\n") or text:sub(1, max)
-    return cut .. "\n-- … recortado por tamaño (faltan secciones o filas; usa filtros o desactiva secciones)"
-end
-
 local function copyText(text)
     local copier = setclipboard or toclipboard
     return copier ~= nil and pcall(copier, text)
@@ -341,13 +376,16 @@ local function tryGet(f)
 end
 
 local LEGEND = {
-    "--[[ LEYENDA — este archivo es Lua válido; cada sección INFO.xxx es independiente (puede faltar o estar recortada).",
+    "--[[ LEYENDA — este archivo es Lua válido; cada sección INFO.xxx es independiente.",
+    "  ORDEN: INFO.index lista las secciones de MÁS a MENOS importante (es el mismo orden en que aparecen) y dentro de cada",
+    "  sección las filas también van de más a menos importantes. score = puntuación de importancia (mayor = más útil).",
     "  path / example / parent / root = expresiones Lua YA RESUELTAS: se pegan tal cual en un script.",
     "  pattern = string.match anclado para reconocer los objetos de un grupo (Pen_3_12 -> ^Pen%_%d+%_%d+$); count = cuántos hay.",
     "  Recorrer un grupo: for _, o in ipairs(<parent>:GetChildren()) do if o.Name:match(pattern) then ... end end",
-    "  Remotes: <path>:FireServer(...) / <path>:InvokeServer(...)  |  INFO.calls: steps[].code = la llamada exacta observada.",
+    "  dist = distancia en studs desde tu personaje al objeto más cercano del grupo · pos = Vector3 (para teletransportar).",
+    "  Remotes: <path>:FireServer(...) / <path>:InvokeServer(...)  |  remotes[].sample = llamada real capturada  |  calls[].steps[].code = llamada exacta observada (sig = tipos de argumentos).",
     "  Interactuar: fireproximityprompt(p) · fireclickdetector(cd) · firetouchinterest(hrp, part, 0) y luego (…, 1) · firesignal(btn.Activated)",
-    "  pos = Vector3 del objeto (para teletransportar). Árboles: ruta = root + nombres de los children anidados.",
+    "  tags: CollectionService:GetTagged(tag) · attrs: inst:GetAttribute(nombre) · humanoids = cuántos de esos objetos son Humanoid.",
     "  visible=false en un botón: la ruta existe pero hay que abrir antes su menú.",
     "]]",
 }
@@ -363,15 +401,72 @@ local function startReport(title, extra)
 end
 
 ----------------------------------------------------------------
--- ESTADO + CAPTURA DE REMOTES
+-- IMPORTANCIA: puntuación para ordenar de más a menos útil
 ----------------------------------------------------------------
-local running = true
-local connections = {}
-local function track(c) table.insert(connections, c) return c end
+local KW_HIGH = {
+    "buy", "purchase", "sell", "collect", "claim", "reward", "equip", "upgrade", "hatch", "open", "rebirth",
+    "spin", "craft", "quest", "trade", "teleport", "attack", "damage", "skill", "ability", "shoot", "gift",
+    "redeem", "daily", "mine", "harvest", "fish", "boss", "enemy", "zombie", "mob", "shop", "store", "coin",
+    "cash", "gem", "portal", "chest", "loot", "drop", "combatant", "egg", "pet", "money", "currency",
+}
+local KW_MED = {
+    "tap", "click", "farm", "chop", "orb", "checkpoint", "door", "stat", "level", "xp", "skin", "weapon",
+    "tool", "inventory", "item", "unlock", "spawn", "wave", "round", "win", "finish", "start", "join", "ready",
+    "event", "remote", "fire", "use", "action", "interact",
+}
 
-local state = { capturing = false, hide = true, seq = {}, map = {}, seen = {}, total = 0, calls = 0, marker = 0, dirty = true }
-env.__RemoteCapture = state
+local function kwScore(s)
+    s = tostring(s):lower()
+    local total = 0
+    for _, w in ipairs(KW_HIGH) do if s:find(w, 1, true) then total += 20 end end
+    for _, w in ipairs(KW_MED) do if s:find(w, 1, true) then total += 8 end end
+    return math.min(total, 80)
+end
 
+local function isNoise(name)
+    for _, pat in ipairs(NOISE) do
+        if name:find(pat) then return true end
+    end
+    return false
+end
+
+local function myPos()
+    local c = player.Character
+    local h = c and c:FindFirstChild("HumanoidRootPart")
+    return h and h.Position or nil
+end
+
+-- Distancia desde mi personaje al objeto (o a su primer ancestro con posición)
+local function distOf(inst, mp)
+    if not mp then return nil end
+    local cur = inst
+    for _ = 1, 4 do
+        if not cur or cur == Workspace or cur == game then return nil end
+        local p = instPos(cur)
+        if p then return (p - mp).Magnitude end
+        cur = cur.Parent
+    end
+    return nil
+end
+
+-- Hasta +30 puntos si está a menos de 300 studs
+local function proxBonus(d)
+    if not d then return 0 end
+    return math.max(0, 30 - d / 10)
+end
+
+-- Ordena una lista de tablas por .score (mayor primero); a igual puntuación, mantiene el orden original
+local function sortByScore(list)
+    for i, g in ipairs(list) do g.idx = i end
+    table.sort(list, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.idx < b.idx
+    end)
+end
+
+----------------------------------------------------------------
+-- CAPTURA DE REMOTES
+----------------------------------------------------------------
 local hookOK = false
 if hookmetamethod and getnamecallmethod then
     pcall(function()
@@ -412,13 +507,13 @@ state.record = function(remote, method, args, res, caller)
     local full = path(remote)
     state.seen[full] = (state.seen[full] or 0) + 1 -- para marcar `seen` en la lista de remotes
     local short = full:match("Services%.(.+)$") or full
-    if state.hide then
-        for _, pat in ipairs(NOISE) do
-            if remote.Name:find(pat) then return end
-        end
-    end
+    if state.hide and isNoise(remote.Name) then return end
+
     local argStr = joinLv(args)
     local resStr = res and joinLv(res) or nil
+    if not state.sample[full] then
+        state.sample[full] = pathExpr(remote) .. ":" .. method .. "(" .. argStr .. ")"
+    end
 
     state.total += 1
     state.dirty = true
@@ -427,12 +522,32 @@ state.record = function(remote, method, args, res, caller)
     if e then
         e.count += 1
         if resStr and not e.res then e.res = resStr end
-    elseif state.calls < MAX_CALLS then
-        e = { kind = "call", path = short, expr = pathExpr(remote), method = method, args = argStr, res = resStr,
-              count = 1, caller = caller and pathExpr(caller) or nil }
-        state.map[key] = e
-        table.insert(state.seq, e)
+        return
     end
+
+    local n = (state.perRemote[short] or 0) + 1
+    state.perRemote[short] = n
+    if n > MAX_DISTINCT then
+        -- Protección de memoria: ya hay demasiadas combinaciones distintas; solo se cuenta
+        local okey = state.marker .. "|" .. short .. "|" .. method .. "|*overflow"
+        local o = state.map[okey]
+        if o then
+            o.count += 1
+        else
+            o = { kind = "call", path = short, expr = pathExpr(remote), method = method,
+                  args = "--[[ …más de " .. MAX_DISTINCT .. " combinaciones distintas: solo se cuentan ]]",
+                  sig = "", count = 1 }
+            state.map[okey] = o
+            table.insert(state.seq, o)
+        end
+        return
+    end
+
+    e = { kind = "call", path = short, expr = pathExpr(remote), method = method, args = argStr, res = resStr,
+          sig = sigOf(args), count = 1, caller = caller and pathExpr(caller) or nil }
+    state.map[key] = e
+    state.calls += 1
+    table.insert(state.seq, e)
 end
 
 local function addMarker(label)
@@ -441,7 +556,8 @@ local function addMarker(label)
     state.dirty = true
 end
 
--- INFO.calls: una entrada por acción marcada; cada paso trae la línea de código exacta
+-- INFO.calls: una entrada por acción marcada; cada paso trae la línea de código exacta.
+-- Los pasos van en el orden en que ocurrieron (el orden temporal ES lo importante aquí).
 local function capturesLines(out)
     local groups, cur = {}, nil
     for _, e in ipairs(state.seq) do
@@ -456,13 +572,16 @@ local function capturesLines(out)
             cur.steps[#cur.steps + 1] = e
         end
     end
-    out[#out + 1] = "INFO.calls = {   -- en orden; action = lo que marcaste con el botón Marcar"
+    local rows = 0
+    out[#out + 1] = "INFO.calls = {   -- en orden temporal; action = lo que marcaste con el botón Marcar"
     for _, g in ipairs(groups) do
         out[#out + 1] = "  { action = " .. q(g.label) .. ", steps = {"
         for _, e in ipairs(g.steps) do
+            rows += 1
             out[#out + 1] = row("    ", {
                 { "code", lb(e.expr .. ":" .. e.method .. "(" .. e.args .. ")") },
                 { "count", tostring(e.count) },
+                { "sig", (e.sig and e.sig ~= "") and q(e.sig) or nil },
                 { "ret", e.res and ("{ " .. e.res .. " }") or nil },
                 { "caller", e.caller },
             })
@@ -470,6 +589,7 @@ local function capturesLines(out)
         out[#out + 1] = "  } },"
     end
     out[#out + 1] = "}"
+    return rows
 end
 
 local function buildReport()
@@ -481,41 +601,30 @@ local function buildReport()
 end
 
 ----------------------------------------------------------------
--- SCANNER DE WORKSPACE
+-- SCANNER DE WORKSPACE (sin límites; ordenado por importancia)
 ----------------------------------------------------------------
-local scan = {
-    zone = 1,          -- 1 Workspace, 2 ReplicatedStorage, 3 ambos
-    mode = 1,          -- 1 Modelos, 2 Modelos+Carpetas, 3 Todo
-    hidePlayers = true,
-    report = "",
-    busy = false,
-    preview = "(nada todavía)",
-    status = "Pulsa «Escanear».",
-}
-local zoneNames = { "Workspace", "ReplicatedStorage", "Workspace + ReplicatedStorage" }
-local modeNames = { "Solo Modelos", "Modelos + Carpetas", "Todo (cualquier objeto)" }
-
 local function relPath(inst)
     local p = path(inst)
     p = p:gsub("^Workspace%.", "")
-    return #p > 100 and ("…" .. p:sub(-99)) or p
+    return p
 end
 
--- Campos extra de un objeto de muestra: attrs, children, humanoid, primary, pos
+-- Campos extra de un objeto de muestra: attrs, tags, children, humanoid, primary, pos
 local function sampleFields(d, f)
     local okA, attrs = pcall(d.GetAttributes, d)
     if okA and attrs and next(attrs) then f[#f + 1] = { "attrs", lv(attrs) } end
-    local kids, seen, n = {}, {}, 0
+    local okT, tags = pcall(CollectionService.GetTags, CollectionService, d)
+    if okT and tags and #tags > 0 then f[#f + 1] = { "tags", lv(tags) } end
+    local kids, seen = {}, {}
     for _, c in ipairs(d:GetChildren()) do
         local k = normName(c.Name) .. "|" .. c.ClassName
         if not seen[k] then
             seen[k] = true
-            n += 1
-            if n <= 8 then kids[#kids + 1] = q(c.ClassName .. ":" .. c.Name) end
+            kids[#kids + 1] = q(c.ClassName .. ":" .. c.Name)
         end
     end
-    if n > 0 then
-        f[#f + 1] = { "children", "{ " .. table.concat(kids, ", ") .. (n > 8 and ", --[[…]]" or "") .. " }" }
+    if #kids > 0 then
+        f[#f + 1] = { "children", "{ " .. table.concat(kids, ", ") .. " }" }
     end
     if d:IsA("Model") then
         if d:FindFirstChildOfClass("Humanoid") then f[#f + 1] = { "humanoid", "true" } end
@@ -536,6 +645,7 @@ local function runScan(filterText, radiusText)
         local char = player.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         local center = (radius > 0 and hrp) and hrp.Position or nil
+        local mp = hrp and hrp.Position or nil
 
         local chars = {}
         if scan.hidePlayers then
@@ -560,7 +670,7 @@ local function runScan(filterText, radiusText)
         for _, root in ipairs(roots) do
             for _, d in ipairs(root:GetDescendants()) do
                 n += 1
-                if n % 400 == 0 then task.wait() end
+                if n % 400 == 0 then task.wait() scan.status = "Escaneando… " .. n end
 
                 local skip = false
                 for _, ch in ipairs(chars) do
@@ -572,7 +682,11 @@ local function runScan(filterText, radiusText)
                 if d:IsA("ProximityPrompt") then
                     local pk = tostring(d.ActionText) .. " | " .. tostring(d.ObjectText) .. " | en " .. keyOf(d.Parent and d.Parent.Name or "?")
                     local g = prompts[pk]
-                    if g then g.count += 1 else prompts[pk] = { count = 1, sample = d } end
+                    if g then
+                        g.count += 1
+                    else
+                        prompts[pk] = { count = 1, sample = d, dist = distOf(d.Parent or d, mp) }
+                    end
                 end
 
                 local take = (scan.mode == 3) or d:IsA("Model") or (scan.mode == 2 and d:IsA("Folder"))
@@ -598,22 +712,64 @@ local function runScan(filterText, radiusText)
                     g.count += 1
                     if dist and (not g.dist or dist < g.dist) then g.dist = dist end
                 else
-                    groups[gk] = { name = key, class = d.ClassName, count = 1, sample = d, dist = dist }
+                    groups[gk] = { name = key, class = d.ClassName, count = 1, sample = d, dist = dist or distOf(d, mp) }
                 end
             end
         end
 
         local list = {}
-        for _, g in pairs(groups) do list[#list + 1] = g end
+        for _, g in pairs(groups) do
+            g.score = kwScore(g.name .. " " .. g.class) + math.min(g.count, 200) / 4 + proxBonus(g.dist)
+            list[#list + 1] = g
+        end
         table.sort(list, function(a, b)
+            if a.score ~= b.score then return a.score > b.score end
             if a.count ~= b.count then return a.count > b.count end
             return a.name < b.name
         end)
 
         local out = startReport("SCANNER")
-        out[#out + 1] = "INFO.scan = { zone = " .. q(zoneNames[scan.zone]) .. ", mode = " .. q(modeNames[scan.mode])
+        out[#out + 1] = "INFO.scan = { zone = " .. q(scan.zoneNames[scan.zone]) .. ", mode = " .. q(scan.modeNames[scan.mode])
             .. ", filter = " .. q(filter) .. ", radius = " .. (center and tostring(radius) or "nil")
             .. ", playersHidden = " .. tostring(scan.hidePlayers) .. ", checked = " .. checked .. ", groups = " .. #list .. " }"
+        out[#out + 1] = ""
+
+        local previewLines = {}
+        out[#out + 1] = "INFO.names = {   -- grupos de objetos con el mismo patrón de nombre · MÁS IMPORTANTES PRIMERO (score)"
+        for i, g in ipairs(list) do
+            local s = g.sample
+            local f = {
+                { "pattern", q(namePattern(s.Name)) }, { "class", q(g.class) }, { "count", tostring(g.count) },
+                { "score", sc(g.score) },
+                { "example", pathExpr(s) }, { "parent", pathExpr(s.Parent) },
+            }
+            if g.dist then f[#f + 1] = { "nearest", num(g.dist) } end
+            sampleFields(s, f)
+            out[#out + 1] = row("  ", f)
+            if i <= 8 then previewLines[#previewLines + 1] = g.name .. " x" .. g.count end
+        end
+        out[#out + 1] = "}"
+        out[#out + 1] = ""
+
+        local pl = {}
+        for _, v in pairs(prompts) do
+            local d = v.sample
+            v.score = kwScore(tostring(d.ActionText) .. " " .. tostring(d.ObjectText) .. " " .. (d.Parent and d.Parent.Name or ""))
+                + math.min(v.count, 200) / 4 + proxBonus(v.dist) + (d.Enabled and 5 or -20)
+            pl[#pl + 1] = v
+        end
+        sortByScore(pl)
+        out[#out + 1] = "INFO.prompts = {   -- ordenados por importancia · fireproximityprompt(<example>)"
+        for _, e in ipairs(pl) do
+            local d = e.sample
+            out[#out + 1] = row("  ", {
+                { "action", q(d.ActionText) }, { "object", q(d.ObjectText) }, { "count", tostring(e.count) },
+                { "score", sc(e.score) }, { "dist", e.dist and num(e.dist) or nil },
+                { "ownerPattern", q(namePattern(d.Parent and d.Parent.Name or "?")) },
+                { "example", pathExpr(d) }, { "pos", posLv(d) },
+            })
+        end
+        out[#out + 1] = "}"
         out[#out + 1] = ""
 
         if scan.zone == 1 or scan.zone == 3 then
@@ -627,11 +783,15 @@ local function runScan(filterText, radiusText)
                     if g then g.count += 1 else direct[k] = { count = 1, sample = c } dorder[#dorder + 1] = k end
                 end
             end
-            table.sort(dorder)
-            out[#out + 1] = "INFO.workspaceChildren = {   -- hijos directos de workspace"
-            for i, k in ipairs(dorder) do
-                if i > 80 then out[#out + 1] = "  -- … (más)" break end
+            local dl = {}
+            for _, k in ipairs(dorder) do
                 local g = direct[k]
+                g.score = kwScore(g.sample.Name .. " " .. g.sample.ClassName) + math.min(g.count, 200) / 4
+                dl[#dl + 1] = g
+            end
+            sortByScore(dl)
+            out[#out + 1] = "INFO.workspaceChildren = {   -- hijos directos de workspace (más importantes primero)"
+            for _, g in ipairs(dl) do
                 out[#out + 1] = row("  ", {
                     { "class", q(g.sample.ClassName) },
                     g.count > 1 and { "pattern", q(namePattern(g.sample.Name)) } or { "name", q(g.sample.Name) },
@@ -642,45 +802,9 @@ local function runScan(filterText, radiusText)
             out[#out + 1] = ""
         end
 
-        local previewLines = {}
-        out[#out + 1] = "INFO.names = {   -- grupos de objetos con el mismo patrón de nombre (los más repetidos primero)"
-        for i, g in ipairs(list) do
-            if i > MAX_GROUPS then
-                out[#out + 1] = "  -- … (" .. (#list - MAX_GROUPS) .. " grupos más; usa filtro o radio)"
-                break
-            end
-            local s = g.sample
-            local f = {
-                { "pattern", q(namePattern(s.Name)) }, { "class", q(g.class) }, { "count", tostring(g.count) },
-                { "example", pathExpr(s) }, { "parent", pathExpr(s.Parent) },
-            }
-            if g.dist then f[#f + 1] = { "nearest", num(g.dist) } end
-            sampleFields(s, f)
-            out[#out + 1] = row("  ", f)
-            if i <= 8 then previewLines[#previewLines + 1] = g.name .. " x" .. g.count end
-        end
-        out[#out + 1] = "}"
-        out[#out + 1] = ""
-
-        local pl = {}
-        for _, v in pairs(prompts) do pl[#pl + 1] = v end
-        table.sort(pl, function(a, b) return a.count > b.count end)
-        out[#out + 1] = "INFO.prompts = {   -- fireproximityprompt(<example>)"
-        for i, e in ipairs(pl) do
-            if i > 40 then out[#out + 1] = "  -- … (más)" break end
-            local d = e.sample
-            out[#out + 1] = row("  ", {
-                { "action", q(d.ActionText) }, { "object", q(d.ObjectText) }, { "count", tostring(e.count) },
-                { "ownerPattern", q(namePattern(d.Parent and d.Parent.Name or "?")) },
-                { "example", pathExpr(d) }, { "pos", posLv(d) },
-            })
-        end
-        out[#out + 1] = "}"
-        out[#out + 1] = ""
         out[#out + 1] = "return INFO"
 
-        local text = capText(scrub(table.concat(out, "\n")), MAX_SCAN)
-        scan.report = text
+        scan.report = scrub(table.concat(out, "\n"))
         scan.preview = #previewLines > 0 and scrub(table.concat(previewLines, "\n")) or "(ninguno)"
         scan.status = "✅ " .. #list .. " grupos, " .. checked .. " objetos revisados. Copia o guarda el informe."
     end)
@@ -689,9 +813,7 @@ local function runScan(filterText, radiusText)
     if not ok then scan.status = "⚠ Error: " .. tostring(err):sub(1, 70) end
 end
 
--- Detalle objeto por objeto: árbol anidado con atributos y valores
-local DETAIL_MAX = 60
-
+-- Detalle objeto por objeto: árbol anidado con atributos y valores (sin límites)
 local function describeLua(d, indent, depth, out, extra)
     local pad = string.rep("  ", indent)
     local f = { { "class", q(d.ClassName) }, { "name", q(d.Name) } }
@@ -701,12 +823,11 @@ local function describeLua(d, indent, depth, out, extra)
     if okA and attrs and next(attrs) then f[#f + 1] = { "attrs", lv(attrs) } end
     if depth <= 0 then out[#out + 1] = row(pad, f) return end
 
-    local kids, counts, n = {}, {}, 0
+    local kids, counts = {}, {}
     for _, c in ipairs(d:GetChildren()) do
         if c:IsA("ValueBase") or c:IsA("Folder") or c:IsA("Model") or c:IsA("Configuration")
             or c:IsA("Tool") or c:IsA("ProximityPrompt") then
-            n += 1
-            if n <= 25 then kids[#kids + 1] = c end
+            kids[#kids + 1] = c
         else
             counts[c.ClassName] = (counts[c.ClassName] or 0) + 1
         end
@@ -716,12 +837,11 @@ local function describeLua(d, indent, depth, out, extra)
     table.sort(parts)
     local otherStr = #parts > 0 and ("{ " .. table.concat(parts, ", ") .. " }") or nil
 
-    if n == 0 and not otherStr then
+    if #kids == 0 and not otherStr then
         out[#out + 1] = row(pad, f)
     else
         out[#out + 1] = rowOpen(pad, f)
         for _, k in ipairs(kids) do describeLua(k, indent + 1, depth - 1, out) end
-        if n > 25 then out[#out + 1] = pad .. "  -- … (" .. (n - 25) .. " más)" end
         out[#out + 1] = pad .. "}" .. (otherStr and (", other = " .. otherStr) or "") .. " },"
     end
 end
@@ -732,9 +852,9 @@ local function detailReport(filterText)
     local qn = {}
     for _, nd in ipairs(needles) do qn[#qn + 1] = q(nd) end
     local out = startReport("DETALLE DE OBJETOS", ", needles = { " .. table.concat(qn, ", ") .. " }")
-    out[#out + 1] = "INFO.details = {   -- cada objeto: path + árbol de contenedores (attrs, valores)"
 
-    local described, found, n = {}, 0, 0
+    local mp = myPos()
+    local matches, described, n = {}, {}, 0
     for _, d in ipairs(Workspace:GetDescendants()) do
         n += 1
         if n % 400 == 0 then task.wait() end
@@ -752,38 +872,42 @@ local function detailReport(filterText)
                 end
                 if not nested then
                     described[d] = true
-                    found += 1
-                    if found <= DETAIL_MAX then
-                        local mine = false
-                        if d:GetAttribute("OwnerUserId") == player.UserId then mine = true end
-                        if d.Name:find(player.Name, 1, true) then mine = true end
-                        local extra = { { "path", pathExpr(d) } }
-                        if mine then extra[#extra + 1] = { "mine", "true" } end
-                        local pos = posLv(d)
-                        if pos then extra[#extra + 1] = { "pos", pos } end
-                        describeLua(d, 1, 2, out, extra)
-                    end
+                    local mine = (d:GetAttribute("OwnerUserId") == player.UserId) or (d.Name:find(player.Name, 1, true) ~= nil)
+                    local dist = distOf(d, mp)
+                    -- importancia: lo tuyo primero, luego lo más cercano
+                    matches[#matches + 1] = { inst = d, mine = mine, dist = dist,
+                        score = (mine and 1000 or 0) + kwScore(d.Name) + proxBonus(dist) }
                 end
             end
         end
     end
+    sortByScore(matches)
+
+    out[#out + 1] = "INFO.details = {   -- lo tuyo primero, luego lo más cercano · path + árbol de contenedores (attrs, valores)"
+    for _, m in ipairs(matches) do
+        local extra = { { "path", pathExpr(m.inst) } }
+        if m.mine then extra[#extra + 1] = { "mine", "true" } end
+        if m.dist then extra[#extra + 1] = { "dist", num(m.dist) } end
+        local pos = posLv(m.inst)
+        if pos then extra[#extra + 1] = { "pos", pos } end
+        describeLua(m.inst, 1, 3, out, extra)
+    end
     out[#out + 1] = "}"
-    out[#out + 1] = "INFO.detailsFound = " .. found .. (found > DETAIL_MAX and ("   -- mostrando " .. DETAIL_MAX .. "; usa un filtro más concreto") or "")
+    out[#out + 1] = "INFO.detailsFound = " .. #matches
     out[#out + 1] = ""
     out[#out + 1] = "return INFO"
-    return capText(scrub(table.concat(out, "\n")), MAX_SCAN), found
+    return scrub(table.concat(out, "\n")), #matches
 end
 
 ----------------------------------------------------------------
--- INFO ÚTIL (pestaña 📦)
+-- INFO ÚTIL: secciones (cada una escribe en su propio buffer y devuelve cuántas filas tiene)
 ----------------------------------------------------------------
-local info = { busy = false, text = "", parts = {}, partIndex = 1, status = "Pulsa «Recopilar»." }
+local SEC = {}
 
--- Agrupa por clave. Devuelve nil si se alcanzó el límite de grupos.
-local function grp(map, order, key, cap, make)
+-- Agrupa por clave (sin límite de grupos). Devuelve el grupo.
+local function grp(map, order, key, make)
     local g = map[key]
     if g then g.count += 1 return g end
-    if #order >= cap then return nil end
     g = make()
     g.count = 1
     map[key] = g
@@ -791,38 +915,67 @@ local function grp(map, order, key, cap, make)
     return g
 end
 
--- 1) REMOTES
-local function collectRemotes()
-    local found, n = {}, 0
-    for _, root in ipairs({ ReplicatedStorage, ReplicatedFirst }) do
+local function ownerPat(inst)
+    local o = inst and inst.Parent
+    return q(namePattern(o and o.Name or "?"))
+end
+
+local function listOf(order, map)
+    local list = {}
+    for _, key in ipairs(order) do list[#list + 1] = map[key] end
+    return list
+end
+
+-- 2) REMOTES (de todo el juego), los capturados primero
+function SEC.remotes(buf)
+    local found, seenInst, n = {}, {}, 0
+    local roots = { ReplicatedStorage, ReplicatedFirst, Workspace, game:GetService("Lighting"), player }
+    for _, root in ipairs(roots) do
         for _, d in ipairs(root:GetDescendants()) do
             n += 1
             if n % 500 == 0 then task.wait() info.status = "Buscando remotes… " .. n end
             local cn = d.ClassName
-            if cn == "RemoteEvent" or cn == "RemoteFunction" or cn == "UnreliableRemoteEvent" then
+            if (cn == "RemoteEvent" or cn == "RemoteFunction" or cn == "UnreliableRemoteEvent") and not seenInst[d] then
+                seenInst[d] = true
                 found[#found + 1] = { inst = d, key = path(d), class = cn }
             end
         end
     end
-    return found
-end
-
-local function secRemotes(out)
-    local list = collectRemotes()
-    table.sort(list, function(a, b) return a.key < b.key end)
-    out[#out + 1] = "INFO.remotes = {   -- RemoteFunction -> :InvokeServer(...)  |  RemoteEvent -> :FireServer(...)  |  seen = veces capturado con 📡"
-    for _, r in ipairs(list) do
-        local seen = state.seen[r.key]
-        out[#out + 1] = row("  ", {
-            { "path", pathExpr(r.inst) }, { "class", q(r.class) }, { "seen", seen and tostring(seen) or nil },
+    for _, r in ipairs(found) do
+        local seen = state.seen[r.key] or 0
+        local parentName = r.inst.Parent and r.inst.Parent.Name or ""
+        local s = 0
+        if seen > 0 then s += 200 + math.min(seen, 100) end              -- los que ya hiciste/observaste, arriba del todo
+        s += kwScore(r.inst.Name) * 2 + kwScore(parentName)
+        if r.class == "RemoteFunction" then s += 5 end
+        if isNoise(r.inst.Name) then s -= 100 end
+        if r.key:find("DefaultChatSystemChatEvents", 1, true) then s -= 150 end
+        r.score = s
+        r.seen = seen
+    end
+    sortByScore(found)
+    buf[#buf + 1] = "INFO.remotes = {   -- más importantes primero · RemoteFunction -> :InvokeServer(...) · RemoteEvent -> :FireServer(...) · seen = veces capturado con 📡 · sample = llamada real"
+    for _, r in ipairs(found) do
+        local code = state.sample[r.key]
+        buf[#buf + 1] = row("  ", {
+            { "path", pathExpr(r.inst) }, { "class", q(r.class) },
+            { "score", sc(r.score) }, { "seen", r.seen > 0 and tostring(r.seen) or nil },
+            { "sample", code and lb(code) or nil },
         })
     end
-    out[#out + 1] = "}"
+    buf[#buf + 1] = "}"
+    return #found
 end
 
--- 3) INTERACTUABLES E IDs: un solo recorrido por Workspace (sin entrar en personajes)
-local function scanWorld(skipSet)
-    local R = { prompts = {}, po = {}, clicks = {}, co = {}, touch = {}, to = {}, npcs = {}, no = {}, attrs = {}, ao = {} }
+-- 1) CAPTURAS
+function SEC.calls(buf)
+    return capturesLines(buf)
+end
+
+-- Un solo recorrido por Workspace (sin entrar en personajes de jugadores)
+local function scanWorld(skipSet, mp)
+    local R = { prompts = {}, po = {}, clicks = {}, co = {}, touch = {}, to = {}, npcs = {}, no = {},
+        attrs = {}, ao = {}, spawns = {} }
     local stack, n = { Workspace }, 0
     local cam = Workspace.CurrentCamera
     while #stack > 0 do
@@ -835,21 +988,28 @@ local function scanWorld(skipSet)
 
             local cn, owner = c.ClassName, c.Parent
             local ownerName = normName(owner and owner.Name or "?")
+            local g
             if cn == "ProximityPrompt" then
                 local key = tostring(c.ActionText) .. "|" .. tostring(c.ObjectText) .. "|" .. ownerName
-                grp(R.prompts, R.po, key, 150, function() return { p = c } end)
+                g = grp(R.prompts, R.po, key, function() return { p = c } end)
             elseif cn == "ClickDetector" then
-                grp(R.clicks, R.co, ownerName, 60, function() return { p = c } end)
+                g = grp(R.clicks, R.co, ownerName, function() return { p = c } end)
             elseif cn == "TouchTransmitter" then
-                grp(R.touch, R.to, ownerName, 60, function() return { p = c } end)
+                g = grp(R.touch, R.to, ownerName, function() return { p = c } end)
             elseif cn == "Humanoid" then
-                grp(R.npcs, R.no, ownerName, 100, function() return { p = c, model = owner } end)
+                g = grp(R.npcs, R.no, ownerName, function() return { p = c, model = owner } end)
+            elseif cn == "SpawnLocation" then
+                R.spawns[#R.spawns + 1] = c
+            end
+            if g then
+                local d = distOf(owner or c, mp)
+                if d and (not g.dist or d < g.dist) then g.dist = d end
             end
 
             if c:IsA("Model") or c:IsA("Folder") or c:IsA("Tool") or c:IsA("Configuration") or c:IsA("BasePart") then
                 local okA, a = pcall(c.GetAttributes, c)
                 if okA and a and next(a) then
-                    grp(R.attrs, R.ao, normName(c.Name) .. "|" .. cn, 120, function() return { p = c, a = a } end)
+                    grp(R.attrs, R.ao, normName(c.Name) .. "|" .. cn, function() return { p = c, a = a } end)
                 end
             end
         end
@@ -857,210 +1017,146 @@ local function scanWorld(skipSet)
     return R
 end
 
-local function ownerPat(inst)
-    local o = inst and inst.Parent
-    return q(namePattern(o and o.Name or "?"))
-end
-
-local function secInter(out, R)
-    out[#out + 1] = "INFO.prompts = {   -- fireproximityprompt(<example>)"
-    for _, key in ipairs(R.po) do
-        local g = R.prompts[key]
+-- 3) PROXIMITY PROMPTS
+function SEC.prompts(buf, R)
+    local list = listOf(R.po, R.prompts)
+    for _, g in ipairs(list) do
         local p = g.p
-        out[#out + 1] = row("  ", {
+        g.score = kwScore(tostring(p.ActionText) .. " " .. tostring(p.ObjectText) .. " " .. (p.Parent and p.Parent.Name or ""))
+            + math.min(g.count, 200) / 4 + proxBonus(g.dist) + (p.Enabled and 5 or -20)
+    end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.prompts = {   -- más importantes primero · fireproximityprompt(<example>)"
+    for _, g in ipairs(list) do
+        local p = g.p
+        buf[#buf + 1] = row("  ", {
             { "action", q(p.ActionText) }, { "object", q(p.ObjectText) }, { "count", tostring(g.count) },
-            { "hold", num(p.HoldDuration) }, { "distance", num(p.MaxActivationDistance) }, { "enabled", tostring(p.Enabled) },
+            { "score", sc(g.score) }, { "dist", g.dist and num(g.dist) or nil },
+            { "hold", num(p.HoldDuration) }, { "distance", num(p.MaxActivationDistance) },
+            { "key", q(p.KeyboardKeyCode.Name) }, { "enabled", tostring(p.Enabled) },
             { "ownerPattern", ownerPat(p) }, { "example", pathExpr(p) }, { "pos", posLv(p) },
         })
     end
-    out[#out + 1] = "}"
-    out[#out + 1] = ""
+    buf[#buf + 1] = "}"
+    return #list
+end
 
-    out[#out + 1] = "INFO.clicks = {   -- fireclickdetector(<example>)"
-    for _, key in ipairs(R.co) do
-        local g = R.clicks[key]
-        out[#out + 1] = row("  ", {
-            { "count", tostring(g.count) }, { "ownerPattern", ownerPat(g.p) },
-            { "example", pathExpr(g.p) }, { "pos", posLv(g.p) },
-        })
+-- 4) NPCS / ENEMIGOS
+function SEC.npcs(buf, R)
+    local list = listOf(R.no, R.npcs)
+    for _, g in ipairs(list) do
+        local m = g.model or g.p
+        local alive = (tryGet(function() return g.p.Health end) or 0) > 0
+        g.score = kwScore(m.Name) + math.min(g.count, 100) / 3 + proxBonus(g.dist) + (alive and 5 or -10)
     end
-    out[#out + 1] = "}"
-    out[#out + 1] = ""
-
-    out[#out + 1] = "INFO.touch = {   -- objetos con TouchInterest (coleccionables, zonas, puertas): firetouchinterest(hrp, example, 0/1)"
-    for _, key in ipairs(R.to) do
-        local g = R.touch[key]
-        local owner = g.p.Parent or g.p
-        out[#out + 1] = row("  ", {
-            { "pattern", q(namePattern(owner.Name)) }, { "class", q(owner.ClassName) }, { "count", tostring(g.count) },
-            { "example", pathExpr(owner) }, { "parent", pathExpr(owner.Parent) }, { "pos", posLv(owner) },
-        })
-    end
-    out[#out + 1] = "}"
-    out[#out + 1] = ""
-
-    out[#out + 1] = "INFO.npcs = {   -- NPCs / enemigos (Humanoid)"
-    for _, key in ipairs(R.no) do
-        local g = R.npcs[key]
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.npcs = {   -- NPCs / enemigos (Humanoid), más importantes primero"
+    for _, g in ipairs(list) do
         local h = g.p
         local m = g.model or h
         local f = {
             { "pattern", q(namePattern(m.Name)) }, { "count", tostring(g.count) },
+            { "score", sc(g.score) }, { "dist", g.dist and num(g.dist) or nil },
             { "health", lv(tryGet(function() return h.Health end)) },
             { "maxHealth", lv(tryGet(function() return h.MaxHealth end)) },
+            { "walkSpeed", lv(tryGet(function() return h.WalkSpeed end)) },
+            { "rig", q(tostring(tryGet(function() return h.RigType.Name end) or "?")) },
         }
         local okA, a = pcall(function() return m:GetAttributes() end)
         if okA and a and next(a) then f[#f + 1] = { "attrs", lv(a) } end
+        local okT, tags = pcall(CollectionService.GetTags, CollectionService, m)
+        if okT and tags and #tags > 0 then f[#f + 1] = { "tags", lv(tags) } end
         f[#f + 1] = { "example", pathExpr(m) }
         f[#f + 1] = { "parent", pathExpr(m.Parent) }
         f[#f + 1] = { "pos", posLv(m) }
-        out[#out + 1] = row("  ", f)
+        buf[#buf + 1] = row("  ", f)
     end
-    out[#out + 1] = "}"
-    out[#out + 1] = ""
+    buf[#buf + 1] = "}"
+    return #list
+end
 
-    out[#out + 1] = "INFO.attrs = {   -- objetos con atributos (IDs y datos): inst:GetAttribute(nombre)"
-    for _, key in ipairs(R.ao) do
-        local g = R.attrs[key]
-        out[#out + 1] = row("  ", {
-            { "pattern", q(namePattern(g.p.Name)) }, { "class", q(g.p.ClassName) }, { "count", tostring(g.count) },
-            { "attrs", lv(g.a) }, { "example", pathExpr(g.p) }, { "parent", pathExpr(g.p.Parent) },
-        })
-    end
-    out[#out + 1] = "}"
-    out[#out + 1] = ""
-
-    out[#out + 1] = "INFO.tags = {   -- CollectionService:GetTagged(tag)"
+-- 5) TAGS (CollectionService)
+function SEC.tags(buf)
     local okT, tags = pcall(function() return CollectionService:GetAllTags() end)
-    local shown = 0
+    local list = {}
     if okT and type(tags) == "table" then
-        table.sort(tags)
         for _, tag in ipairs(tags) do
             local okG, tagged = pcall(function() return CollectionService:GetTagged(tag) end)
             if okG and #tagged > 0 then
-                shown += 1
-                if shown > 80 then out[#out + 1] = "  -- … (más)" break end
-                out[#out + 1] = row("  ", { { "tag", q(tag) }, { "count", tostring(#tagged) }, { "example", pathExpr(tagged[1]) } })
-            end
-        end
-    end
-    out[#out + 1] = "}"
-end
-
--- 4) INTERFAZ
-local function secGui(out)
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then out[#out + 1] = "INFO.screens = {}   -- sin PlayerGui" return end
-
-    local prefix = "^Players%.[^%.]+%.PlayerGui%."
-    local btnGroups, border = {}, {}
-    local lblGroups, lorder = {}, {}
-    local screens, n = {}, 0
-
-    for _, sg in ipairs(pg:GetChildren()) do
-        if sg:IsA("ScreenGui") and sg.Name ~= GUI_NAME then
-            local sInfo = { name = sg.Name, enabled = sg.Enabled, buttons = 0 }
-            screens[#screens + 1] = sInfo
-            local stack = { { sg, sg.Enabled } }
-            while #stack > 0 do
-                local item = table.remove(stack)
-                for _, c in ipairs(item[1]:GetChildren()) do
-                    n += 1
-                    if n % 400 == 0 then task.wait() info.status = "Interfaz… " .. n end
-                    local vis = item[2]
-                    if c:IsA("GuiObject") then vis = vis and c.Visible end
-                    stack[#stack + 1] = { c, vis }
-
-                    if c:IsA("TextButton") or c:IsA("ImageButton") then
-                        sInfo.buttons += 1
-                        local rel = (path(c):gsub(prefix, ""))
-                        local text = c:IsA("TextButton") and c.Text or ""
-                        local key = normName(rel) .. "|" .. normName(text) .. "|" .. tostring(vis)
-                        grp(btnGroups, border, key, 250, function()
-                            return { inst = c, text = text, vis = vis, class = c.ClassName }
-                        end)
-                    elseif opts.labels and c:IsA("TextLabel") and c.Text ~= "" and #c.Text <= 50 then
-                        local rel = (path(c):gsub(prefix, ""))
-                        grp(lblGroups, lorder, normName(rel), 150, function() return { inst = c, text = c.Text } end)
-                    end
+                local humanoids = 0
+                for _, o in ipairs(tagged) do
+                    if typeof(o) == "Instance" and o:IsA("Model") and o:FindFirstChildOfClass("Humanoid") then humanoids += 1 end
                 end
+                list[#list + 1] = {
+                    tag = tag, count = #tagged, example = tagged[1], humanoids = humanoids,
+                    score = kwScore(tag) * 2 + math.min(#tagged, 500) / 5 + (humanoids > 0 and 25 or 0),
+                }
             end
         end
     end
-
-    out[#out + 1] = "INFO.screens = {"
-    for _, s in ipairs(screens) do
-        out[#out + 1] = row("  ", { { "name", q(s.name) }, { "enabled", tostring(s.enabled) }, { "buttons", tostring(s.buttons) } })
-    end
-    out[#out + 1] = "}"
-    out[#out + 1] = ""
-
-    out[#out + 1] = "INFO.buttons = {   -- pulsar: firesignal(btn.Activated) o firesignal(btn.MouseButton1Click)"
-    for _, key in ipairs(border) do
-        local g = btnGroups[key]
-        out[#out + 1] = row("  ", {
-            { "class", q(g.class) }, { "text", q((g.text:gsub("\n", " ")):sub(1, 40)) }, { "visible", tostring(g.vis) },
-            { "count", tostring(g.count) }, { "example", pathExpr(g.inst) },
-            g.count > 1 and { "pattern", q(namePattern(g.inst.Name)) } or { "pattern", nil },
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.tags = {   -- CollectionService:GetTagged(tag) · más importantes primero · humanoids = cuántos son personajes/enemigos"
+    for _, t in ipairs(list) do
+        buf[#buf + 1] = row("  ", {
+            { "tag", q(t.tag) }, { "count", tostring(t.count) }, { "score", sc(t.score) },
+            { "humanoids", t.humanoids > 0 and tostring(t.humanoids) or nil },
+            { "example", pathExpr(t.example) },
         })
     end
-    out[#out + 1] = "}"
-
-    if opts.labels then
-        out[#out + 1] = ""
-        out[#out + 1] = "INFO.labels = {   -- textos de la interfaz"
-        for _, key in ipairs(lorder) do
-            local g = lblGroups[key]
-            out[#out + 1] = row("  ", { { "text", q((g.text:gsub("\n", " "))) }, { "count", tostring(g.count) }, { "example", pathExpr(g.inst) } })
-        end
-        out[#out + 1] = "}"
-    end
+    buf[#buf + 1] = "}"
+    return #list
 end
 
--- 5) MIS DATOS (se usa también en «Ver mi personaje»)
-local function secMine(out)
+-- 6) MIS DATOS
+function SEC.mine(out)
+    local rows = 0
     local char = player.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     out[#out + 1] = "INFO.me = {"
     out[#out + 1] = '  player = game:GetService("Players").LocalPlayer,'
+    out[#out + 1] = "  team = " .. q(tostring(player.Team and player.Team.Name or "ninguno")) .. ","
     if hrp then out[#out + 1] = "  position = " .. lv(hrp.Position) .. "," end
     if hum then
         out[#out + 1] = "  humanoid = { health = " .. lv(tryGet(function() return hum.Health end))
             .. ", maxHealth = " .. lv(tryGet(function() return hum.MaxHealth end))
             .. ", walkSpeed = " .. lv(tryGet(function() return hum.WalkSpeed end))
-            .. ", jumpPower = " .. lv(tryGet(function() return hum.JumpPower end)) .. " },"
+            .. ", jumpPower = " .. lv(tryGet(function() return hum.JumpPower end))
+            .. ", hipHeight = " .. lv(tryGet(function() return hum.HipHeight end)) .. " },"
     end
     local okP, pattrs = pcall(player.GetAttributes, player)
-    if okP and pattrs and next(pattrs) then out[#out + 1] = "  attributes = " .. lv(pattrs) .. "," end
+    if okP and pattrs and next(pattrs) then out[#out + 1] = "  attributes = " .. lv(pattrs) .. "," rows += 1 end
 
-    -- Valores (leaderstats, Data, etc.) sin entrar en PlayerGui / Backpack
+    -- Valores (leaderstats, Data, etc.) sin entrar en PlayerGui / Backpack; los de dinero/recursos primero
     local values, stack = {}, { player }
-    while #stack > 0 and #values < 40 do
+    while #stack > 0 do
         local inst = table.remove(stack)
         for _, c in ipairs(inst:GetChildren()) do
             if c.Name ~= "PlayerGui" and c.Name ~= "Backpack" and c.Name ~= "PlayerScripts" then
                 if c:IsA("ValueBase") then
-                    if #values < 40 then values[#values + 1] = c end
+                    values[#values + 1] = { inst = c, score = kwScore(c.Name) + (c.Parent and c.Parent.Name == "leaderstats" and 30 or 0) }
                 elseif c:IsA("Folder") or c:IsA("Configuration") then
                     stack[#stack + 1] = c
                 end
             end
         end
     end
-    out[#out + 1] = "  values = {"
+    sortByScore(values)
+    out[#out + 1] = "  values = {   -- leaderstats y datos, más importantes primero"
     for _, v in ipairs(values) do
-        out[#out + 1] = row("    ", { { "path", pathExpr(v) }, { "value", valueLv(v) } })
+        rows += 1
+        out[#out + 1] = row("    ", { { "path", pathExpr(v.inst) }, { "value", valueLv(v.inst) } })
     end
     out[#out + 1] = "  },"
 
     out[#out + 1] = "  tools = {"
     local bp = player:FindFirstChildOfClass("Backpack")
-    for _, pair in ipairs({ { bp, "Backpack" }, { char, "Character" } }) do
+    for _, pair in ipairs({ { char, "Character" }, { bp, "Backpack" } }) do
         local container = pair[1]
         if container then
             for _, t in ipairs(container:GetChildren()) do
                 if t:IsA("Tool") then
+                    rows += 1
                     local okA, a = pcall(t.GetAttributes, t)
                     out[#out + 1] = row("    ", {
                         { "name", q(t.Name) }, { "where", q(pair[2]) }, { "path", pathExpr(t) },
@@ -1086,17 +1182,355 @@ local function secMine(out)
     end
     out[#out + 1] = "  },"
     out[#out + 1] = "}"
+    return rows + 1
 end
 
-local function myCharReport()
-    local out = startReport("MI PERSONAJE")
-    secMine(out)
+-- 7) TOUCH
+function SEC.touch(buf, R)
+    local list = listOf(R.to, R.touch)
+    for _, g in ipairs(list) do
+        local owner = g.p.Parent or g.p
+        g.score = kwScore(owner.Name) + math.min(g.count, 300) / 6 + proxBonus(g.dist)
+    end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.touch = {   -- objetos con TouchInterest (coleccionables, zonas, puertas) · firetouchinterest(hrp, example, 0/1) · más importantes primero"
+    for _, g in ipairs(list) do
+        local owner = g.p.Parent or g.p
+        buf[#buf + 1] = row("  ", {
+            { "pattern", q(namePattern(owner.Name)) }, { "class", q(owner.ClassName) }, { "count", tostring(g.count) },
+            { "score", sc(g.score) }, { "dist", g.dist and num(g.dist) or nil },
+            { "example", pathExpr(owner) }, { "parent", pathExpr(owner.Parent) }, { "pos", posLv(owner) },
+        })
+    end
+    buf[#buf + 1] = "}"
+    return #list
+end
+
+-- 8) CLICKDETECTORS
+function SEC.clicks(buf, R)
+    local list = listOf(R.co, R.clicks)
+    for _, g in ipairs(list) do
+        local owner = g.p.Parent or g.p
+        g.score = kwScore(owner.Name) + math.min(g.count, 200) / 4 + proxBonus(g.dist)
+    end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.clicks = {   -- fireclickdetector(<example>) · más importantes primero"
+    for _, g in ipairs(list) do
+        buf[#buf + 1] = row("  ", {
+            { "count", tostring(g.count) }, { "score", sc(g.score) }, { "dist", g.dist and num(g.dist) or nil },
+            { "ownerPattern", ownerPat(g.p) }, { "example", pathExpr(g.p) }, { "pos", posLv(g.p) },
+        })
+    end
+    buf[#buf + 1] = "}"
+    return #list
+end
+
+-- 9) OBJETOS CON ATRIBUTOS (IDs y datos)
+function SEC.attrs(buf, R)
+    local list = listOf(R.ao, R.attrs)
+    for _, g in ipairs(list) do
+        local names, n = {}, 0
+        for k in pairs(g.a) do names[#names + 1] = k n += 1 end
+        g.score = kwScore(g.p.Name .. " " .. table.concat(names, " ")) + n * 2 + math.min(g.count, 200) / 8
+    end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.attrs = {   -- objetos con atributos (IDs y datos): inst:GetAttribute(nombre) · más importantes primero"
+    for _, g in ipairs(list) do
+        local f = {
+            { "pattern", q(namePattern(g.p.Name)) }, { "class", q(g.p.ClassName) }, { "count", tostring(g.count) },
+            { "score", sc(g.score) }, { "attrs", lv(g.a) },
+        }
+        local okT, tags = pcall(CollectionService.GetTags, CollectionService, g.p)
+        if okT and tags and #tags > 0 then f[#f + 1] = { "tags", lv(tags) } end
+        f[#f + 1] = { "example", pathExpr(g.p) }
+        f[#f + 1] = { "parent", pathExpr(g.p.Parent) }
+        buf[#buf + 1] = row("  ", f)
+    end
+    buf[#buf + 1] = "}"
+    return #list
+end
+
+-- 10) INTERFAZ (botones visibles y con palabras de acción primero)
+function SEC.gui(out)
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then out[#out + 1] = "INFO.screens = {}   -- sin PlayerGui" return 0 end
+
+    local prefix = "^Players%.[^%.]+%.PlayerGui%."
+    local btnGroups, border = {}, {}
+    local lblGroups, lorder = {}, {}
+    local screens, n = {}, 0
+
+    for _, sg in ipairs(pg:GetChildren()) do
+        if sg:IsA("ScreenGui") and sg.Name ~= GUI_NAME then
+            local sInfo = { name = sg.Name, enabled = sg.Enabled, buttons = 0 }
+            screens[#screens + 1] = sInfo
+            local stack = { { sg, sg.Enabled } }
+            while #stack > 0 do
+                local item = table.remove(stack)
+                for _, c in ipairs(item[1]:GetChildren()) do
+                    n += 1
+                    if n % 400 == 0 then task.wait() info.status = "Interfaz… " .. n end
+                    local vis = item[2]
+                    if c:IsA("GuiObject") then vis = vis and c.Visible end
+                    stack[#stack + 1] = { c, vis }
+
+                    if c:IsA("TextButton") or c:IsA("ImageButton") then
+                        sInfo.buttons += 1
+                        local rel = (path(c):gsub(prefix, ""))
+                        local text = c:IsA("TextButton") and c.Text or ""
+                        local key = normName(rel) .. "|" .. normName(text) .. "|" .. tostring(vis)
+                        grp(btnGroups, border, key, function()
+                            return { inst = c, text = text, vis = vis, class = c.ClassName, rel = rel }
+                        end)
+                    elseif opts.labels and c:IsA("TextLabel") and c.Text ~= "" then
+                        local rel = (path(c):gsub(prefix, ""))
+                        grp(lblGroups, lorder, normName(rel), function() return { inst = c, text = c.Text } end)
+                    end
+                end
+            end
+        end
+    end
+
+    -- pantallas: las activas y con más botones primero
+    for _, s in ipairs(screens) do s.score = (s.enabled and 100 or 0) + s.buttons end
+    sortByScore(screens)
+    out[#out + 1] = "INFO.screens = {   -- activas y con más botones primero"
+    for _, s in ipairs(screens) do
+        out[#out + 1] = row("  ", { { "name", q(s.name) }, { "enabled", tostring(s.enabled) }, { "buttons", tostring(s.buttons) } })
+    end
+    out[#out + 1] = "}"
     out[#out + 1] = ""
-    out[#out + 1] = "return INFO"
-    return scrub(table.concat(out, "\n"))
+
+    local blist = listOf(border, btnGroups)
+    for _, g in ipairs(blist) do
+        g.score = (g.vis and 30 or 0) + kwScore(g.text .. " " .. g.rel) + math.min(g.count, 100) / 5
+    end
+    sortByScore(blist)
+    out[#out + 1] = "INFO.buttons = {   -- visibles y con palabras de acción primero · pulsar: firesignal(btn.Activated) o firesignal(btn.MouseButton1Click)"
+    for _, g in ipairs(blist) do
+        out[#out + 1] = row("  ", {
+            { "class", q(g.class) }, { "text", q((g.text:gsub("\n", " "))) }, { "visible", tostring(g.vis) },
+            { "count", tostring(g.count) }, { "score", sc(g.score) }, { "example", pathExpr(g.inst) },
+            g.count > 1 and { "pattern", q(namePattern(g.inst.Name)) } or { "pattern", nil },
+        })
+    end
+    out[#out + 1] = "}"
+
+    local rows = #blist
+    if opts.labels then
+        local llist = listOf(lorder, lblGroups)
+        for _, g in ipairs(llist) do g.score = kwScore(g.text) + math.min(g.count, 50) / 5 end
+        sortByScore(llist)
+        out[#out + 1] = ""
+        out[#out + 1] = "INFO.labels = {   -- textos de la interfaz, más importantes primero"
+        for _, g in ipairs(llist) do
+            out[#out + 1] = row("  ", { { "text", q((g.text:gsub("\n", " "))) }, { "count", tostring(g.count) }, { "example", pathExpr(g.inst) } })
+        end
+        out[#out + 1] = "}"
+        rows += #llist
+    end
+    return rows
 end
 
--- 6) JERARQUÍA: árbol anidado de contenedores (root + children), repetidos agrupados
+-- 11) PUNTOS DE APARICIÓN
+function SEC.spawns(buf, R)
+    local mp = myPos()
+    local list = {}
+    for _, s in ipairs(R.spawns) do
+        local d = distOf(s, mp)
+        list[#list + 1] = { inst = s, dist = d, score = (s.Neutral and 10 or 0) + (s.Enabled and 5 or 0) + proxBonus(d) }
+    end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.spawns = {   -- SpawnLocation (puntos seguros para teletransportarte) · más importantes primero"
+    for _, s in ipairs(list) do
+        local i = s.inst
+        buf[#buf + 1] = row("  ", {
+            { "example", pathExpr(i) }, { "pos", posLv(i) }, { "dist", s.dist and num(s.dist) or nil },
+            { "neutral", tostring(i.Neutral) }, { "enabled", tostring(i.Enabled) },
+            { "team", q(tostring(i.TeamColor)) },
+        })
+    end
+    buf[#buf + 1] = "}"
+    return #list
+end
+
+-- 12) SERVIDOR, EQUIPOS, JUGADORES Y ATRIBUTOS DEL JUEGO
+function SEC.extra(buf)
+    local rows = 0
+    buf[#buf + 1] = "INFO.server = { players = " .. #Players:GetPlayers()
+        .. ", maxPlayers = " .. lv(tryGet(function() return Players.MaxPlayers end))
+        .. ", jobId = " .. q(game.JobId)
+        .. ", privateServer = " .. tostring(game.PrivateServerId ~= "")
+        .. ", gravity = " .. lv(tryGet(function() return Workspace.Gravity end))
+        .. ", streaming = " .. tostring(tryGet(function() return Workspace.StreamingEnabled end))
+        .. ", creatorId = " .. tostring(game.CreatorId) .. " }"
+    buf[#buf + 1] = ""
+
+    -- Atributos del propio juego (suelen guardar configuración global)
+    local ga = {}
+    for _, pair in ipairs({ { "workspace", Workspace }, { "replicatedStorage", ReplicatedStorage },
+        { "lighting", game:GetService("Lighting") } }) do
+        local okA, a = pcall(pair[2].GetAttributes, pair[2])
+        if okA and a and next(a) then ga[#ga + 1] = pair[1] .. " = " .. lv(a) end
+    end
+    if #ga > 0 then
+        buf[#buf + 1] = "INFO.gameAttrs = { " .. table.concat(ga, ", ") .. " }"
+        buf[#buf + 1] = ""
+        rows += #ga
+    end
+
+    local teams = {}
+    local okT, tl = pcall(function() return game:GetService("Teams"):GetTeams() end)
+    if okT and tl then
+        for _, t in ipairs(tl) do
+            local n = 0
+            for _, pl in ipairs(Players:GetPlayers()) do if pl.Team == t then n += 1 end end
+            teams[#teams + 1] = { t = t, score = n }
+        end
+    end
+    sortByScore(teams)
+    buf[#buf + 1] = "INFO.teams = {   -- equipos, los más poblados primero"
+    for _, x in ipairs(teams) do
+        rows += 1
+        buf[#buf + 1] = row("  ", {
+            { "name", q(x.t.Name) }, { "color", lv(x.t.TeamColor.Color) }, { "players", tostring(x.score) },
+            { "autoAssignable", tostring(x.t.AutoAssignable) },
+        })
+    end
+    buf[#buf + 1] = "}"
+    buf[#buf + 1] = ""
+
+    local mp = myPos()
+    local plist = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= player then
+            local ch = pl.Character
+            local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+            local d = hrp and mp and (hrp.Position - mp).Magnitude or nil
+            plist[#plist + 1] = { pl = pl, ch = ch, dist = d, score = d and (100000 - d) or 0 }
+        end
+    end
+    sortByScore(plist)
+    buf[#buf + 1] = "INFO.players = {   -- otros jugadores, el más cercano primero (los nombres se ocultan si «Ocultar nombres» está activo)"
+    for _, x in ipairs(plist) do
+        rows += 1
+        local stats = {}
+        local ls = x.pl:FindFirstChild("leaderstats")
+        if ls then
+            for _, v in ipairs(ls:GetChildren()) do
+                if v:IsA("ValueBase") then stats[#stats + 1] = q(v.Name) .. " = " .. valueLv(v) end
+            end
+        end
+        local hum = x.ch and x.ch:FindFirstChildOfClass("Humanoid")
+        buf[#buf + 1] = row("  ", {
+            { "name", q(x.pl.Name) }, { "team", q(tostring(x.pl.Team and x.pl.Team.Name or "ninguno")) },
+            { "health", hum and lv(tryGet(function() return hum.Health end)) or nil },
+            { "dist", x.dist and num(x.dist) or nil },
+            { "stats", #stats > 0 and ("{ " .. table.concat(stats, ", ") .. " }") or nil },
+        })
+    end
+    buf[#buf + 1] = "}"
+    return rows + 1
+end
+
+-- 13-14) SCRIPTS (lista agrupada y, si se pide, el código decompilado)
+local function isCoreInst(inst)
+    local cur = inst
+    for _ = 1, 100 do
+        if not cur then return false end
+        local par = cur.Parent
+        if par == game then
+            return cur.ClassName == "CoreGui" or cur.Name == "CorePackages"
+        end
+        cur = par
+    end
+    return false
+end
+
+local function gatherScripts()
+    local seen, list = {}, {}
+    local function consider(s)
+        if typeof(s) ~= "Instance" or seen[s] then return end
+        seen[s] = true
+        local cn = s.ClassName
+        if (cn == "LocalScript" or cn == "ModuleScript" or cn == "Script") and not isCoreInst(s) then
+            list[#list + 1] = s
+        end
+    end
+    local n = 0
+    for _, root in ipairs({ ReplicatedStorage, ReplicatedFirst, player }) do
+        for _, d in ipairs(root:GetDescendants()) do
+            n += 1
+            if n % 500 == 0 then task.wait() info.status = "Buscando scripts… " .. n end
+            consider(d)
+        end
+    end
+    for _, fname in ipairs({ "getscripts", "getloadedmodules" }) do
+        local f = env[fname]
+        if f then
+            local ok, res = pcall(f)
+            if ok and type(res) == "table" then
+                for _, s in ipairs(res) do consider(s) end
+            end
+        end
+    end
+    return list
+end
+
+local function scriptScore(s)
+    local cn = s.ClassName
+    return kwScore(s.Name .. " " .. (s.Parent and s.Parent.Name or ""))
+        + (cn == "LocalScript" and 10 or cn == "ModuleScript" and 6 or 3)
+end
+
+function SEC.scripts(buf, scripts)
+    local groups, order = {}, {}
+    for _, s in ipairs(scripts) do
+        local key = normName(s.Name) .. "|" .. s.ClassName
+        local g = grp(groups, order, key, function() return { s = s, score = scriptScore(s) } end)
+        g.score = math.max(g.score, scriptScore(s))
+    end
+    local list = listOf(order, groups)
+    for _, g in ipairs(list) do g.score += math.min(g.count, 50) / 5 end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.scripts = {   -- LocalScripts / ModuleScripts / Scripts del cliente (sin los de Roblox), más importantes primero"
+    for _, g in ipairs(list) do
+        local s = g.s
+        buf[#buf + 1] = row("  ", {
+            g.count > 1 and { "pattern", q(namePattern(s.Name)) } or { "name", q(s.Name) },
+            { "class", q(s.ClassName) }, { "count", tostring(g.count) }, { "score", sc(g.score) },
+            { "example", pathExpr(s) },
+        })
+    end
+    buf[#buf + 1] = "}"
+    return #list
+end
+
+function SEC.sources(buf, scripts)
+    if not decompile then
+        buf[#buf + 1] = "-- (tu ejecutor no tiene decompile)"
+        return 0
+    end
+    local list = {}
+    for _, s in ipairs(scripts) do
+        if s.ClassName ~= "Script" then list[#list + 1] = { s = s, score = scriptScore(s) } end
+    end
+    sortByScore(list)
+    buf[#buf + 1] = "INFO.sources = {   -- código decompilado, los scripts más importantes primero"
+    local rows = 0
+    for i, g in ipairs(list) do
+        if i % 3 == 0 then task.wait() info.status = "Decompilando… " .. i .. "/" .. #list end
+        local ok, src = pcall(decompile, g.s)
+        if ok and type(src) == "string" and #src > 0 then
+            rows += 1
+            buf[#buf + 1] = "  { path = " .. pathExpr(g.s) .. ", score = " .. sc(g.score) .. ", source = " .. lb(src) .. " },"
+        end
+    end
+    buf[#buf + 1] = "}"
+    return rows
+end
+
+-- 15-16) JERARQUÍA: árbol anidado de contenedores (root + children), repetidos agrupados, importantes primero
 local CONTAINER = {
     Folder = true, Model = true, Configuration = true, Tool = true, ModuleScript = true, Script = true,
     LocalScript = true, RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true,
@@ -1104,7 +1538,7 @@ local CONTAINER = {
 }
 local OMIT = { Packages = true, _Index = true }
 
-local function hierarchy(root, maxDepth, cap, skipSet, varName, out)
+local function hierarchy(root, maxDepth, skipSet, varName, out)
     local st = { lines = 0, n = 0 }
     local cam = Workspace.CurrentCamera
 
@@ -1120,12 +1554,14 @@ local function hierarchy(root, maxDepth, cap, skipSet, varName, out)
                 other[c.ClassName] = (other[c.ClassName] or 0) + 1
             end
         end
+        for _, g in ipairs(order) do
+            g.score = kwScore(g.first.Name .. " " .. g.first.ClassName) + math.min(g.count, 100) / 5
+                + (#g.first:GetChildren() > 0 and 3 or 0)
+        end
+        sortByScore(order)
+
         local pad = string.rep("  ", depth)
         for _, g in ipairs(order) do
-            if st.lines >= cap then
-                out[#out + 1] = pad .. "-- … límite de " .. cap .. " líneas"
-                break
-            end
             st.lines += 1
             st.n += 1
             if st.n % 300 == 0 then task.wait() info.status = "Jerarquía… " .. st.lines .. " líneas" end
@@ -1161,11 +1597,13 @@ local function hierarchy(root, maxDepth, cap, skipSet, varName, out)
     out[#out + 1] = varName .. " = { root = " .. pathExpr(root) .. ", children = {"
     local o = node(root, 1)
     out[#out + 1] = "}" .. (o and (", other = " .. o) or "") .. " }"
+    return st.lines
 end
 
--- Construye el informe completo
+-- Construye el informe completo, de más a menos importante
 local function buildInfo()
     local sec = opts.sec
+    local mp = myPos()
 
     local skipSet = {}
     if scan.hidePlayers then
@@ -1177,68 +1615,145 @@ local function buildInfo()
     local streaming = tryGet(function() return Workspace.StreamingEnabled end)
     local funcs = {}
     for _, f in ipairs({ "hookmetamethod", "fireproximityprompt", "fireclickdetector", "firetouchinterest",
-        "firesignal", "getconnections", "writefile", "setclipboard" }) do
+        "firesignal", "getconnections", "decompile", "getscripts", "writefile", "setclipboard" }) do
         funcs[#funcs + 1] = f .. " = " .. (env[f] ~= nil and "true" or "false")
     end
-    local out = startReport("INFO ÚTIL", ", streaming = " .. tostring(streaming)
+    local head = startReport("INFO ÚTIL", ", streaming = " .. tostring(streaming)
         .. ", executor = { " .. table.concat(funcs, ", ") .. " }")
     if streaming then
-        out[#out + 1] = "-- ⚠ StreamingEnabled: solo se ve lo cercano al personaje; repite en otra zona si falta algo"
-        out[#out + 1] = ""
+        head[#head + 1] = "-- ⚠ StreamingEnabled: solo se ve lo cercano al personaje; repite en otra zona si falta algo"
+        head[#head + 1] = ""
     end
 
-    local function run(name, fn)
-        info.status = name .. "…"
-        local ok, err = pcall(fn)
-        if not ok then
-            out[#out + 1] = "-- (error en «" .. name .. "»: " .. tostring(err):gsub("%s+", " "):sub(1, 80) .. ")"
-        end
-        out[#out + 1] = ""
-    end
-
-    if sec.remotes then run("Remotes", function() secRemotes(out) end) end
-    if sec.caps and state.total > 0 then
-        run("Capturas", function() capturesLines(out) end)
-    end
+    -- Un solo recorrido del Workspace para prompts, npcs, touch, clicks, attrs y spawns
+    local R
     if sec.inter then
-        run("Interactuables e IDs", function()
-            local R = scanWorld(skipSet)
-            secInter(out, R)
-        end)
+        info.status = "Recorriendo Workspace…"
+        local ok, res = pcall(scanWorld, skipSet, mp)
+        if ok then R = res end
     end
-    if sec.gui then run("Interfaz", function() secGui(out) end) end
-    if sec.mine then run("Mis datos", function() secMine(out) end) end
-    if sec.hier then
-        run("Jerarquía de Workspace", function()
-            hierarchy(Workspace, 3, 250, skipSet, "INFO.workspaceTree", out)
-        end)
-        run("Jerarquía de ReplicatedStorage", function()
-            hierarchy(ReplicatedStorage, 6, 400, {}, "INFO.replicatedTree", out)
-        end)
+    local scripts
+    if sec.scripts then
+        local ok, res = pcall(gatherScripts)
+        scripts = ok and res or {}
+    end
+    local depth = DEPTHS[opts.depthIdx]
+
+    local secs = {}
+    local function add(name, why, enabled, fn)
+        local s = { name = name, why = why, rank = #secs + 1, count = 0, lines = {} }
+        secs[#secs + 1] = s
+        if not enabled then s.skipped = true return end
+        info.status = name .. "…"
+        local ok, res = pcall(fn, s.lines)
+        if ok then
+            s.count = tonumber(res) or 0
+        else
+            s.err = true
+            s.lines[#s.lines + 1] = "-- (error en «" .. name .. "»: " .. tostring(res):gsub("%s+", " "):sub(1, 90) .. ")"
+        end
+    end
+
+    add("calls", "Lo que hizo el juego cuando marcaste cada acción: llamadas exactas a remotes, en orden.",
+        sec.caps and state.total > 0, function(b) return SEC.calls(b) end)
+    add("remotes", "Todos los RemoteEvent/RemoteFunction con su ruta exacta; los observados y de acción, primero.",
+        sec.remotes, function(b) return SEC.remotes(b) end)
+    add("prompts", "ProximityPrompts (recoger, abrir, comprar…) con posición y distancia.",
+        sec.inter and R ~= nil, function(b) return SEC.prompts(b, R) end)
+    add("npcs", "Enemigos y NPCs (Humanoid) con vida, atributos y tags.",
+        sec.inter and R ~= nil, function(b) return SEC.npcs(b, R) end)
+    add("tags", "Tags de CollectionService (p. ej. Combatant) y cuántos son personajes.",
+        sec.tags, function(b) return SEC.tags(b) end)
+    add("me", "Tu personaje: posición, vida, dinero/leaderstats, herramientas.",
+        sec.mine, function(b) return SEC.mine(b) end)
+    add("touch", "Objetos con TouchInterest: coleccionables, zonas, puertas, portales.",
+        sec.inter and R ~= nil, function(b) return SEC.touch(b, R) end)
+    add("clicks", "ClickDetectors.",
+        sec.inter and R ~= nil, function(b) return SEC.clicks(b, R) end)
+    add("attrs", "Objetos con atributos (IDs, niveles, dueños, precios).",
+        sec.inter and R ~= nil, function(b) return SEC.attrs(b, R) end)
+    add("gui", "Pantallas y botones de la interfaz (los visibles y de acción, primero).",
+        sec.gui, function(b) return SEC.gui(b) end)
+    add("spawns", "Puntos de aparición (SpawnLocation), útiles para teletransportarte a un sitio seguro.",
+        sec.inter and R ~= nil, function(b) return SEC.spawns(b, R) end)
+    add("extra", "Servidor, atributos globales del juego, equipos y otros jugadores.",
+        sec.extra, function(b) return SEC.extra(b) end)
+    add("scripts", "Scripts del cliente agrupados (indican qué sistemas tiene el juego).",
+        sec.scripts and scripts ~= nil, function(b) return SEC.scripts(b, scripts) end)
+    add("sources", "Código decompilado de los scripts del cliente (muestra los argumentos reales de los remotes).",
+        sec.scripts and opts.src and scripts ~= nil, function(b) return SEC.sources(b, scripts) end)
+    add("replicatedTree", "Jerarquía de ReplicatedStorage (módulos, remotes, assets).",
+        sec.hier, function(b) return hierarchy(ReplicatedStorage, depth, {}, "INFO.replicatedTree", b) end)
+    add("workspaceTree", "Jerarquía de Workspace (el mapa completo).",
+        sec.hier, function(b) return hierarchy(Workspace, depth, skipSet, "INFO.workspaceTree", b) end)
+
+    -- Ensamblado: cabecera, índice por importancia y secciones en ese mismo orden
+    local out = head
+    local idx = {}
+    out[#out + 1] = "INFO.index = {   -- ORDEN DE IMPORTANCIA (1 = lo más útil para escribir un script). Las secciones aparecen en este mismo orden."
+    for _, s in ipairs(secs) do
+        out[#out + 1] = row("  ", {
+            { "rank", tostring(s.rank) }, { "section", q(s.name) }, { "rows", tostring(s.count) },
+            { "skipped", s.skipped and "true" or nil }, { "error", s.err and "true" or nil },
+            { "why", q(s.why) },
+        })
+        idx[#idx + 1] = string.format("%d. %s: %s", s.rank, s.name,
+            s.skipped and "desactivado" or (s.err and "error" or (s.count .. " filas")))
+    end
+    out[#out + 1] = "}"
+    out[#out + 1] = ""
+    for _, s in ipairs(secs) do
+        if #s.lines > 0 and (s.count > 0 or s.err) then
+            for _, l in ipairs(s.lines) do out[#out + 1] = l end
+            out[#out + 1] = ""
+        end
     end
     out[#out + 1] = "return INFO"
 
-    return capText(scrub(table.concat(out, "\n")), MAX_INFO)
+    info.preview = scrub(table.concat(idx, "\n"))
+    return scrub(table.concat(out, "\n"))
 end
 
-local function splitParts(text)
-    local parts, cur, size = {}, {}, 0
+local function myCharReport()
+    local out = startReport("MI PERSONAJE")
+    SEC.mine(out)
+    out[#out + 1] = ""
+    out[#out + 1] = "return INFO"
+    return scrub(table.concat(out, "\n"))
+end
+
+local function splitParts(text, size)
+    local parts, cur, total = {}, {}, 0
     for line in (text .. "\n"):gmatch("(.-)\n") do
-        if size + #line + 1 > PART_SIZE and #cur > 0 then
+        if total + #line + 1 > size and #cur > 0 then
             parts[#parts + 1] = table.concat(cur, "\n")
-            cur, size = {}, 0
+            cur, total = {}, 0
         end
         cur[#cur + 1] = line
-        size += #line + 1
+        total += #line + 1
     end
     if #cur > 0 then parts[#parts + 1] = table.concat(cur, "\n") end
     return parts
 end
 
+API.buildReport = buildReport
+API.runScan = runScan
+API.detailReport = detailReport
+API.myCharReport = myCharReport
+API.buildInfo = buildInfo
+API.splitParts = splitParts
+API.addMarker = addMarker
+API.copyText = copyText
+API.hookOK = hookOK
+end -- fin del motor
+
 ----------------------------------------------------------------
--- INTERFAZ (en un bloque para no pasar el límite de variables locales)
+-- INTERFAZ (en otro bloque para no pasar el límite de variables locales)
 ----------------------------------------------------------------
 do
+local copyText = API.copyText
+local hookOK = API.hookOK
+
 local function corner(obj, r)
     local c = Instance.new("UICorner")
     c.CornerRadius = UDim.new(0, r or 10)
@@ -1324,8 +1839,8 @@ local grad = Instance.new("UIGradient")
 grad.Color = ColorSequence.new(Color3.fromRGB(60, 80, 160), C.Card)
 grad.Parent = header
 
-makeLabel(header, "📡 Capture + Scanner + Info v4", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
-makeLabel(header, "Informe en datos Lua · solo lee, no modifica", UDim2.new(1, -90, 0, 16), UDim2.new(0, 14, 0, 26), 11, C.Sub)
+makeLabel(header, "📡 Capture + Scanner + Info v5", UDim2.new(1, -90, 0, 24), UDim2.new(0, 14, 0, 4), 16).Font = Enum.Font.GothamBold
+makeLabel(header, "Sin límites · ordenado por importancia · solo lee", UDim2.new(1, -90, 0, 16), UDim2.new(0, 14, 0, 26), 11, C.Sub)
 local minBtn   = makeButton(header, "–", UDim2.fromOffset(32, 32), UDim2.new(1, -78, 0.5, -16))
 local closeBtn = makeButton(header, "✕", UDim2.fromOffset(32, 32), UDim2.new(1, -40, 0.5, -16), C.Red)
 
@@ -1575,7 +2090,7 @@ local markBtn = makeButton(markCard, "Marcar", UDim2.fromOffset(88, 34), UDim2.n
 markBtn.Activated:Connect(function()
     local label = markBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
     if label == "" then label = "acción " .. (state.marker + 1) end
-    addMarker(label)
+    API.addMarker(label)
     markBox.Text = ""
     statusLabel.Text = "Marcado: " .. label .. ". Ahora haz la acción en el juego."
 end)
@@ -1594,7 +2109,7 @@ local clearBtn = bigButton(pageCap, "🧹  Limpiar", C.Btn, 40)
 
 copyBtn.Activated:Connect(function()
     if state.total == 0 then statusLabel.Text = "Aún no hay nada capturado." return end
-    local text = buildReport()
+    local text = API.buildReport()
     if copyText(text) then
         statusLabel.Text = "📋 Copiado (" .. #text .. " caracteres). Pégalo en el chat."
     else
@@ -1604,12 +2119,13 @@ end)
 
 saveBtn.Activated:Connect(function()
     if state.total == 0 then statusLabel.Text = "Aún no hay nada capturado." return end
-    local ok, res = saveFile(buildReport(), "RemoteCapture_" .. game.PlaceId .. ".txt")
+    local ok, res = saveFile(API.buildReport(), "RemoteCapture_" .. game.PlaceId .. ".txt")
     statusLabel.Text = ok and ("💾 Guardado como " .. res .. ".") or ("⚠ No se pudo guardar: " .. res)
 end)
 
 clearBtn.Activated:Connect(function()
-    state.seq, state.map, state.seen, state.total, state.calls, state.marker = {}, {}, {}, 0, 0, 0
+    state.seq, state.map, state.seen, state.sample, state.perRemote = {}, {}, {}, {}, {}
+    state.total, state.calls, state.marker = 0, 0, 0
     state.dirty = true
     statusLabel.Text = "Limpio."
 end)
@@ -1630,19 +2146,19 @@ radiusBox.Text = ""
 
 local zoneBtn = bigButton(pageScan, "", C.Btn, 40)
 zoneBtn.TextSize = 12
-local function refreshZone() zoneBtn.Text = "Zona: " .. zoneNames[scan.zone] .. "\nToca para cambiar" end
+local function refreshZone() zoneBtn.Text = "Zona: " .. scan.zoneNames[scan.zone] .. "\nToca para cambiar" end
 zoneBtn.Activated:Connect(function() scan.zone = scan.zone % 3 + 1 refreshZone() end)
 refreshZone()
 
 local modeBtn = bigButton(pageScan, "", C.Btn, 40)
 modeBtn.TextSize = 12
-local function refreshMode() modeBtn.Text = "Buscar: " .. modeNames[scan.mode] .. "\nToca para cambiar" end
+local function refreshMode() modeBtn.Text = "Buscar: " .. scan.modeNames[scan.mode] .. "\nToca para cambiar" end
 modeBtn.Activated:Connect(function() scan.mode = scan.mode % 3 + 1 refreshMode() end)
 refreshMode()
 
 makeToggle(pageScan, "Ignorar personajes de jugadores", scan, "hidePlayers", 38)
 
-local previewTag = makeLabel(pageScan, "VISTA PREVIA (los más repetidos)", UDim2.new(1, 0, 0, 16), nil, 11, C.Sub)
+local previewTag = makeLabel(pageScan, "VISTA PREVIA (los más importantes)", UDim2.new(1, 0, 0, 16), nil, 11, C.Sub)
 previewTag.Font = Enum.Font.GothamBold
 previewTag.LayoutOrder = nextOrder()
 local previewCard = card(pageScan, 130)
@@ -1659,7 +2175,7 @@ detailBtn.Activated:Connect(function()
     scan.busy = true
     scan.status = "Leyendo detalle…"
     task.spawn(function()
-        local ok, text, found = pcall(detailReport, filterBox.Text)
+        local ok, text, found = pcall(API.detailReport, filterBox.Text)
         scan.busy = false
         if not ok then scan.status = "⚠ Error: " .. tostring(text):sub(1, 70) return end
         scan.report = text
@@ -1674,11 +2190,11 @@ scanSave.TextSize = 12
 
 scanGo.Activated:Connect(function()
     if scan.busy then return end
-    task.spawn(runScan, filterBox.Text, radiusBox.Text)
+    task.spawn(API.runScan, filterBox.Text, radiusBox.Text)
 end)
 
 charBtn.Activated:Connect(function()
-    local text = myCharReport()
+    local text = API.myCharReport()
     scan.status = copyText(text) and ("📋 Personaje copiado (" .. #text .. " car.)") or "⚠ No se pudo copiar."
 end)
 
@@ -1704,29 +2220,66 @@ local infoGo = bigButton(pageAll, "📦  RECOPILAR INFO ÚTIL (y guardar archivo
 
 local infoCard = card(pageAll, 84)
 makeLabel(infoCard,
-    "Genera datos Lua estructurados (INFO.remotes, INFO.prompts, INFO.npcs, INFO.buttons…) con rutas "
-    .. "ya resueltas, listos para que una IA escriba el script. Los repetidos se agrupan con un pattern.",
+    "Recopila TODO sin límites y lo ordena de más a menos importante (mira INFO.index al principio del archivo). "
+    .. "El archivo se guarda completo; al copiar sale por partes y la parte 1 trae lo más importante.",
     UDim2.new(1, -16, 1, -12), UDim2.new(0, 8, 0, 6), 11, C.Sub)
+
+local idxTag = makeLabel(pageAll, "ORDEN DEL ÚLTIMO INFORME (importancia)", UDim2.new(1, 0, 0, 16), nil, 11, C.Sub)
+idxTag.Font = Enum.Font.GothamBold
+idxTag.LayoutOrder = nextOrder()
+local idxCard = card(pageAll, 250)
+local idxLabel = makeLabel(idxCard, "", UDim2.new(1, -16, 1, -12), UDim2.new(0, 8, 0, 6), 11, C.Sub)
+idxLabel.Font = Enum.Font.Code
 
 local secTag = makeLabel(pageAll, "SECCIONES A INCLUIR", UDim2.new(1, 0, 0, 16), nil, 11, C.Sub)
 secTag.Font = Enum.Font.GothamBold
 secTag.LayoutOrder = nextOrder()
-makeToggle(pageAll, "1 Remotes (rutas exactas)", opts.sec, "remotes", 34)
-makeToggle(pageAll, "2 Capturas de 📡", opts.sec, "caps", 34)
-makeToggle(pageAll, "3 Interactuables e IDs", opts.sec, "inter", 34)
-makeToggle(pageAll, "4 Interfaz (PlayerGui)", opts.sec, "gui", 34)
-makeToggle(pageAll, "5 Mis datos", opts.sec, "mine", 34)
-makeToggle(pageAll, "6 Jerarquía (Workspace y RS)", opts.sec, "hier", 34)
+makeToggle(pageAll, "Remotes (de todo el juego)", opts.sec, "remotes", 34)
+makeToggle(pageAll, "Capturas de 📡", opts.sec, "caps", 34)
+makeToggle(pageAll, "Interactuables (prompts, NPCs, touch…)", opts.sec, "inter", 34)
+makeToggle(pageAll, "Tags (CollectionService)", opts.sec, "tags", 34)
+makeToggle(pageAll, "Interfaz (PlayerGui)", opts.sec, "gui", 34)
+makeToggle(pageAll, "Mis datos", opts.sec, "mine", 34)
+makeToggle(pageAll, "Servidor, equipos y jugadores", opts.sec, "extra", 34)
+makeToggle(pageAll, "Scripts del cliente", opts.sec, "scripts", 34)
+makeToggle(pageAll, "Jerarquía (Workspace y RS)", opts.sec, "hier", 34)
 
 local optTag = makeLabel(pageAll, "OPCIONES", UDim2.new(1, 0, 0, 16), nil, 11, C.Sub)
 optTag.Font = Enum.Font.GothamBold
 optTag.LayoutOrder = nextOrder()
+makeToggle(pageAll, "Código decompilado de scripts (pesado)", opts, "src", 34)
 makeToggle(pageAll, "Incluir textos de la interfaz", opts, "labels", 34)
 makeToggle(pageAll, "Ocultar nombres de usuario", opts, "scrub", 34)
 makeToggle(pageAll, "Ignorar personajes de jugadores", scan, "hidePlayers", 34)
 makeToggle(pageAll, "No sobrescribir (añade _2, _3…)", opts, "safe", 34)
 
+local depthBtn = bigButton(pageAll, "", C.Btn, 36)
+depthBtn.TextSize = 12
+local function refreshDepth()
+    local d = DEPTHS[opts.depthIdx]
+    depthBtn.Text = "Profundidad de jerarquía: " .. (d >= 99 and "ilimitada" or d) .. " (toca)"
+end
+depthBtn.Activated:Connect(function() opts.depthIdx = opts.depthIdx % #DEPTHS + 1 refreshDepth() end)
+refreshDepth()
+
+local partBtn = bigButton(pageAll, "", C.Btn, 36)
+partBtn.TextSize = 12
+local function refreshPartSize()
+    partBtn.Text = "Tamaño de cada parte al copiar: " .. (PART_SIZES[opts.partIdx] / 1000) .. "k (toca)"
+end
+partBtn.Activated:Connect(function()
+    opts.partIdx = opts.partIdx % #PART_SIZES + 1
+    refreshPartSize()
+    if info.text ~= "" then
+        info.parts = API.splitParts(info.text, PART_SIZES[opts.partIdx])
+        info.partIndex = 1
+    end
+end)
+refreshPartSize()
+
 local infoCopy = bigButton(pageAll, "📋  Copiar informe", C.Accent, 46)
+local firstBtn = bigButton(pageAll, "⏮  Volver a la parte 1 (la más importante)", C.Btn, 34)
+firstBtn.TextSize = 12
 local infoSave = bigButton(pageAll, "💾  Guardar de nuevo con el nombre de arriba", C.Btn, 40)
 infoSave.TextSize = 12
 
@@ -1735,11 +2288,11 @@ infoGo.Activated:Connect(function()
     info.busy = true
     info.status = "Recopilando… (puede tardar, no cierres)"
     task.spawn(function()
-        local ok, text = pcall(buildInfo)
+        local ok, text = pcall(API.buildInfo)
         info.busy = false
         if not ok then info.status = "⚠ Error: " .. tostring(text):sub(1, 80) return end
         info.text = text
-        info.parts = splitParts(text)
+        info.parts = API.splitParts(text, PART_SIZES[opts.partIdx])
         info.partIndex = 1
         local saved, res = saveFile(text, "InfoUtil_" .. game.PlaceId .. ".txt")
         info.status = (saved and ("💾 Guardado como " .. res) or ("⚠ No se pudo guardar: " .. res))
@@ -1757,6 +2310,11 @@ infoCopy.Activated:Connect(function()
     else
         info.status = "⚠ No se pudo copiar. Usa el archivo guardado."
     end
+end)
+
+firstBtn.Activated:Connect(function()
+    info.partIndex = 1
+    info.status = "Volverás a copiar desde la parte 1."
 end)
 
 infoSave.Activated:Connect(function()
@@ -1792,6 +2350,7 @@ task.spawn(function()
         scanStatusLabel.Text = scan.status
         previewLabel.Text = scan.preview
         infoStatusLabel.Text = info.status
+        idxLabel.Text = info.preview
         infoCopy.Text = #info.parts == 0 and "📋  Copiar informe"
             or string.format("📋  Copiar parte %d/%d", info.partIndex, #info.parts)
     end
@@ -1804,8 +2363,8 @@ local minimized = false
 local function layoutFrame()
     local cam = Workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-    local w = clamp(vp.X * 0.92, 260, 340)
-    local h = clamp(vp.Y * 0.82, 260, 520)
+    local w = math.clamp(vp.X * 0.92, 260, 340)
+    local h = math.clamp(vp.Y * 0.82, 260, 520)
     frame.Size = minimized and UDim2.fromOffset(w, HEADER_H) or UDim2.fromOffset(w, h)
 end
 do
