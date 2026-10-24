@@ -1,4 +1,4 @@
--- Auto-apuntado v3: la cámara gira y SIGUE al objetivo sin perderlo de vista (lock-on)
+-- Auto-apuntado v5: lock-on + TP a la espalda + el personaje gira con la cámara + configuración que se guarda
 ---------------------------------------------------------------
 -- SERVICIOS
 ---------------------------------------------------------------
@@ -16,9 +16,12 @@ local LocalPlayer = Players.LocalPlayer
 ---------------------------------------------------------------
 local CONFIG = {
     ETIQUETA = "Combatant",
-    ARCHIVO = "AutoApuntadoConfig_v3.json",
-    TECLA_ALTERNAR = Enum.KeyCode.X,   -- encender / apagar
+    ARCHIVO = "AutoApuntadoConfig.json",
+    -- Archivos de versiones anteriores: si no existe el principal, se importa de aquí
+    ARCHIVOS_ANTIGUOS = { "AutoApuntadoConfig_v4.json", "AutoApuntadoConfig_v3.json" },
+    TECLA_ALTERNAR = Enum.KeyCode.X,   -- encender / apagar el apuntado
     TECLA_CAMBIAR = Enum.KeyCode.C,    -- cambiar al siguiente objetivo
+    TECLA_PEGARSE = Enum.KeyCode.V,    -- encender / apagar "pegarse a la espalda"
     NOMBRE_RENDER = "AutoApuntadoCamara",
     MARGEN_SOLTAR = 1.15,              -- el objetivo fijado se suelta al pasar radio x 1.15
     RADIO_MIN = 5,
@@ -28,6 +31,12 @@ local CONFIG = {
     SUAVIZADO_MAX = 95,
     ESCALA_MIN = 50,
     ESCALA_MAX = 150,
+    ESPALDA_MIN = 1,
+    ESPALDA_MAX = 20,
+    ALTURA_MIN = -5,
+    ALTURA_MAX = 10,
+    ALCANCE_MIN = 10,
+    ALCANCE_MAX = 5000,
 }
 
 local PARTES = {
@@ -36,9 +45,10 @@ local PARTES = {
 }
 local PRIORIDADES = { "Más cercano", "Más cercano a la mira" }
 local TIPOS = { "Todos", "Solo jugadores", "Solo bots" }
+local TABS = { "Apuntar", "Filtros", "Seguir", "Visual" }
 
 ---------------------------------------------------------------
--- ESTADO (se guarda en archivo)
+-- ESTADO (todo esto se guarda en el archivo)
 ---------------------------------------------------------------
 local DEFAULTS = {
     activo = true,
@@ -48,7 +58,7 @@ local DEFAULTS = {
     prioIdx = 1,
     soloClic = false,
     fijar = true,             -- mantener al mismo objetivo aunque salga de pantalla
-    girarPersonaje = false,   -- el personaje también mira al objetivo
+    girarPersonaje = true,    -- el personaje gira junto con la cámara
     tipoIdx = 1,
     ignorarEquipo = true,
     paredes = false,
@@ -58,6 +68,15 @@ local DEFAULTS = {
     mostrarFov = false,
     resaltar = true,
     escala = 100,
+    -- Seguimiento pegado a la espalda
+    pegarse = false,          -- TP continuo a la espalda del jugador más cercano
+    distEspalda = 3,          -- studs detrás del jugador
+    alturaTP = 0,             -- studs de altura respecto al jugador
+    alcanceTP = 500,          -- alcance máximo para elegir al jugador
+    -- Interfaz
+    tab = 1,                  -- última pestaña abierta
+    posXs = 0.5, posXo = 0,   -- posición del panel
+    posYs = 0.5, posYo = 0,
 }
 
 local S = {}
@@ -65,14 +84,23 @@ for k, v in pairs(DEFAULTS) do
     S[k] = v
 end
 
+-- Lee el primer archivo de configuración que exista
 pcall(function()
-    if readfile and isfile and isfile(CONFIG.ARCHIVO) then
-        local data = HttpService:JSONDecode(readfile(CONFIG.ARCHIVO))
-        if type(data) == "table" then
-            for k, default in pairs(DEFAULTS) do
-                if type(data[k]) == type(default) then
-                    S[k] = data[k]
+    if not (readfile and isfile) then return end
+    local candidatos = { CONFIG.ARCHIVO }
+    for _, nombre in ipairs(CONFIG.ARCHIVOS_ANTIGUOS) do
+        table.insert(candidatos, nombre)
+    end
+    for _, nombre in ipairs(candidatos) do
+        if isfile(nombre) then
+            local data = HttpService:JSONDecode(readfile(nombre))
+            if type(data) == "table" then
+                for k, default in pairs(DEFAULTS) do
+                    if type(data[k]) == type(default) then
+                        S[k] = data[k]
+                    end
                 end
+                return
             end
         end
     end
@@ -86,20 +114,47 @@ S.escala = math.clamp(S.escala, CONFIG.ESCALA_MIN, CONFIG.ESCALA_MAX)
 S.parteIdx = math.clamp(math.floor(S.parteIdx), 1, #PARTES)
 S.prioIdx = math.clamp(math.floor(S.prioIdx), 1, #PRIORIDADES)
 S.tipoIdx = math.clamp(math.floor(S.tipoIdx), 1, #TIPOS)
+S.tab = math.clamp(math.floor(S.tab), 1, #TABS)
+S.distEspalda = math.clamp(S.distEspalda, CONFIG.ESPALDA_MIN, CONFIG.ESPALDA_MAX)
+S.alturaTP = math.clamp(S.alturaTP, CONFIG.ALTURA_MIN, CONFIG.ALTURA_MAX)
+S.alcanceTP = math.clamp(S.alcanceTP, CONFIG.ALCANCE_MIN, CONFIG.ALCANCE_MAX)
+S.posXs = math.clamp(S.posXs, 0, 1)
+S.posYs = math.clamp(S.posYs, 0, 1)
+S.posXo = math.clamp(S.posXo, -3000, 3000)
+S.posYo = math.clamp(S.posYo, -3000, 3000)
 
 local closed = false
 local dirty = false
 local refreshUI
+local main                 -- ventana principal (se crea más abajo)
+local mensaje = function() end   -- se redefine cuando existe la cabecera
+local avisoSinGuardado = false
 
 local function markDirty()
     dirty = true
 end
 
+-- Guarda toda la configuración. Devuelve true si se pudo escribir el archivo.
 local function saveConfig()
-    if not writefile then return end
-    pcall(function()
+    if not writefile then
+        if not avisoSinGuardado then
+            avisoSinGuardado = true
+            mensaje("Tu ejecutor no permite guardar archivos")
+        end
+        return false
+    end
+
+    if main then
+        S.posXs = main.Position.X.Scale
+        S.posXo = main.Position.X.Offset
+        S.posYs = main.Position.Y.Scale
+        S.posYo = main.Position.Y.Offset
+    end
+
+    local ok = pcall(function()
         writefile(CONFIG.ARCHIVO, HttpService:JSONEncode(S))
     end)
+    return ok
 end
 
 ---------------------------------------------------------------
@@ -110,9 +165,13 @@ local function getRoot()
     return character and character:FindFirstChild("HumanoidRootPart")
 end
 
-local function estoyVivo()
+local function getHumanoid()
     local character = LocalPlayer.Character
-    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function estoyVivo()
+    local hum = getHumanoid()
     return hum ~= nil and hum.Health > 0
 end
 
@@ -132,14 +191,20 @@ local function esValido(model)
     return root ~= nil and root:IsA("BasePart")
 end
 
+-- Compañero de equipo (solo aplica a jugadores)
+local function esCompanero(jugador)
+    return jugador ~= nil
+        and S.ignorarEquipo
+        and LocalPlayer.Team ~= nil
+        and jugador.Team == LocalPlayer.Team
+end
+
 -- Filtros de tipo (jugador/bot) y de equipo
 local function pasaFiltros(model)
     local jugador = Players:GetPlayerFromCharacter(model)
     if S.tipoIdx == 2 and not jugador then return false end
     if S.tipoIdx == 3 and jugador then return false end
-    if jugador and S.ignorarEquipo and LocalPlayer.Team ~= nil and jugador.Team == LocalPlayer.Team then
-        return false
-    end
+    if esCompanero(jugador) then return false end
     return true
 end
 
@@ -221,7 +286,7 @@ end
 ---------------------------------------------------------------
 -- FIJADO DE OBJETIVO (LOCK-ON)
 ---------------------------------------------------------------
-local bloqueado = nil          -- objetivo fijado
+local bloqueado = nil          -- objetivo fijado por el apuntado
 local objetivoActual = nil     -- objetivo usado este fotograma
 local distanciaActual = 0
 
@@ -270,6 +335,71 @@ local function cambiarObjetivo()
 end
 
 ---------------------------------------------------------------
+-- TP A LA ESPALDA DEL JUGADOR MÁS CERCANO
+---------------------------------------------------------------
+local seguido = nil            -- personaje al que me estoy pegando
+
+-- Jugador (no bot) más cercano dentro del alcance, vivo y que no sea compañero
+local function buscarJugadorCercano(root)
+    local mejor, mejorDist = nil, S.alcanceTP
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and not esCompanero(p) then
+            local char = p.Character
+            if esValido(char) then
+                local d = (char.HumanoidRootPart.Position - root.Position).Magnitude
+                if d <= mejorDist then
+                    mejorDist = d
+                    mejor = char
+                end
+            end
+        end
+    end
+    return mejor
+end
+
+-- Me coloca detrás del personaje, mirando en su misma dirección
+local function pegarseA(model, root)
+    local t = model:FindFirstChild("HumanoidRootPart")
+    if not t then return end
+    local pos = (t.CFrame * CFrame.new(0, S.alturaTP, S.distEspalda)).Position
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = CFrame.new(pos, pos + t.CFrame.LookVector)
+end
+
+---------------------------------------------------------------
+-- EL PERSONAJE GIRA CON LA CÁMARA
+---------------------------------------------------------------
+local autoRotateDesactivado = false
+
+-- Orienta al personaje (solo en horizontal) hacia donde mira la cámara.
+-- Se desactiva AutoRotate del Humanoid para que el juego no pelee con este giro.
+local function personajeConCamara(cam, root)
+    local hum = getHumanoid()
+
+    if not S.girarPersonaje then
+        if autoRotateDesactivado and hum then
+            hum.AutoRotate = true
+        end
+        autoRotateDesactivado = false
+        return
+    end
+
+    if not hum or hum.Sit then return end
+
+    if hum.AutoRotate then
+        hum.AutoRotate = false
+        autoRotateDesactivado = true
+    end
+
+    local look = cam.CFrame.LookVector
+    local plano = Vector3.new(look.X, 0, look.Z)
+    if plano.Magnitude < 0.01 then return end
+
+    local pos = root.Position
+    root.CFrame = CFrame.new(pos, pos + plano)
+end
+
+---------------------------------------------------------------
 -- UI: PALETA Y HELPERS
 ---------------------------------------------------------------
 local PALETTE = {
@@ -286,7 +416,7 @@ local PALETTE = {
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "AutoApuntadoUI"
+gui.Name = "AutoApuntadoUI "
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.Parent = playerGui
@@ -513,10 +643,10 @@ end
 ---------------------------------------------------------------
 -- UI: VENTANA PRINCIPAL
 ---------------------------------------------------------------
-local main = Instance.new("Frame")
+main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
-main.Position = UDim2.new(0.5, 0, 0.5, 0)
+main.Position = UDim2.new(S.posXs, S.posXo, S.posYs, S.posYo)   -- posición guardada
 main.Size = UDim2.fromOffset(300, 470)
 main.BackgroundColor3 = PALETTE.bg
 main.BorderSizePixel = 0
@@ -535,13 +665,28 @@ header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
 header.Parent = main
 
-local title = label(header, "🎯 Auto-Apuntado", 15, PALETTE.text, true)
+local title = label(header, "MAYK DEV", 15, PALETTE.text, true)
 title.Position = UDim2.new(0, 14, 0, 6)
 title.Size = UDim2.new(1, -100, 0, 18)
 
-local subtitle = label(header, "Arrastra aquí para mover", 10, PALETTE.muted, false)
+local SUBTITULO = "Arrastra aquí para mover"
+local subtitle = label(header, SUBTITULO, 10, PALETTE.muted, false)
 subtitle.Position = UDim2.new(0, 14, 0, 24)
 subtitle.Size = UDim2.new(1, -100, 0, 14)
+subtitle.TextTruncate = Enum.TextTruncate.AtEnd
+
+-- Mensaje temporal en la cabecera
+local mensajeId = 0
+mensaje = function(texto)
+    mensajeId += 1
+    local id = mensajeId
+    subtitle.Text = texto
+    task.delay(2.5, function()
+        if mensajeId == id and not closed then
+            subtitle.Text = SUBTITULO
+        end
+    end)
+end
 
 local minBtn = button(header, "—", UDim2.fromOffset(30, 30), PALETTE.card)
 minBtn.Position = UDim2.new(1, -72, 0, 7)
@@ -582,10 +727,9 @@ tabRow.BackgroundTransparency = 1
 tabRow.Parent = main
 listLayout(tabRow, 4, true)
 
-local tabNames = { "Apuntar", "Filtros", "Visual" }
 local tabButtons = {}
-for i, name in ipairs(tabNames) do
-    local b = button(tabRow, name, UDim2.new(1 / #tabNames, -3, 1, 0), PALETTE.card)
+for i, name in ipairs(TABS) do
+    local b = button(tabRow, name, UDim2.new(1 / #TABS, -3, 1, 0), PALETTE.card)
     b.TextSize = 11
     b.LayoutOrder = i
     tabButtons[i] = b
@@ -617,6 +761,7 @@ end
 
 local pageApuntar = newPage()
 local pageFiltros = newPage()
+local pageSeguir = newPage()
 local pageVisual = newPage()
 
 local function showTab(index)
@@ -629,7 +774,11 @@ local function showTab(index)
 end
 
 for i, b in ipairs(tabButtons) do
-    b.Activated:Connect(function() showTab(i) end)
+    b.Activated:Connect(function()
+        showTab(i)
+        S.tab = i
+        markDirty()
+    end)
 end
 
 local function nota(parent, order, height)
@@ -736,7 +885,7 @@ track(arrowRow(pageApuntar, 7,
         markDirty() refreshUI()
     end))
 
-track(checkRow(pageApuntar, "Girar también el personaje", 8,
+track(checkRow(pageApuntar, "Personaje gira con la cámara", 8,
     function() return S.girarPersonaje end,
     function(v) S.girarPersonaje = v markDirty() refreshUI() end))
 
@@ -788,6 +937,57 @@ track(numberRow(pageFiltros, 6, "Radio FOV (px)",
 local notaFiltros = nota(pageFiltros, 7, 58)
 
 ---------------------------------------------------------------
+-- PESTAÑA SEGUIR (TP a la espalda del jugador más cercano)
+---------------------------------------------------------------
+track(checkRow(pageSeguir, "Pegarse a la espalda del más cercano", 1,
+    function() return S.pegarse end,
+    function(v)
+        S.pegarse = v
+        if not v then seguido = nil end
+        markDirty() refreshUI()
+    end))
+
+local tpAhoraBtn = button(pageSeguir, "⚡ TP a su espalda (una vez)", UDim2.new(1, -4, 0, 34), PALETTE.accent)
+tpAhoraBtn.LayoutOrder = 2
+tpAhoraBtn.Activated:Connect(function()
+    local root = getRoot()
+    if not root or not estoyVivo() then
+        mensaje("No tienes personaje vivo")
+        return
+    end
+    local objetivo = buscarJugadorCercano(root)
+    if not objetivo then
+        mensaje("No hay jugadores en el alcance")
+        return
+    end
+    pegarseA(objetivo, root)
+    mensaje("TP a " .. nombreDe(objetivo))
+end)
+
+track(numberRow(pageSeguir, 3, "Distancia atrás",
+    function() return S.distEspalda end,
+    function(v)
+        S.distEspalda = math.clamp(v, CONFIG.ESPALDA_MIN, CONFIG.ESPALDA_MAX)
+        markDirty() refreshUI()
+    end, 1, 64))
+
+track(numberRow(pageSeguir, 4, "Altura",
+    function() return S.alturaTP end,
+    function(v)
+        S.alturaTP = math.clamp(v, CONFIG.ALTURA_MIN, CONFIG.ALTURA_MAX)
+        markDirty() refreshUI()
+    end, 1, 64))
+
+track(numberRow(pageSeguir, 5, "Alcance (studs)",
+    function() return S.alcanceTP end,
+    function(v)
+        S.alcanceTP = math.clamp(v, CONFIG.ALCANCE_MIN, CONFIG.ALCANCE_MAX)
+        markDirty() refreshUI()
+    end, 50, 64))
+
+local notaSeguir = nota(pageSeguir, 6, 70)
+
+---------------------------------------------------------------
 -- PESTAÑA VISUAL
 ---------------------------------------------------------------
 track(checkRow(pageVisual, "Mostrar círculo FOV", 1,
@@ -805,18 +1005,39 @@ track(numberRow(pageVisual, 3, "Escala del panel %",
         markDirty() refreshUI()
     end, 10, 64))
 
-local resetBtn = button(pageVisual, "↺ Restablecer todo", UDim2.new(1, -4, 0, 36), PALETTE.card)
-resetBtn.LayoutOrder = 4
+local guardarBtn = button(pageVisual, "💾 Guardar ahora", UDim2.new(1, -4, 0, 34), PALETTE.accent)
+guardarBtn.LayoutOrder = 4
+guardarBtn.Activated:Connect(function()
+    dirty = false
+    if saveConfig() then
+        mensaje("💾 Guardado en " .. CONFIG.ARCHIVO)
+    else
+        mensaje("No se pudo guardar")
+    end
+end)
+
+local centrarBtn = button(pageVisual, "⌖ Centrar panel", UDim2.new(1, -4, 0, 34), PALETTE.card)
+centrarBtn.LayoutOrder = 5
+centrarBtn.Activated:Connect(function()
+    main.Position = UDim2.new(0.5, 0, 0.5, 0)
+    markDirty()
+end)
+
+local resetBtn = button(pageVisual, "↺ Restablecer todo", UDim2.new(1, -4, 0, 34), PALETTE.card)
+resetBtn.LayoutOrder = 6
 resetBtn.Activated:Connect(function()
     for k, v in pairs(DEFAULTS) do
         S[k] = v
     end
     bloqueado = nil
+    seguido = nil
+    main.Position = UDim2.new(0.5, 0, 0.5, 0)
+    showTab(S.tab)
     markDirty()
     refreshUI()
 end)
 
-local notaVisual = nota(pageVisual, 5, 46)
+local notaVisual = nota(pageVisual, 7, 58)
 
 ---------------------------------------------------------------
 -- MINIMIZAR / CERRAR
@@ -841,27 +1062,41 @@ mini.Activated:Connect(function()
 end)
 
 ---------------------------------------------------------------
--- LÓGICA PRINCIPAL (cada fotograma, DESPUÉS de la cámara por defecto)
+-- LÓGICA DEL APUNTADO Y EL SEGUIMIENTO
 ---------------------------------------------------------------
--- Se enlaza con prioridad de cámara + 1 para que se ejecute justo después del script
--- de cámara del juego; así nuestra rotación no se pisa y el objetivo no se pierde.
-local function paso(dt)
-    if closed then return end
+local function apagarResaltado()
+    highlight.Enabled = false
+    highlight.Adornee = nil
+end
 
-    objetivoActual = nil
-    local cam = Workspace.CurrentCamera
-    local root = getRoot()
+local function logicaApuntado(cam, root, dt)
+    -- 1) Pegarse a la espalda del jugador más cercano (si está activado)
+    local pegadoA = nil
+    if S.pegarse then
+        if not (seguido and esValido(seguido) and not esCompanero(Players:GetPlayerFromCharacter(seguido))) then
+            seguido = buscarJugadorCercano(root)
+        end
+        if seguido then
+            pegarseA(seguido, root)
+            pegadoA = seguido
+        end
+    else
+        seguido = nil
+    end
 
-    if not (S.activo and cam and root and estoyVivo()) then
+    if not S.activo and not pegadoA then
         bloqueado = nil
-        highlight.Enabled = false
-        highlight.Adornee = nil
+        apagarResaltado()
         return
     end
 
+    -- 2) Elegir objetivo del apuntado (si me pego a alguien, es siempre ese jugador)
     local objetivo, dist
 
-    if S.fijar then
+    if pegadoA then
+        objetivo = pegadoA
+        dist = (pegadoA.HumanoidRootPart.Position - root.Position).Magnitude
+    elseif S.fijar then
         -- Mantiene al objetivo fijado aunque salga de pantalla; solo lo suelta si
         -- muere, se aleja demasiado o deja de cumplir los filtros.
         local ok, d = bloqueoSigueValido(cam, root)
@@ -884,52 +1119,63 @@ local function paso(dt)
         end
     end
 
+    -- 3) Girar la cámara hacia el objetivo
     if objetivo then
         objetivoActual, distanciaActual = objetivo, dist
 
-        local mantener = (not S.soloClic)
-            or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        local mantener = S.activo and ((not S.soloClic)
+            or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
 
         if mantener then
-            pcall(function()
-                local punto = getPuntoDeMira(objetivo)
-
-                -- Girar la cámara hacia el objetivo
-                local deseado = CFrame.new(cam.CFrame.Position, punto)
-                if S.suavizado > 0 then
-                    local alpha = 1 - (S.suavizado / 100) ^ (math.max(dt, 0.001) * 60)
-                    cam.CFrame = cam.CFrame:Lerp(deseado, alpha)
-                else
-                    cam.CFrame = deseado
-                end
-
-                -- Girar también al personaje (solo en horizontal)
-                if S.girarPersonaje then
-                    local pos = root.Position
-                    local mira = Vector3.new(punto.X, pos.Y, punto.Z)
-                    if (mira - pos).Magnitude > 0.1 then
-                        root.CFrame = CFrame.new(pos, mira)
-                    end
-                end
-            end)
+            local punto = getPuntoDeMira(objetivo)
+            local deseado = CFrame.new(cam.CFrame.Position, punto)
+            if S.suavizado > 0 then
+                local alpha = 1 - (S.suavizado / 100) ^ (math.max(dt, 0.001) * 60)
+                cam.CFrame = cam.CFrame:Lerp(deseado, alpha)
+            else
+                cam.CFrame = deseado
+            end
         end
     end
 
-    -- Resaltado del objetivo
+    -- 4) Resaltado del objetivo
     if S.resaltar and objetivoActual then
         highlight.Adornee = objetivoActual
         highlight.Enabled = true
     else
-        highlight.Enabled = false
-        highlight.Adornee = nil
+        apagarResaltado()
     end
+end
+
+-- Se ejecuta cada fotograma DESPUÉS de la cámara por defecto del juego (prioridad Camera + 1),
+-- así nuestra rotación no se pisa. El giro del personaje va al final, con la cámara ya orientada.
+local function paso(dt)
+    if closed then return end
+
+    objetivoActual = nil
+    local cam = Workspace.CurrentCamera
+    local root = getRoot()
+
+    if not (cam and root and estoyVivo()) then
+        bloqueado = nil
+        seguido = nil
+        apagarResaltado()
+        return
+    end
+
+    local ok, err = pcall(logicaApuntado, cam, root, dt)
+    if not ok then
+        warn("[AutoApuntado] " .. tostring(err))
+    end
+
+    pcall(personajeConCamara, cam, root)
 end
 
 RunService:BindToRenderStep(CONFIG.NOMBRE_RENDER, Enum.RenderPriority.Camera.Value + 1, paso)
 
 local connections = {}
 
--- Teclas (PC): X enciende/apaga, C cambia de objetivo
+-- Teclas (PC): X apuntado, C cambiar objetivo, V pegarse a la espalda
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, procesado)
     if procesado or closed then return end
     if input.KeyCode == CONFIG.TECLA_ALTERNAR then
@@ -939,6 +1185,11 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, pr
     elseif input.KeyCode == CONFIG.TECLA_CAMBIAR then
         cambiarObjetivo()
         refreshUI()
+    elseif input.KeyCode == CONFIG.TECLA_PEGARSE then
+        S.pegarse = not S.pegarse
+        if not S.pegarse then seguido = nil end
+        markDirty()
+        refreshUI()
     end
 end))
 
@@ -946,14 +1197,20 @@ end))
 -- ACTUALIZAR UI
 ---------------------------------------------------------------
 refreshUI = function()
-    estadoLabel.Text = S.activo and "ACTIVO" or "APAGADO"
-    estadoLabel.TextColor3 = S.activo and PALETTE.green or PALETTE.red
+    local encendido = S.activo or S.pegarse
+    estadoLabel.Text = encendido and "ACTIVO" or "APAGADO"
+    estadoLabel.TextColor3 = encendido and PALETTE.green or PALETTE.red
 
     if objetivoActual then
-        local candado = (S.fijar and bloqueado == objetivoActual) and "🔒 " or ""
-        objetivoLabel.Text = string.format("%s%s · %d st", candado, nombreDe(objetivoActual), math.floor(distanciaActual + 0.5))
+        local icono = ""
+        if seguido == objetivoActual then
+            icono = "📍 "
+        elseif S.fijar and bloqueado == objetivoActual then
+            icono = "🔒 "
+        end
+        objetivoLabel.Text = string.format("%s%s · %d st", icono, nombreDe(objetivoActual), math.floor(distanciaActual + 0.5))
     else
-        objetivoLabel.Text = S.activo and "Sin objetivo" or "—"
+        objetivoLabel.Text = encendido and "Sin objetivo" or "—"
     end
 
     for _, r in ipairs(refreshables) do
@@ -961,37 +1218,67 @@ refreshUI = function()
     end
 
     notaApuntar.Text = string.format(
-        "Con 'Fijar objetivo' la cámara sigue al mismo enemigo aunque se mueva o salga de pantalla, hasta que muera o pase de %d st. Tecla %s: encender/apagar. Tecla %s: cambiar de objetivo.",
+        "Con 'Fijar objetivo' la cámara sigue al mismo enemigo aunque salga de pantalla, hasta que muera o pase de %d st. Con 'Personaje gira con la cámara' tu personaje mira siempre hacia donde apunta la cámara. Teclas: %s apagar/encender, %s cambiar objetivo.",
         math.floor(S.radio * CONFIG.MARGEN_SOLTAR), CONFIG.TECLA_ALTERNAR.Name, CONFIG.TECLA_CAMBIAR.Name)
     notaFiltros.Text = "'En pantalla' y 'círculo FOV' solo se usan para ELEGIR un objetivo nuevo; una vez fijado, la cámara lo sigue donde vaya. 'Pared' lo suelta si lo tapa algo."
-    notaVisual.Text = "El círculo FOV solo limita la elección si activas 'Elegir solo dentro del círculo FOV' en Filtros."
+    notaSeguir.Text = string.format(
+        "Te teletransporta cada fotograma detrás del jugador más cercano (hasta %d st) y la cámara lo mira. Cuando muere o se va, pasa al siguiente. Tecla %s: encender/apagar. Respeta 'Ignorar compañeros de equipo'. Esta opción también se guarda.",
+        S.alcanceTP, CONFIG.TECLA_PEGARSE.Name)
+    notaVisual.Text = "Todo se guarda solo en " .. CONFIG.ARCHIVO .. " (opciones, pestaña y posición del panel). El círculo FOV solo limita la elección si activas 'Elegir solo dentro del círculo FOV'."
 
     applyVisuals()
 end
 
 closeBtn.Activated:Connect(function()
     closed = true
-    S.activo = false
     pcall(function() RunService:UnbindFromRenderStep(CONFIG.NOMBRE_RENDER) end)
     for _, c in ipairs(connections) do
         c:Disconnect()
+    end
+    -- Devuelve el giro automático del personaje al juego
+    local hum = getHumanoid()
+    if autoRotateDesactivado and hum then
+        hum.AutoRotate = true
     end
     saveConfig()
     highlight:Destroy()
     gui:Destroy()
 end)
 
-showTab(1)
+showTab(S.tab)
 applyVisuals()
 refreshUI()
 
--- Guardado automático y refresco del texto del objetivo
+if S.pegarse then
+    mensaje("Pegarse a la espalda sigue ACTIVO (guardado)")
+end
+
+-- Guardado automático: guarda al cambiar cualquier opción y cuando dejas de mover el panel
 task.spawn(function()
+    local ultimaPos = tostring(main.Position)
+    local posPendiente = false
+    local posCambio = 0
+
     while not closed do
+        -- Detecta que el panel se movió y guarda cuando lleva un rato quieto
+        local pos = tostring(main.Position)
+        if pos ~= ultimaPos then
+            ultimaPos = pos
+            posPendiente = true
+            posCambio = os.clock()
+        end
+        if posPendiente and os.clock() - posCambio > 0.6 then
+            posPendiente = false
+            dirty = true
+        end
+
         if dirty then
             dirty = false
-            saveConfig()
+            if saveConfig() then
+                mensaje("💾 Guardado")
+            end
         end
+
         refreshUI()
         task.wait(0.2)
     end
