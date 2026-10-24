@@ -2,7 +2,7 @@
 -- + PUNTO DE ENTREGA (automático o manual) + POSICIÓN GUARDADA DE PANEL Y BURBUJA
 -- + RECORRIDO DE TODAS LAS ISLAS DE UN MAR + RAREZA "Secret" (el filtro incluye la elegida y las superiores)
 -- + PUNTO MANUAL DEL TESORERO (para vaciar la bóveda) + VALIDACIÓN Y DIAGNÓSTICO DE TAMAÑOS DE COFRES
--- + AUTO FARM DE JEFES (te pegas a una parte del jefe, golpe automático o manual y loot cofre por cofre)
+-- + AUTO FARM DE JEFES (detección de muerte por HP, barra de vida y loot cofre por cofre)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -217,6 +217,8 @@ local CONFIG = {
     MAX_ENEMIGOS_POR_CICLO = 5,        -- tras estos kills deja turno a la recolección de cofres
 
     -- JEFES (BOSSES)
+    JEFE_PROP_VIDA = "HP",             -- propiedad (atributo o ValueBase) con la vida actual del jefe. 0 = muerto
+    JEFE_PROP_VIDA_MAX = "MaxHP",      -- propiedad opcional con la vida máxima (si no existe se usa la mayor vista)
     JEFE_RUTA_LOOT = { "World", "Dynamic", "Loot" }, -- carpeta donde aparecen los cofres que sueltan los jefes
     JEFE_AUTOGOLPE_INICIAL = true,     -- true = golpea solo; false = solo te pegas al jefe y golpeas tú
     JEFE_DISTANCIA_INICIAL = 3,        -- studs de separación de la parte del jefe (0 = encima de ella)
@@ -458,7 +460,9 @@ BS.killed = 0          -- jefes derrotados en esta sesión
 BS.lootCollected = 0   -- cofres de loot guardados en esta sesión
 BS.pending = 0         -- cofres de loot que faltan por recoger ahora mismo
 BS.nextCheck = {}      -- nombre del jefe -> hasta cuándo no se vuelve a revisar
-BS.current = nil       -- jefe con el que estás peleando
+BS.current = nil       -- nombre del jefe con el que estás peleando ahora
+BS.hpMax = {}          -- nombre del jefe -> vida máxima vista en esta sesión (si el juego no la expone)
+BS.cards = {}          -- tarjetas de la UI, una por jefe
 
 -- Memoria de sesión de barcos de otros jugadores (no se guarda en archivo)
 -- label -> { ship = Instance|nil, shipName = string, pos = Vector3 }
@@ -1740,8 +1744,8 @@ end
 --   1) Va a la isla del jefe que marcaste y espera a que cargue.
 --   2) Se PEGA a la parte del cuerpo indicada (la sigue aunque el jefe se mueva o gire) y golpea
 --      automáticamente (o solo se pega, si eliges golpear tú).
---   3) Cuando el jefe muere se suelta y recoge su loot de World.Dynamic.Loot cofre por cofre:
---      recoge uno -> lo lleva al barco -> vuelve por el siguiente.
+--   3) MUERTE: el jefe está muerto cuando su propiedad HP (CONFIG.JEFE_PROP_VIDA) llega a 0.
+--      En ese momento se suelta y recoge su loot de World.Dynamic.Loot cofre por cofre.
 --   4) Los cofres lejanos se "descargan" del Workspace (streaming). Por eso se recuerda la posición de cada
 --      cofre pendiente y, tras dejar uno en el barco, se vuelve a esa posición para que carguen de nuevo.
 ---------------------------------------------------------------
@@ -1767,6 +1771,13 @@ function BS.islandEntry(boss)
     return nil
 end
 
+function BS.bossByName(name)
+    for _, boss in ipairs(BS.LIST) do
+        if boss.nombre == name then return boss end
+    end
+    return nil
+end
+
 -- Modelo del jefe siguiendo su ruta desde Workspace (nil si no está cargado / no ha aparecido)
 function BS.getBossModel(boss)
     local cur = Workspace
@@ -1777,15 +1788,36 @@ function BS.getBossModel(boss)
     return cur
 end
 
--- ¿Sigue vivo? Mira Humanoid, atributo/valor "Health" y que el modelo siga en el Workspace
+-- Lee una propiedad numérica del jefe (atributo o ValueBase con ese nombre). nil si no existe.
+local function readNumberProp(m, name)
+    local v = tonumber(m:GetAttribute(name))
+    if v ~= nil then return v end
+    local child = m:FindFirstChild(name, true)
+    if child and child:IsA("ValueBase") then
+        return tonumber(child.Value)
+    end
+    return nil
+end
+
+-- Vida actual del jefe (propiedad HP). nil si no se puede leer
+function BS.readHP(m)
+    if not m then return nil end
+    return readNumberProp(m, CONFIG.JEFE_PROP_VIDA)
+end
+
+-- ¿Sigue vivo? La propiedad HP manda: si llega a 0 (o menos) el jefe está muerto.
+-- Luego se comprueban Humanoid y Health como respaldo, y que el modelo siga en el Workspace.
 function BS.alive(m)
     if not m or not m.Parent or not m:IsDescendantOf(Workspace) then return false end
+
+    local hp = BS.readHP(m)
+    if hp ~= nil and hp <= 0 then return false end
 
     local hum = m:FindFirstChildWhichIsA("Humanoid", true)
     if hum and hum.Health <= 0 then return false end
 
-    local hp = m:GetAttribute("Health")
-    if type(hp) == "number" and hp <= 0 then return false end
+    local hpAttr = m:GetAttribute("Health")
+    if type(hpAttr) == "number" and hpAttr <= 0 then return false end
 
     local hv = m:FindFirstChild("Health", true)
     if hv and hv:IsA("ValueBase") then
@@ -1839,7 +1871,7 @@ function BS.attackCF(partCF)
     return CFrame.lookAt(pos, partCF.Position)
 end
 
--- Te pega a la parte del jefe hasta que muera, desaparezca o se acabe el tiempo.
+-- Te pega a la parte del jefe hasta que muera (HP = 0), desaparezca o se acabe el tiempo.
 -- Devuelve: murió?, última posición de la parte, ¿falta tool?
 function BS.fight(boss, model)
     local t0 = os.clock()
@@ -1851,6 +1883,12 @@ function BS.fight(boss, model)
     setStatus("Pegado a " .. boss.nombre .. (BS.autoHit and "" or " (golpea tú)"))
 
     while not closed and BS.enabled and BS.alive(model) and os.clock() - t0 < CONFIG.JEFE_TIMEOUT do
+        -- Guarda la vida máxima vista (por si el juego no expone MaxHP)
+        local hp = BS.readHP(model)
+        if hp then
+            BS.hpMax[boss.nombre] = math.max(BS.hpMax[boss.nombre] or 0, hp)
+        end
+
         if not part or not part.Parent then
             part = BS.resolvePart(model, boss.parte)
         end
@@ -1876,7 +1914,9 @@ function BS.fight(boss, model)
         task.wait(CONFIG.ESPERA_ATAQUE)
     end
 
-    return not BS.alive(model), lastPos, false
+    -- Al salir ya no estás peleando: te sueltas en el acto
+    local dead = not BS.alive(model)
+    return dead, lastPos, false
 end
 
 -- Carpeta donde aparecen los cofres del loot
@@ -2140,6 +2180,7 @@ function BS.cycle()
 
                     if dead then
                         BS.killed += 1
+                        BS.nextCheck[boss.nombre] = nil
                         setStatus(boss.nombre .. " derrotado")
                         if BS.lootOn then
                             BS.collectLoot(lastPos)
@@ -2288,6 +2329,7 @@ local PALETTE = {
     accent = Color3.fromRGB(110, 150, 255),
     green = Color3.fromRGB(80, 200, 130),
     red = Color3.fromRGB(225, 85, 95),
+    gold = Color3.fromRGB(240, 185, 80),
     text = Color3.fromRGB(240, 242, 250),
     muted = Color3.fromRGB(140, 146, 170),
 }
@@ -3103,34 +3145,175 @@ CB.combatNote.TextWrapped = true
 CB.combatNote.TextYAlignment = Enum.TextYAlignment.Top
 
 ---------------------------------------------------------------
--- PESTAÑA JEFES (AUTO FARM)
+-- PESTAÑA JEFES (AUTO FARM) - diseño nuevo
+--   Cabecera con interruptor y barra de vida del jefe en pelea
+--   Una tarjeta por jefe con su estado en vivo (vivo / peleando / derrotado / no está)
+--   Secciones: JEFES, GOLPE Y POSICIÓN, LOOT
 ---------------------------------------------------------------
-BS.mainCheck = checkRow(BS.page, "Auto farm de jefes", 1, BS.enabled, function(v)
-    BS.enabled = v
-    if not v then
+local function sectionLabel(parent, text, order)
+    local l = label(parent, string.upper(text), 9, PALETTE.muted, true)
+    l.LayoutOrder = order
+    l.Size = UDim2.new(1, -4, 0, 16)
+    l.Position = UDim2.new(0, 4, 0, 0)
+    return l
+end
+
+-- Cabecera: interruptor general, estado y barra de vida
+local bossHero = Instance.new("Frame")
+bossHero.Size = UDim2.new(1, -4, 0, 96)
+bossHero.BackgroundColor3 = PALETTE.card
+bossHero.BorderSizePixel = 0
+bossHero.LayoutOrder = 1
+bossHero.Parent = BS.page
+corner(bossHero, 12)
+
+local heroTitle = label(bossHero, "Auto farm de jefes", 13, PALETTE.text, true)
+heroTitle.Position = UDim2.new(0, 12, 0, 8)
+heroTitle.Size = UDim2.new(1, -120, 0, 18)
+
+BS.mainToggle = button(bossHero, "APAGADO", UDim2.fromOffset(96, 26), PALETTE.track)
+BS.mainToggle.Position = UDim2.new(1, -106, 0, 7)
+BS.mainToggle.TextSize = 10
+BS.mainToggle.Activated:Connect(function()
+    BS.enabled = not BS.enabled
+    if not BS.enabled then
         BS.current = nil
         BS.pending = 0
     end
-    setStatus(v and "Auto farm de jefes encendido" or "Auto farm de jefes apagado")
+    setStatus(BS.enabled and "Auto farm de jefes encendido" or "Auto farm de jefes apagado")
 end)
 
--- Una casilla por cada jefe de la lista BS.LIST (los que marques son los que ataca, en ese orden)
-for i, boss in ipairs(BS.LIST) do
-    checkRow(BS.page, boss.nombre .. " · " .. boss.mar, 1 + i, BS.selected[boss.nombre] == true, function(v)
+BS.heroInfo = label(bossHero, "", 10, PALETTE.muted, false)
+BS.heroInfo.Position = UDim2.new(0, 12, 0, 28)
+BS.heroInfo.Size = UDim2.new(1, -24, 0, 14)
+BS.heroInfo.TextTruncate = Enum.TextTruncate.AtEnd
+
+local hpTrack = Instance.new("Frame")
+hpTrack.Position = UDim2.new(0, 12, 0, 56)
+hpTrack.Size = UDim2.new(1, -24, 0, 10)
+hpTrack.BackgroundColor3 = PALETTE.track
+hpTrack.BorderSizePixel = 0
+hpTrack.Parent = bossHero
+corner(hpTrack, 5)
+
+BS.hpFill = Instance.new("Frame")
+BS.hpFill.Size = UDim2.new(0, 0, 1, 0)
+BS.hpFill.BackgroundColor3 = PALETTE.red
+BS.hpFill.BorderSizePixel = 0
+BS.hpFill.Parent = hpTrack
+corner(BS.hpFill, 5)
+
+BS.hpText = label(bossHero, "", 10, PALETTE.text, true)
+BS.hpText.Position = UDim2.new(0, 12, 0, 70)
+BS.hpText.Size = UDim2.new(1, -24, 0, 16)
+BS.hpText.TextTruncate = Enum.TextTruncate.AtEnd
+
+-- Tarjeta de un jefe: punto de estado, nombre, mar · isla · estado, y casilla para marcarlo
+local function bossCard(parent, boss, order)
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -4, 0, 50)
+    row.BackgroundColor3 = PALETTE.card
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.LayoutOrder = order
+    row.Parent = parent
+    corner(row, 10)
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(10, 10)
+    dot.Position = UDim2.new(0, 12, 0.5, -5)
+    dot.BackgroundColor3 = PALETTE.muted
+    dot.BorderSizePixel = 0
+    dot.Parent = row
+    corner(dot, 5)
+
+    local nameLbl = label(row, boss.nombre, 12, PALETTE.text, true)
+    nameLbl.Position = UDim2.new(0, 30, 0, 8)
+    nameLbl.Size = UDim2.new(1, -78, 0, 16)
+    nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local subLbl = label(row, "", 10, PALETTE.muted, false)
+    subLbl.Position = UDim2.new(0, 30, 0, 27)
+    subLbl.Size = UDim2.new(1, -78, 0, 14)
+    subLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local box = Instance.new("Frame")
+    box.Size = UDim2.fromOffset(20, 20)
+    box.Position = UDim2.new(1, -32, 0.5, -10)
+    box.BorderSizePixel = 0
+    box.Parent = row
+    corner(box, 6)
+    stroke(box, PALETTE.muted, 1, 0.2)
+
+    local tick = label(box, "✓", 14, PALETTE.text, true)
+    tick.Size = UDim2.new(1, 0, 1, 0)
+    tick.TextXAlignment = Enum.TextXAlignment.Center
+
+    local function paint()
+        local selected = BS.selected[boss.nombre] == true
+        box.BackgroundColor3 = selected and PALETTE.green or PALETTE.track
+        tick.Visible = selected
+
+        local stateText, stateColor = BS.stateOf(boss)
+        dot.BackgroundColor3 = stateColor
+        local entry, group = BS.islandEntry(boss)
+        local sea = group and seaDisplayName(group) or boss.mar
+        local isl = entry and islandDisplayName(entry) or boss.isla
+        subLbl.Text = sea .. " · " .. isl .. " · " .. stateText
+    end
+
+    row.Activated:Connect(function()
+        local v = not (BS.selected[boss.nombre] == true)
         BS.selected[boss.nombre] = v or nil
         BS.nextCheck[boss.nombre] = nil
         markDirty()
         setStatus(v and ("Atacará a " .. boss.nombre) or ("Ya no atacará a " .. boss.nombre))
+        paint()
     end)
+
+    paint()
+    return { refresh = paint, boss = boss }
 end
 
-checkRow(BS.page, "Golpear automáticamente", 20, BS.autoHit, function(v)
+-- Estado legible de un jefe (para la tarjeta y la cabecera)
+function BS.stateOf(boss)
+    if BS.selected[boss.nombre] ~= true then
+        return "apagado", PALETTE.muted
+    end
+    if BS.current == boss.nombre then
+        return "peleando", PALETTE.gold
+    end
+    local m = BS.getBossModel(boss)
+    if m and m.Parent then
+        local hp = BS.readHP(m)
+        if hp ~= nil and hp <= 0 then
+            return "derrotado", PALETTE.red
+        end
+    end
+    if BS.alive(m) then
+        return "vivo", PALETTE.green
+    end
+    if BS.nextCheck[boss.nombre] then
+        return "no está ahora", PALETTE.muted
+    end
+    return "sin revisar", PALETTE.muted
+end
+
+sectionLabel(BS.page, "Jefes", 2)
+for i, boss in ipairs(BS.LIST) do
+    table.insert(BS.cards, bossCard(BS.page, boss, 2 + i))
+end
+
+sectionLabel(BS.page, "Golpe y posición", 10)
+
+BS.autoHitRow = checkRow(BS.page, "Golpear automáticamente", 11, BS.autoHit, function(v)
     BS.autoHit = v
     markDirty()
     setStatus(v and "Golpe automático: el script golpea por ti" or "Golpe manual: solo te pegas al jefe, golpeas tú")
 end)
 
-BS.distStepper = stepperRow(BS.page, 21,
+BS.distStepper = stepperRow(BS.page, 12,
     function() return "Distancia a la parte: " .. BS.dist .. " studs" end,
     function()
         BS.dist = math.max(0, BS.dist - 1)
@@ -3144,7 +3327,7 @@ BS.distStepper = stepperRow(BS.page, 21,
     end
 )
 
-BS.heightStepper = stepperRow(BS.page, 22,
+BS.heightStepper = stepperRow(BS.page, 13,
     function() return "Altura sobre la parte: " .. BS.height .. " studs" end,
     function()
         BS.height = math.max(CONFIG.JEFE_ALTURA_MIN, BS.height - 1)
@@ -3158,19 +3341,21 @@ BS.heightStepper = stepperRow(BS.page, 22,
     end
 )
 
-checkRow(BS.page, "Recoger el loot al morir el jefe", 23, BS.lootOn, function(v)
+sectionLabel(BS.page, "Loot", 20)
+
+checkRow(BS.page, "Recoger el loot al morir el jefe", 21, BS.lootOn, function(v)
     BS.lootOn = v
     markDirty()
     setStatus(v and "Recogerá los cofres que suelte el jefe" or "No recogerá el loot")
 end)
 
-checkRow(BS.page, "Aplicar filtros de valor/rareza al loot", 24, BS.lootFilters, function(v)
+checkRow(BS.page, "Aplicar filtros de valor/rareza al loot", 22, BS.lootFilters, function(v)
     BS.lootFilters = v
     markDirty()
     setStatus(v and "El loot respetará tus filtros (pestaña Filtros)" or "Recogerá todo el loot")
 end)
 
-BS.recheckStepper = stepperRow(BS.page, 25,
+BS.recheckStepper = stepperRow(BS.page, 23,
     function() return "Revisar jefes cada: " .. BS.recheck .. " s" end,
     function()
         BS.recheck = math.max(CONFIG.JEFE_REVISAR_MIN, BS.recheck - 5)
@@ -3184,40 +3369,63 @@ BS.recheckStepper = stepperRow(BS.page, 25,
     end
 )
 
+-- Pie: estadísticas de la sesión
 BS.note = label(BS.page, "", 10, PALETTE.muted, false)
-BS.note.LayoutOrder = 26
-BS.note.Size = UDim2.new(1, -4, 0, 120)
+BS.note.LayoutOrder = 30
+BS.note.Size = UDim2.new(1, -4, 0, 58)
 BS.note.TextWrapped = true
 BS.note.TextYAlignment = Enum.TextYAlignment.Top
 
-function BS.refreshNote()
-    local lines = {}
-    for _, boss in ipairs(BS.LIST) do
-        if BS.selected[boss.nombre] then
-            local m = BS.getBossModel(boss)
-            local estado
-            if BS.current == boss.nombre then
-                estado = "peleando"
-            elseif BS.alive(m) then
-                estado = "vivo"
-            elseif BS.nextCheck[boss.nombre] then
-                estado = "no está (reviso en unos segundos)"
-            else
-                estado = "sin revisar"
-            end
-            table.insert(lines, boss.nombre .. ": " .. estado)
+-- Actualiza cabecera, tarjetas y pie de la pestaña Jefes
+function BS.refreshPanel()
+    -- Interruptor
+    BS.mainToggle.Text = BS.enabled and "ENCENDIDO" or "APAGADO"
+    BS.mainToggle.BackgroundColor3 = BS.enabled and PALETTE.green or PALETTE.track
+
+    -- Cabecera: qué estás haciendo y la vida del jefe en pelea
+    local fighting = BS.current and BS.bossByName(BS.current)
+    if fighting then
+        local m = BS.getBossModel(fighting)
+        local hp = BS.readHP(m)
+        local maxHp = readNumberProp(m or Instance.new("Folder"), CONFIG.JEFE_PROP_VIDA_MAX)
+            or BS.hpMax[fighting.nombre] or hp or 0
+        BS.heroInfo.Text = "Peleando con " .. fighting.nombre
+        BS.heroInfo.TextColor3 = PALETTE.gold
+        if hp then
+            local ratio = math.clamp(hp / math.max(maxHp, 1), 0, 1)
+            BS.hpFill.Size = UDim2.new(ratio, 0, 1, 0)
+            BS.hpFill.BackgroundColor3 = ratio > 0.5 and PALETTE.green or (ratio > 0.2 and PALETTE.gold or PALETTE.red)
+            BS.hpText.Text = string.format("HP %d / %d  (%d%%)", hp, maxHp, math.floor(ratio * 100 + 0.5))
+        else
+            BS.hpFill.Size = UDim2.new(0, 0, 1, 0)
+            BS.hpText.Text = "HP no disponible"
         end
-    end
-    if #lines == 0 then
-        table.insert(lines, "Marca uno o más jefes para atacarlos.")
+    else
+        BS.hpFill.Size = UDim2.new(0, 0, 1, 0)
+        if BS.enabled then
+            local count = 0
+            for _, boss in ipairs(BS.LIST) do
+                if BS.selected[boss.nombre] then count += 1 end
+            end
+            BS.heroInfo.Text = count > 0 and ("Buscando " .. count .. " jefe(s) marcado(s)") or "Marca uno o más jefes"
+        else
+            BS.heroInfo.Text = "Apagado: no ataca a ningún jefe"
+        end
+        BS.heroInfo.TextColor3 = PALETTE.muted
+        BS.hpText.Text = "Sin jefe en pelea"
     end
 
+    -- Tarjetas
+    for _, card in ipairs(BS.cards) do
+        card.refresh()
+    end
+
+    -- Pie
     local tool = CB.getHeldTool()
-    BS.note.Text = table.concat(lines, "\n")
-        .. "\nDerrotados: " .. BS.killed .. " · Loot guardado: " .. BS.lootCollected
-        .. " · Pendiente: " .. BS.pending
+    BS.note.Text = "Derrotados: " .. BS.killed .. "   ·   Loot guardado: " .. BS.lootCollected
+        .. "   ·   Pendiente: " .. BS.pending
         .. "\nTool en mano: " .. (tool and tool.Name or "ninguna")
-        .. "\nGolpe: " .. (BS.autoHit and "automático" or "manual (golpeas tú)")
+        .. "   ·   Golpe: " .. (BS.autoHit and "automático" or "manual")
         .. "\nLos cofres lejanos se recuerdan y se vuelve por ellos al dejar uno en el barco."
 end
 
@@ -3457,10 +3665,11 @@ refreshUI = function()
         .. (CB.attackByIsland and ("\nIsla: " .. currentIslandName()) or "\nIsla: todo el mapa")
 
     -- Jefes
+    BS.autoHitRow.refresh()
     BS.distStepper.refresh()
     BS.heightStepper.refresh()
     BS.recheckStepper.refresh()
-    BS.refreshNote()
+    BS.refreshPanel()
 
     widthRow.refresh()
     heightRow.refresh()
