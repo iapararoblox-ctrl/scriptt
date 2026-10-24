@@ -1,4 +1,4 @@
--- Auto-apuntado v5: lock-on + TP a la espalda + el personaje gira con la cámara + configuración que se guarda
+-- Auto-apuntado v6: lock-on + TP a la espalda + personaje gira con la cámara + la cámara viaja con el personaje
 ---------------------------------------------------------------
 -- SERVICIOS
 ---------------------------------------------------------------
@@ -59,6 +59,7 @@ local DEFAULTS = {
     soloClic = false,
     fijar = true,             -- mantener al mismo objetivo aunque salga de pantalla
     girarPersonaje = true,    -- el personaje gira junto con la cámara
+    camaraOrbita = true,      -- al apuntar, la cámara se coloca detrás del personaje (no se queda atrás)
     tipoIdx = 1,
     ignorarEquipo = true,
     paredes = false,
@@ -416,7 +417,7 @@ local PALETTE = {
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "AutoApuntadoUI "
+gui.Name = "AutoApuntadoUI"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.Parent = playerGui
@@ -665,7 +666,7 @@ header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
 header.Parent = main
 
-local title = label(header, "MAYK DEV", 15, PALETTE.text, true)
+local title = label(header, "🎯 Auto-Apuntado", 15, PALETTE.text, true)
 title.Position = UDim2.new(0, 14, 0, 6)
 title.Size = UDim2.new(1, -100, 0, 18)
 
@@ -889,11 +890,15 @@ track(checkRow(pageApuntar, "Personaje gira con la cámara", 8,
     function() return S.girarPersonaje end,
     function(v) S.girarPersonaje = v markDirty() refreshUI() end))
 
-track(checkRow(pageApuntar, "Solo con clic derecho (PC)", 9,
+track(checkRow(pageApuntar, "Cámara detrás del personaje al apuntar", 9,
+    function() return S.camaraOrbita end,
+    function(v) S.camaraOrbita = v markDirty() refreshUI() end))
+
+track(checkRow(pageApuntar, "Solo con clic derecho (PC)", 10,
     function() return S.soloClic end,
     function(v) S.soloClic = v markDirty() refreshUI() end))
 
-local notaApuntar = nota(pageApuntar, 10, 58)
+local notaApuntar = nota(pageApuntar, 11, 58)
 
 ---------------------------------------------------------------
 -- PESTAÑA FILTROS
@@ -1077,7 +1082,11 @@ local function logicaApuntado(cam, root, dt)
             seguido = buscarJugadorCercano(root)
         end
         if seguido then
+            local antes = root.Position
             pegarseA(seguido, root)
+            -- La cámara del juego ya se actualizó este fotograma con la posición vieja:
+            -- se mueve el mismo salto para que viaje junto con el personaje
+            cam.CFrame = cam.CFrame + (root.Position - antes)
             pegadoA = seguido
         end
     else
@@ -1129,6 +1138,17 @@ local function logicaApuntado(cam, root, dt)
         if mantener then
             local punto = getPuntoDeMira(objetivo)
             local deseado = CFrame.new(cam.CFrame.Position, punto)
+
+            -- La cámara se coloca detrás del personaje, en línea con el objetivo, manteniendo
+            -- el mismo zoom. Así gira ALREDEDOR del personaje y nunca se queda en otro punto.
+            if S.camaraOrbita then
+                local pivote = root.Position + Vector3.new(0, 1.5, 0)
+                local hacia = punto - pivote
+                if hacia.Magnitude > 0.5 then
+                    local zoom = math.clamp((cam.CFrame.Position - pivote).Magnitude, 0.5, 128)
+                    deseado = CFrame.new(pivote - hacia.Unit * zoom, punto)
+                end
+            end
             if S.suavizado > 0 then
                 local alpha = 1 - (S.suavizado / 100) ^ (math.max(dt, 0.001) * 60)
                 cam.CFrame = cam.CFrame:Lerp(deseado, alpha)
@@ -1224,7 +1244,9 @@ refreshUI = function()
     notaSeguir.Text = string.format(
         "Te teletransporta cada fotograma detrás del jugador más cercano (hasta %d st) y la cámara lo mira. Cuando muere o se va, pasa al siguiente. Tecla %s: encender/apagar. Respeta 'Ignorar compañeros de equipo'. Esta opción también se guarda.",
         S.alcanceTP, CONFIG.TECLA_PEGARSE.Name)
-    notaVisual.Text = "Todo se guarda solo en " .. CONFIG.ARCHIVO .. " (opciones, pestaña y posición del panel). El círculo FOV solo limita la elección si activas 'Elegir solo dentro del círculo FOV'."
+    local camAhora = Workspace.CurrentCamera
+    notaVisual.Text = "Todo se guarda solo en " .. CONFIG.ARCHIVO .. " (opciones, pestaña y posición del panel). Tipo de cámara del juego: "
+        .. (camAhora and camAhora.CameraType.Name or "?") .. "."
 
     applyVisuals()
 end
