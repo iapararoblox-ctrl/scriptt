@@ -1,4 +1,4 @@
--- Auto-apuntado de cámara hacia "Combatant" con panel de configuración
+-- Auto-apuntado v3: la cámara gira y SIGUE al objetivo sin perderlo de vista (lock-on)
 ---------------------------------------------------------------
 -- SERVICIOS
 ---------------------------------------------------------------
@@ -16,8 +16,11 @@ local LocalPlayer = Players.LocalPlayer
 ---------------------------------------------------------------
 local CONFIG = {
     ETIQUETA = "Combatant",
-    ARCHIVO = "AutoApuntadoConfig.json",
-    TECLA_ALTERNAR = Enum.KeyCode.X,
+    ARCHIVO = "AutoApuntadoConfig_v3.json",
+    TECLA_ALTERNAR = Enum.KeyCode.X,   -- encender / apagar
+    TECLA_CAMBIAR = Enum.KeyCode.C,    -- cambiar al siguiente objetivo
+    NOMBRE_RENDER = "AutoApuntadoCamara",
+    MARGEN_SOLTAR = 1.15,              -- el objetivo fijado se suelta al pasar radio x 1.15
     RADIO_MIN = 5,
     RADIO_MAX = 2000,
     FOV_MIN = 20,
@@ -44,6 +47,8 @@ local DEFAULTS = {
     suavizado = 0,
     prioIdx = 1,
     soloClic = false,
+    fijar = true,             -- mantener al mismo objetivo aunque salga de pantalla
+    girarPersonaje = false,   -- el personaje también mira al objetivo
     tipoIdx = 1,
     ignorarEquipo = true,
     paredes = false,
@@ -167,9 +172,10 @@ local function nombreDe(model)
     return jugador and jugador.DisplayName or model.Name
 end
 
--- Devuelve el mejor objetivo y su distancia
-local function buscarObjetivo(cam, root)
-    local mejor, mejorPuntaje, mejorDist = nil, math.huge, 0
+-- Lista de candidatos dentro del radio.
+-- estricto = true aplica "solo en pantalla" y el círculo FOV (para elegir uno NUEVO).
+local function listaCandidatos(cam, root, estricto)
+    local lista = {}
     local centro = cam.ViewportSize / 2
 
     for _, model in ipairs(CollectionService:GetTagged(CONFIG.ETIQUETA)) do
@@ -181,23 +187,86 @@ local function buscarObjetivo(cam, root)
                 local distPantalla = (Vector2.new(v.X, v.Y) - centro).Magnitude
 
                 local ok = true
-                if S.soloPantalla and not enPantalla then ok = false end
-                if ok and S.usarFov and distPantalla > S.fov then ok = false end
+                if estricto then
+                    if S.soloPantalla and not enPantalla then ok = false end
+                    if ok and S.usarFov and distPantalla > S.fov then ok = false end
+                end
                 if ok and S.paredes and not tieneLineaDeVista(cam, punto, model) then ok = false end
 
                 if ok then
-                    local puntaje = (S.prioIdx == 1) and dist or distPantalla
-                    if puntaje < mejorPuntaje then
-                        mejorPuntaje = puntaje
-                        mejor = model
-                        mejorDist = dist
-                    end
+                    table.insert(lista, {
+                        model = model,
+                        dist = dist,
+                        puntaje = (S.prioIdx == 1) and dist or distPantalla,
+                    })
                 end
             end
         end
     end
 
-    return mejor, mejorDist
+    return lista
+end
+
+-- Mejor objetivo nuevo según la prioridad elegida
+local function buscarMejor(cam, root)
+    local mejor
+    for _, c in ipairs(listaCandidatos(cam, root, true)) do
+        if not mejor or c.puntaje < mejor.puntaje then
+            mejor = c
+        end
+    end
+    return mejor and mejor.model or nil
+end
+
+---------------------------------------------------------------
+-- FIJADO DE OBJETIVO (LOCK-ON)
+---------------------------------------------------------------
+local bloqueado = nil          -- objetivo fijado
+local objetivoActual = nil     -- objetivo usado este fotograma
+local distanciaActual = 0
+
+-- ¿Sigue siendo válido el objetivo fijado? Devuelve (ok, distancia)
+local function bloqueoSigueValido(cam, root)
+    local m = bloqueado
+    if not (m and esValido(m) and pasaFiltros(m)) then
+        return false
+    end
+    local dist = (m.HumanoidRootPart.Position - root.Position).Magnitude
+    if dist > S.radio * CONFIG.MARGEN_SOLTAR then
+        return false
+    end
+    if S.paredes and not tieneLineaDeVista(cam, getPuntoDeMira(m), m) then
+        return false
+    end
+    return true, dist
+end
+
+-- Pasa al siguiente objetivo (por distancia) sin importar si está en pantalla
+local function cambiarObjetivo()
+    local cam = Workspace.CurrentCamera
+    local root = getRoot()
+    if not cam or not root then return end
+
+    local lista = listaCandidatos(cam, root, false)
+    if #lista == 0 then
+        bloqueado = nil
+        return
+    end
+    table.sort(lista, function(a, b) return a.dist < b.dist end)
+
+    local siguiente = lista[1].model
+    for i, c in ipairs(lista) do
+        if c.model == bloqueado then
+            siguiente = lista[(i % #lista) + 1].model
+            break
+        end
+    end
+
+    bloqueado = siguiente
+    if not S.fijar then
+        S.fijar = true
+        markDirty()
+    end
 end
 
 ---------------------------------------------------------------
@@ -311,6 +380,7 @@ local function checkRow(parent, text, order, get, set)
     local lbl = label(row, text, 12, PALETTE.text, false)
     lbl.Position = UDim2.new(0, 10, 0, 0)
     lbl.Size = UDim2.new(1, -44, 1, 0)
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
 
     local box = Instance.new("Frame")
     box.Size = UDim2.fromOffset(18, 18)
@@ -367,6 +437,7 @@ local function numberRow(parent, order, name, getVal, setVal, step, boxWidth)
     local lbl = label(row, name, 12, PALETTE.text, true)
     lbl.Position = UDim2.new(0, 10, 0, 0)
     lbl.Size = UDim2.new(1, -(boxWidth + 90), 1, 0)
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
 
     local minus = button(row, "−", UDim2.fromOffset(30, 28), PALETTE.track)
     minus.Position = UDim2.new(1, -(boxWidth + 76), 0.5, -14)
@@ -446,7 +517,7 @@ local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.fromOffset(300, 440)
+main.Size = UDim2.fromOffset(300, 470)
 main.BackgroundColor3 = PALETTE.bg
 main.BorderSizePixel = 0
 main.ClipsDescendants = true
@@ -617,7 +688,22 @@ track(numberRow(pageApuntar, 2, "Distancia",
         markDirty() refreshUI()
     end, 10, 64))
 
-track(arrowRow(pageApuntar, 3,
+track(checkRow(pageApuntar, "Fijar objetivo (no perderlo de vista)", 3,
+    function() return S.fijar end,
+    function(v)
+        S.fijar = v
+        if not v then bloqueado = nil end
+        markDirty() refreshUI()
+    end))
+
+local cambiarBtn = button(pageApuntar, "⟳ Cambiar de objetivo", UDim2.new(1, -4, 0, 34), PALETTE.accent)
+cambiarBtn.LayoutOrder = 4
+cambiarBtn.Activated:Connect(function()
+    cambiarObjetivo()
+    refreshUI()
+end)
+
+track(arrowRow(pageApuntar, 5,
     function() return "Apuntar a: " .. PARTES[S.parteIdx].txt end,
     function()
         S.parteIdx = S.parteIdx - 1
@@ -630,14 +716,14 @@ track(arrowRow(pageApuntar, 3,
         markDirty() refreshUI()
     end))
 
-track(numberRow(pageApuntar, 4, "Suavizado %",
+track(numberRow(pageApuntar, 6, "Suavizado %",
     function() return S.suavizado end,
     function(v)
         S.suavizado = math.clamp(v, 0, CONFIG.SUAVIZADO_MAX)
         markDirty() refreshUI()
     end, 5, 64))
 
-track(arrowRow(pageApuntar, 5,
+track(arrowRow(pageApuntar, 7,
     function() return "Prioridad: " .. PRIORIDADES[S.prioIdx] end,
     function()
         S.prioIdx = S.prioIdx - 1
@@ -650,11 +736,15 @@ track(arrowRow(pageApuntar, 5,
         markDirty() refreshUI()
     end))
 
-track(checkRow(pageApuntar, "Solo con clic derecho (PC)", 6,
+track(checkRow(pageApuntar, "Girar también el personaje", 8,
+    function() return S.girarPersonaje end,
+    function(v) S.girarPersonaje = v markDirty() refreshUI() end))
+
+track(checkRow(pageApuntar, "Solo con clic derecho (PC)", 9,
     function() return S.soloClic end,
     function(v) S.soloClic = v markDirty() refreshUI() end))
 
-local notaApuntar = nota(pageApuntar, 7, 46)
+local notaApuntar = nota(pageApuntar, 10, 58)
 
 ---------------------------------------------------------------
 -- PESTAÑA FILTROS
@@ -680,11 +770,11 @@ track(checkRow(pageFiltros, "Ignorar si hay pared en medio", 3,
     function() return S.paredes end,
     function(v) S.paredes = v markDirty() refreshUI() end))
 
-track(checkRow(pageFiltros, "Solo objetivos en pantalla", 4,
+track(checkRow(pageFiltros, "Elegir solo objetivos en pantalla", 4,
     function() return S.soloPantalla end,
     function(v) S.soloPantalla = v markDirty() refreshUI() end))
 
-track(checkRow(pageFiltros, "Limitar por círculo FOV", 5,
+track(checkRow(pageFiltros, "Elegir solo dentro del círculo FOV", 5,
     function() return S.usarFov end,
     function(v) S.usarFov = v markDirty() refreshUI() end))
 
@@ -695,7 +785,7 @@ track(numberRow(pageFiltros, 6, "Radio FOV (px)",
         markDirty() refreshUI()
     end, 10, 64))
 
-local notaFiltros = nota(pageFiltros, 7, 46)
+local notaFiltros = nota(pageFiltros, 7, 58)
 
 ---------------------------------------------------------------
 -- PESTAÑA VISUAL
@@ -721,6 +811,7 @@ resetBtn.Activated:Connect(function()
     for k, v in pairs(DEFAULTS) do
         S[k] = v
     end
+    bloqueado = nil
     markDirty()
     refreshUI()
 end)
@@ -750,37 +841,77 @@ mini.Activated:Connect(function()
 end)
 
 ---------------------------------------------------------------
--- LÓGICA PRINCIPAL (cada fotograma)
+-- LÓGICA PRINCIPAL (cada fotograma, DESPUÉS de la cámara por defecto)
 ---------------------------------------------------------------
-local objetivoActual, distanciaActual = nil, 0
-local connections = {}
-
-table.insert(connections, RunService.RenderStepped:Connect(function(dt)
+-- Se enlaza con prioridad de cámara + 1 para que se ejecute justo después del script
+-- de cámara del juego; así nuestra rotación no se pisa y el objetivo no se pierde.
+local function paso(dt)
     if closed then return end
 
     objetivoActual = nil
     local cam = Workspace.CurrentCamera
     local root = getRoot()
 
-    if S.activo and cam and root and estoyVivo() then
-        local ok, model, dist = pcall(buscarObjetivo, cam, root)
-        if ok and model then
-            objetivoActual, distanciaActual = model, dist
+    if not (S.activo and cam and root and estoyVivo()) then
+        bloqueado = nil
+        highlight.Enabled = false
+        highlight.Adornee = nil
+        return
+    end
 
-            local mantener = (not S.soloClic)
-                or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    local objetivo, dist
 
-            if mantener then
-                pcall(function()
-                    local deseado = CFrame.new(cam.CFrame.Position, getPuntoDeMira(model))
-                    if S.suavizado > 0 then
-                        local alpha = 1 - (S.suavizado / 100) ^ (math.max(dt, 0.001) * 60)
-                        cam.CFrame = cam.CFrame:Lerp(deseado, alpha)
-                    else
-                        cam.CFrame = deseado
-                    end
-                end)
+    if S.fijar then
+        -- Mantiene al objetivo fijado aunque salga de pantalla; solo lo suelta si
+        -- muere, se aleja demasiado o deja de cumplir los filtros.
+        local ok, d = bloqueoSigueValido(cam, root)
+        if ok then
+            objetivo, dist = bloqueado, d
+        else
+            local okBusca, nuevo = pcall(buscarMejor, cam, root)
+            bloqueado = okBusca and nuevo or nil
+            if bloqueado then
+                objetivo = bloqueado
+                dist = (bloqueado.HumanoidRootPart.Position - root.Position).Magnitude
             end
+        end
+    else
+        bloqueado = nil
+        local okBusca, nuevo = pcall(buscarMejor, cam, root)
+        if okBusca and nuevo then
+            objetivo = nuevo
+            dist = (nuevo.HumanoidRootPart.Position - root.Position).Magnitude
+        end
+    end
+
+    if objetivo then
+        objetivoActual, distanciaActual = objetivo, dist
+
+        local mantener = (not S.soloClic)
+            or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+
+        if mantener then
+            pcall(function()
+                local punto = getPuntoDeMira(objetivo)
+
+                -- Girar la cámara hacia el objetivo
+                local deseado = CFrame.new(cam.CFrame.Position, punto)
+                if S.suavizado > 0 then
+                    local alpha = 1 - (S.suavizado / 100) ^ (math.max(dt, 0.001) * 60)
+                    cam.CFrame = cam.CFrame:Lerp(deseado, alpha)
+                else
+                    cam.CFrame = deseado
+                end
+
+                -- Girar también al personaje (solo en horizontal)
+                if S.girarPersonaje then
+                    local pos = root.Position
+                    local mira = Vector3.new(punto.X, pos.Y, punto.Z)
+                    if (mira - pos).Magnitude > 0.1 then
+                        root.CFrame = CFrame.new(pos, mira)
+                    end
+                end
+            end)
         end
     end
 
@@ -792,14 +923,21 @@ table.insert(connections, RunService.RenderStepped:Connect(function(dt)
         highlight.Enabled = false
         highlight.Adornee = nil
     end
-end))
+end
 
--- Tecla para encender/apagar (PC)
+RunService:BindToRenderStep(CONFIG.NOMBRE_RENDER, Enum.RenderPriority.Camera.Value + 1, paso)
+
+local connections = {}
+
+-- Teclas (PC): X enciende/apaga, C cambia de objetivo
 table.insert(connections, UserInputService.InputBegan:Connect(function(input, procesado)
     if procesado or closed then return end
     if input.KeyCode == CONFIG.TECLA_ALTERNAR then
         S.activo = not S.activo
         markDirty()
+        refreshUI()
+    elseif input.KeyCode == CONFIG.TECLA_CAMBIAR then
+        cambiarObjetivo()
         refreshUI()
     end
 end))
@@ -812,7 +950,8 @@ refreshUI = function()
     estadoLabel.TextColor3 = S.activo and PALETTE.green or PALETTE.red
 
     if objetivoActual then
-        objetivoLabel.Text = string.format("%s · %d st", nombreDe(objetivoActual), math.floor(distanciaActual + 0.5))
+        local candado = (S.fijar and bloqueado == objetivoActual) and "🔒 " or ""
+        objetivoLabel.Text = string.format("%s%s · %d st", candado, nombreDe(objetivoActual), math.floor(distanciaActual + 0.5))
     else
         objetivoLabel.Text = S.activo and "Sin objetivo" or "—"
     end
@@ -822,10 +961,10 @@ refreshUI = function()
     end
 
     notaApuntar.Text = string.format(
-        "Apunta al más cercano dentro de %d studs. Suavizado 0%% = giro instantáneo; más alto = giro más lento. Tecla %s: encender/apagar.",
-        S.radio, CONFIG.TECLA_ALTERNAR.Name)
-    notaFiltros.Text = "El círculo FOV limita los objetivos a los que estén cerca del centro de tu pantalla. Activa 'pared' para ignorar los que no ves."
-    notaVisual.Text = "El círculo FOV solo se dibuja; para que limite el apuntado activa 'Limitar por círculo FOV' en Filtros."
+        "Con 'Fijar objetivo' la cámara sigue al mismo enemigo aunque se mueva o salga de pantalla, hasta que muera o pase de %d st. Tecla %s: encender/apagar. Tecla %s: cambiar de objetivo.",
+        math.floor(S.radio * CONFIG.MARGEN_SOLTAR), CONFIG.TECLA_ALTERNAR.Name, CONFIG.TECLA_CAMBIAR.Name)
+    notaFiltros.Text = "'En pantalla' y 'círculo FOV' solo se usan para ELEGIR un objetivo nuevo; una vez fijado, la cámara lo sigue donde vaya. 'Pared' lo suelta si lo tapa algo."
+    notaVisual.Text = "El círculo FOV solo limita la elección si activas 'Elegir solo dentro del círculo FOV' en Filtros."
 
     applyVisuals()
 end
@@ -833,6 +972,7 @@ end
 closeBtn.Activated:Connect(function()
     closed = true
     S.activo = false
+    pcall(function() RunService:UnbindFromRenderStep(CONFIG.NOMBRE_RENDER) end)
     for _, c in ipairs(connections) do
         c:Disconnect()
     end
