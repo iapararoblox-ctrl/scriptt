@@ -1,4 +1,4 @@
--- Auto-apuntado v6: lock-on + TP a la espalda + personaje gira con la cámara + la cámara viaja con el personaje
+-- Auto-apuntado v7: lock-on + deslizarse a la espalda del jugador + solo la cabeza gira hacia el objetivo
 ---------------------------------------------------------------
 -- SERVICIOS
 ---------------------------------------------------------------
@@ -37,6 +37,10 @@ local CONFIG = {
     ALTURA_MAX = 10,
     ALCANCE_MIN = 10,
     ALCANCE_MAX = 5000,
+    VEL_MIN = 5,
+    VEL_MAX = 500,
+    CABEZA_YAW_MAX = 90,    -- giro lateral máximo de la cabeza (grados)
+    CABEZA_PITCH_MAX = 60,  -- giro vertical máximo de la cabeza (grados)
 }
 
 local PARTES = {
@@ -45,6 +49,8 @@ local PARTES = {
 }
 local PRIORIDADES = { "Más cercano", "Más cercano a la mira" }
 local TIPOS = { "Todos", "Solo jugadores", "Solo bots" }
+local GIROS = { "Solo la cabeza", "Cuerpo completo", "Ninguno" }
+local MOVIMIENTOS = { "Deslizarse", "Teletransporte" }
 local TABS = { "Apuntar", "Filtros", "Seguir", "Visual" }
 
 ---------------------------------------------------------------
@@ -58,7 +64,7 @@ local DEFAULTS = {
     prioIdx = 1,
     soloClic = false,
     fijar = true,             -- mantener al mismo objetivo aunque salga de pantalla
-    girarPersonaje = true,    -- el personaje gira junto con la cámara
+    giroIdx = 1,              -- 1 = solo la cabeza mira al objetivo, 2 = cuerpo completo, 3 = ninguno
     camaraOrbita = true,      -- al apuntar, la cámara se coloca detrás del personaje (no se queda atrás)
     tipoIdx = 1,
     ignorarEquipo = true,
@@ -74,6 +80,8 @@ local DEFAULTS = {
     distEspalda = 3,          -- studs detrás del jugador
     alturaTP = 0,             -- studs de altura respecto al jugador
     alcanceTP = 500,          -- alcance máximo para elegir al jugador
+    movIdx = 1,               -- 1 = deslizarse hacia él, 2 = teletransporte
+    velocidad = 60,           -- studs por segundo al deslizarse
     -- Interfaz
     tab = 1,                  -- última pestaña abierta
     posXs = 0.5, posXo = 0,   -- posición del panel
@@ -119,6 +127,9 @@ S.tab = math.clamp(math.floor(S.tab), 1, #TABS)
 S.distEspalda = math.clamp(S.distEspalda, CONFIG.ESPALDA_MIN, CONFIG.ESPALDA_MAX)
 S.alturaTP = math.clamp(S.alturaTP, CONFIG.ALTURA_MIN, CONFIG.ALTURA_MAX)
 S.alcanceTP = math.clamp(S.alcanceTP, CONFIG.ALCANCE_MIN, CONFIG.ALCANCE_MAX)
+S.giroIdx = math.clamp(math.floor(S.giroIdx), 1, #GIROS)
+S.movIdx = math.clamp(math.floor(S.movIdx), 1, #MOVIMIENTOS)
+S.velocidad = math.clamp(S.velocidad, CONFIG.VEL_MIN, CONFIG.VEL_MAX)
 S.posXs = math.clamp(S.posXs, 0, 1)
 S.posYs = math.clamp(S.posYs, 0, 1)
 S.posXo = math.clamp(S.posXo, -3000, 3000)
@@ -358,13 +369,35 @@ local function buscarJugadorCercano(root)
     return mejor
 end
 
--- Me coloca detrás del personaje, mirando en su misma dirección
-local function pegarseA(model, root)
+-- Me acerca a la espalda del personaje. Si el modo es "Deslizarse", avanza como mucho
+-- S.velocidad studs por segundo hacia ese punto (y se queda pegado cuando llega).
+-- Si es "Teletransporte", salta directamente. Devuelve cuánto falta para llegar.
+local function moverA(model, root, dt)
     local t = model:FindFirstChild("HumanoidRootPart")
-    if not t then return end
-    local pos = (t.CFrame * CFrame.new(0, S.alturaTP, S.distEspalda)).Position
+    if not t then return 0 end
+
+    local destino = (t.CFrame * CFrame.new(0, S.alturaTP, S.distEspalda)).Position
+    local pos = root.Position
+    local falta = destino - pos
+    local paso = S.velocidad * math.max(dt, 0.001)
+
+    local nuevaPos
+    if S.movIdx == 2 or falta.Magnitude <= paso then
+        nuevaPos = destino
+    else
+        nuevaPos = pos + falta.Unit * paso
+    end
+
     root.AssemblyLinearVelocity = Vector3.zero
-    root.CFrame = CFrame.new(pos, pos + t.CFrame.LookVector)
+    if S.giroIdx == 2 then
+        -- Cuerpo completo: queda mirando en la misma dirección que el jugador
+        root.CFrame = CFrame.new(nuevaPos, nuevaPos + t.CFrame.LookVector)
+    else
+        -- Solo cabeza / ninguno: el cuerpo conserva su orientación
+        root.CFrame = CFrame.new(nuevaPos) * (root.CFrame - root.CFrame.Position)
+    end
+
+    return (destino - nuevaPos).Magnitude
 end
 
 ---------------------------------------------------------------
@@ -377,7 +410,7 @@ local autoRotateDesactivado = false
 local function personajeConCamara(cam, root)
     local hum = getHumanoid()
 
-    if not S.girarPersonaje then
+    if S.giroIdx ~= 2 then
         if autoRotateDesactivado and hum then
             hum.AutoRotate = true
         end
@@ -398,6 +431,58 @@ local function personajeConCamara(cam, root)
 
     local pos = root.Position
     root.CFrame = CFrame.new(pos, pos + plano)
+end
+
+---------------------------------------------------------------
+-- SOLO LA CABEZA GIRA HACIA EL OBJETIVO
+---------------------------------------------------------------
+local cuelloOriginal = {}      -- Motor6D del cuello -> C0 original
+local cuelloActual = nil
+
+local function getCuello()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local neck = char:FindFirstChild("Neck", true)
+    if neck and neck:IsA("Motor6D") and neck.Part0 and neck.Part1 then
+        if not cuelloOriginal[neck] then
+            cuelloOriginal[neck] = neck.C0
+        end
+        return neck
+    end
+    return nil
+end
+
+-- Devuelve el cuello a su posición normal
+local function restaurarCabeza()
+    local neck = cuelloActual
+    if neck and neck.Parent and cuelloOriginal[neck] and neck.C0 ~= cuelloOriginal[neck] then
+        neck.C0 = cuelloOriginal[neck]
+    end
+end
+
+-- Gira la cabeza hacia un punto del mundo (con límites para que no se retuerza)
+local function cabezaHacia(punto)
+    local neck = getCuello()
+    if not neck then return end
+    cuelloActual = neck
+
+    local orig = cuelloOriginal[neck]
+    local part0 = neck.Part0
+    local cuelloMundo = (part0.CFrame * orig).Position
+    local haciaPunto = punto - cuelloMundo
+    if haciaPunto.Magnitude < 0.1 then return end
+
+    -- Dirección al objetivo en el espacio del torso: yaw (lados) y pitch (arriba/abajo)
+    local d = part0.CFrame:VectorToObjectSpace(haciaPunto.Unit)
+    local yaw = math.atan2(-d.X, -d.Z)
+    local pitch = math.asin(math.clamp(d.Y, -1, 1))
+    yaw = math.clamp(yaw, -math.rad(CONFIG.CABEZA_YAW_MAX), math.rad(CONFIG.CABEZA_YAW_MAX))
+    pitch = math.clamp(pitch, -math.rad(CONFIG.CABEZA_PITCH_MAX), math.rad(CONFIG.CABEZA_PITCH_MAX))
+
+    -- Rotación en el espacio del torso, convertida al espacio de la articulación del cuello
+    local rel = CFrame.fromEulerAnglesYXZ(pitch, yaw, 0)
+    local R = orig - orig.Position
+    neck.C0 = orig * (R:Inverse() * rel * R)
 end
 
 ---------------------------------------------------------------
@@ -666,7 +751,7 @@ header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
 header.Parent = main
 
-local title = label(header, "🎯 Auto-Apuntado", 15, PALETTE.text, true)
+local title = label(header, "🎯 MAYK DEV", 15, PALETTE.text, true)
 title.Position = UDim2.new(0, 14, 0, 6)
 title.Size = UDim2.new(1, -100, 0, 18)
 
@@ -886,9 +971,18 @@ track(arrowRow(pageApuntar, 7,
         markDirty() refreshUI()
     end))
 
-track(checkRow(pageApuntar, "Personaje gira con la cámara", 8,
-    function() return S.girarPersonaje end,
-    function(v) S.girarPersonaje = v markDirty() refreshUI() end))
+track(arrowRow(pageApuntar, 8,
+    function() return "Giro: " .. GIROS[S.giroIdx] end,
+    function()
+        S.giroIdx = S.giroIdx - 1
+        if S.giroIdx < 1 then S.giroIdx = #GIROS end
+        markDirty() refreshUI()
+    end,
+    function()
+        S.giroIdx = S.giroIdx + 1
+        if S.giroIdx > #GIROS then S.giroIdx = 1 end
+        markDirty() refreshUI()
+    end))
 
 track(checkRow(pageApuntar, "Cámara detrás del personaje al apuntar", 9,
     function() return S.camaraOrbita end,
@@ -952,9 +1046,12 @@ track(checkRow(pageSeguir, "Pegarse a la espalda del más cercano", 1,
         markDirty() refreshUI()
     end))
 
-local tpAhoraBtn = button(pageSeguir, "⚡ TP a su espalda (una vez)", UDim2.new(1, -4, 0, 34), PALETTE.accent)
+local moviendoUnaVez = false
+local tpAhoraBtn = button(pageSeguir, "➜ Ir a su espalda (una vez)", UDim2.new(1, -4, 0, 34), PALETTE.accent)
 tpAhoraBtn.LayoutOrder = 2
 tpAhoraBtn.Activated:Connect(function()
+    if moviendoUnaVez then return end
+
     local root = getRoot()
     if not root or not estoyVivo() then
         mensaje("No tienes personaje vivo")
@@ -965,32 +1062,70 @@ tpAhoraBtn.Activated:Connect(function()
         mensaje("No hay jugadores en el alcance")
         return
     end
-    pegarseA(objetivo, root)
-    mensaje("TP a " .. nombreDe(objetivo))
+
+    if S.movIdx == 2 then
+        moverA(objetivo, root, 1 / 60)
+        mensaje("TP a " .. nombreDe(objetivo))
+        return
+    end
+
+    -- Deslizarse hasta llegar (máximo 15 segundos)
+    moviendoUnaVez = true
+    mensaje("Deslizándote hacia " .. nombreDe(objetivo))
+    task.spawn(function()
+        local t0 = os.clock()
+        while not closed and os.clock() - t0 < 15 do
+            local r = getRoot()
+            if not (r and estoyVivo() and esValido(objetivo)) then break end
+            local dt = RunService.RenderStepped:Wait()
+            if moverA(objetivo, r, dt) < 0.5 then break end
+        end
+        moviendoUnaVez = false
+    end)
 end)
 
-track(numberRow(pageSeguir, 3, "Distancia atrás",
+track(arrowRow(pageSeguir, 3,
+    function() return "Movimiento: " .. MOVIMIENTOS[S.movIdx] end,
+    function()
+        S.movIdx = S.movIdx - 1
+        if S.movIdx < 1 then S.movIdx = #MOVIMIENTOS end
+        markDirty() refreshUI()
+    end,
+    function()
+        S.movIdx = S.movIdx + 1
+        if S.movIdx > #MOVIMIENTOS then S.movIdx = 1 end
+        markDirty() refreshUI()
+    end))
+
+track(numberRow(pageSeguir, 4, "Velocidad (st/s)",
+    function() return S.velocidad end,
+    function(v)
+        S.velocidad = math.clamp(v, CONFIG.VEL_MIN, CONFIG.VEL_MAX)
+        markDirty() refreshUI()
+    end, 10, 64))
+
+track(numberRow(pageSeguir, 5, "Distancia atrás",
     function() return S.distEspalda end,
     function(v)
         S.distEspalda = math.clamp(v, CONFIG.ESPALDA_MIN, CONFIG.ESPALDA_MAX)
         markDirty() refreshUI()
     end, 1, 64))
 
-track(numberRow(pageSeguir, 4, "Altura",
+track(numberRow(pageSeguir, 6, "Altura",
     function() return S.alturaTP end,
     function(v)
         S.alturaTP = math.clamp(v, CONFIG.ALTURA_MIN, CONFIG.ALTURA_MAX)
         markDirty() refreshUI()
     end, 1, 64))
 
-track(numberRow(pageSeguir, 5, "Alcance (studs)",
+track(numberRow(pageSeguir, 7, "Alcance (studs)",
     function() return S.alcanceTP end,
     function(v)
         S.alcanceTP = math.clamp(v, CONFIG.ALCANCE_MIN, CONFIG.ALCANCE_MAX)
         markDirty() refreshUI()
     end, 50, 64))
 
-local notaSeguir = nota(pageSeguir, 6, 70)
+local notaSeguir = nota(pageSeguir, 8, 70)
 
 ---------------------------------------------------------------
 -- PESTAÑA VISUAL
@@ -1083,7 +1218,7 @@ local function logicaApuntado(cam, root, dt)
         end
         if seguido then
             local antes = root.Position
-            pegarseA(seguido, root)
+            moverA(seguido, root, dt)
             -- La cámara del juego ya se actualizó este fotograma con la posición vieja:
             -- se mueve el mismo salto para que viaje junto con el personaje
             cam.CFrame = cam.CFrame + (root.Position - antes)
@@ -1189,6 +1324,13 @@ local function paso(dt)
     end
 
     pcall(personajeConCamara, cam, root)
+
+    -- Solo la cabeza gira hacia el objetivo (sin mover el cuerpo)
+    if S.giroIdx == 1 and objetivoActual then
+        pcall(cabezaHacia, getPuntoDeMira(objetivoActual))
+    else
+        pcall(restaurarCabeza)
+    end
 end
 
 RunService:BindToRenderStep(CONFIG.NOMBRE_RENDER, Enum.RenderPriority.Camera.Value + 1, paso)
@@ -1238,11 +1380,11 @@ refreshUI = function()
     end
 
     notaApuntar.Text = string.format(
-        "Con 'Fijar objetivo' la cámara sigue al mismo enemigo aunque salga de pantalla, hasta que muera o pase de %d st. Con 'Personaje gira con la cámara' tu personaje mira siempre hacia donde apunta la cámara. Teclas: %s apagar/encender, %s cambiar objetivo.",
+        "Con 'Fijar objetivo' la cámara sigue al mismo enemigo aunque salga de pantalla, hasta que muera o pase de %d st. En 'Giro' eliges si solo la cabeza mira al objetivo, si gira todo el cuerpo con la cámara, o ninguno. Teclas: %s apagar/encender, %s cambiar objetivo.",
         math.floor(S.radio * CONFIG.MARGEN_SOLTAR), CONFIG.TECLA_ALTERNAR.Name, CONFIG.TECLA_CAMBIAR.Name)
     notaFiltros.Text = "'En pantalla' y 'círculo FOV' solo se usan para ELEGIR un objetivo nuevo; una vez fijado, la cámara lo sigue donde vaya. 'Pared' lo suelta si lo tapa algo."
     notaSeguir.Text = string.format(
-        "Te teletransporta cada fotograma detrás del jugador más cercano (hasta %d st) y la cámara lo mira. Cuando muere o se va, pasa al siguiente. Tecla %s: encender/apagar. Respeta 'Ignorar compañeros de equipo'. Esta opción también se guarda.",
+        "Te desliza (o teletransporta, según el modo) detrás del jugador más cercano (hasta %d st) y la cámara lo mira. Cuando muere o se va, pasa al siguiente. Tecla %s: encender/apagar. Respeta 'Ignorar compañeros de equipo'. Esta opción también se guarda.",
         S.alcanceTP, CONFIG.TECLA_PEGARSE.Name)
     local camAhora = Workspace.CurrentCamera
     notaVisual.Text = "Todo se guarda solo en " .. CONFIG.ARCHIVO .. " (opciones, pestaña y posición del panel). Tipo de cámara del juego: "
@@ -1262,6 +1404,7 @@ closeBtn.Activated:Connect(function()
     if autoRotateDesactivado and hum then
         hum.AutoRotate = true
     end
+    pcall(restaurarCabeza)
     saveConfig()
     highlight:Destroy()
     gui:Destroy()
