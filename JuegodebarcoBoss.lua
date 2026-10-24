@@ -232,7 +232,7 @@ local CONFIG = {
     JEFE_REVISAR_MAX = 300,
     JEFE_TIMEOUT = 600,                -- segundos máximos peleando con un jefe
     JEFE_ESPERA_APARECER = 4,          -- segundos esperando que el jefe cargue al llegar a su isla
-    JEFE_ESPERA_LOOT = 8,              -- segundos esperando que aparezca el loot tras la muerte del jefe
+    JEFE_ESPERA_LOOT = 15,             -- segundos esperando que aparezca el loot tras la muerte del jefe (antes 8)
     JEFE_ESPERA_STREAM = 4,            -- segundos esperando que los cofres vuelvan a cargar al regresar a su posición
     JEFE_LOOT_REINTENTOS = 3,          -- intentos de guardar un cofre antes de descartarlo
     JEFE_LOOT_TIMEOUT = 240,           -- segundos máximos recogiendo el loot de un jefe
@@ -1979,11 +1979,12 @@ function BS.streamAround(pos)
 end
 
 -- Recoge TODO el loot del jefe, un cofre cada vez:
---   recoge -> lleva al barco -> vuelve por el siguiente (a la posición recordada si ya se descargó)
+--   espera a que aparezca -> recoge -> lleva al barco -> vuelve por el siguiente
 function BS.collectLoot(deathPos)
     local folder = BS.lootFolder()
     if not folder then
         setStatus("No encuentro World.Dynamic.Loot")
+        dbg("Loot: no existe la carpeta", table.concat(CONFIG.JEFE_RUTA_LOOT, "."))
         return
     end
 
@@ -1994,11 +1995,14 @@ function BS.collectLoot(deathPos)
     end
     local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
 
-    local memory = {}   -- cofre (instancia) -> { pos, name }  (los pendientes que hemos visto)
-    local done = {}     -- cofre -> true (guardado o descartado)
-    local fails = {}    -- cofre -> intentos fallidos de guardado
-    local retries = {}  -- cofre -> veces que se volvió a su posición sin que apareciera
+    local memory = {}     -- cofre -> { pos, name }   (pendientes vistos)
+    local done = {}       -- cofre -> true            (guardado o descartado)
+    local fails = {}      -- cofre -> intentos fallidos de guardado
+    local retries = {}    -- cofre -> veces que volvió a su posición
+    local skipLogged = {} -- cofre -> ya se avisó por qué se descartó
     local vaultTries = 0
+    local collectedHere = 0
+    local lastCount = -1
 
     local t0 = os.clock()
     local waitUntil = os.clock() + CONFIG.JEFE_ESPERA_LOOT
@@ -2010,23 +2014,37 @@ function BS.collectLoot(deathPos)
         teleportTo(deathPos + Vector3.new(0, CONFIG.ALTURA + 2, 0))
         BS.streamAround(deathPos)
     end
+    -- Da tiempo al juego a crear los cofres tras la muerte
+    task.wait(1)
 
     while not closed and BS.enabled and folder.Parent and os.clock() - t0 < CONFIG.JEFE_LOOT_TIMEOUT do
-        -- 1) Cofres visibles ahora: se recuerda su posición
+        -- 1) Cofres visibles ahora
+        local items = folder:GetChildren()
         local visible = {}
-        for _, item in ipairs(folder:GetChildren()) do
+        for _, item in ipairs(items) do
             if not done[item] then
                 local base, prompt = BS.chestParts(item)
-                if base and prompt and BS.wantChest(item) then
-                    local pos = base.Position
-                    memory[item] = { pos = pos, name = item.Name }
-                    -- Si volvió a cargar (instancia nueva), se descarta el recuerdo viejo del mismo cofre
-                    for k, m in pairs(memory) do
-                        if k ~= item and not k.Parent and m.name == item.Name and (m.pos - pos).Magnitude < 6 then
-                            memory[k] = nil
+                if base and prompt then
+                    if BS.wantChest(item) then
+                        local pos = base.Position
+                        memory[item] = { pos = pos, name = item.Name }
+                        -- Si el mismo cofre volvió a cargar (instancia nueva), se descarta el recuerdo viejo
+                        for k, m in pairs(memory) do
+                            if k ~= item and not k.Parent and m.name == item.Name and (m.pos - pos).Magnitude < 6 then
+                                memory[k] = nil
+                            end
                         end
+                        table.insert(visible, { item = item, base = base, prompt = prompt })
+                    else
+                        if not skipLogged[item] then
+                            skipLogged[item] = true
+                            dbg("Loot descartado (otro dueño o filtro):", item.Name)
+                        end
+                        done[item] = true
                     end
-                    table.insert(visible, { item = item, base = base, prompt = prompt })
+                elseif not skipLogged[item] then
+                    -- Aún sin prompt: puede que todavía esté cargando, se reintenta
+                    dbg("Loot sin prompt todavía:", item.Name)
                 end
             end
         end
@@ -2037,11 +2055,17 @@ function BS.collectLoot(deathPos)
         end
         BS.pending = pending
 
+        if #items ~= lastCount then
+            lastCount = #items
+            dbg(string.format("Loot en carpeta: %d items, %d visibles, %d pendientes", #items, #visible, pending))
+        end
+
         local root = getRoot()
         local myPos = root and root.Position or Vector3.zero
 
         if #visible > 0 then
             -- 2) El más cercano: recoger, guardar en el barco y repetir
+            waitUntil = os.clock() + CONFIG.JEFE_ESPERA_LOOT
             table.sort(visible, function(a, b)
                 return (a.base.Position - myPos).Magnitude < (b.base.Position - myPos).Magnitude
             end)
@@ -2050,6 +2074,7 @@ function BS.collectLoot(deathPos)
             local cap = EX.capFor(dest)
 
             if size > cap then
+                dbg("Loot más grande que la bóveda, lo salto:", c.item.Name)
                 done[c.item] = true
             elseif usedSpaceOn(dest) + size > cap then
                 if destIsMine then
@@ -2077,11 +2102,12 @@ function BS.collectLoot(deathPos)
                 if storeOnBoat(usedBefore, dest) then
                     done[c.item] = true
                     collectedCount += 1
+                    collectedHere += 1
                     BS.lootCollected += 1
-                    waitUntil = os.clock() + CONFIG.JEFE_ESPERA_LOOT
                     waitOnShip()
                 else
                     fails[c.item] = (fails[c.item] or 0) + 1
+                    dbg("No se guardó el loot:", c.item.Name, "intento", fails[c.item])
                     if fails[c.item] >= CONFIG.JEFE_LOOT_REINTENTOS then
                         done[c.item] = true
                     end
@@ -2089,8 +2115,8 @@ function BS.collectLoot(deathPos)
             end
 
         elseif pending > 0 then
-            -- 3) Hay cofres recordados que ya no están en el Workspace (se descargaron al alejarte):
-            --    vuelve a su posición para que el juego los cargue otra vez
+            -- 3) Cofres recordados que se descargaron al alejarte: vuelve a su posición para recargarlos
+            waitUntil = os.clock() + CONFIG.JEFE_ESPERA_LOOT
             local bestKey, bestPos, bestDist
             for k, m in pairs(memory) do
                 if not done[k] then
@@ -2103,7 +2129,7 @@ function BS.collectLoot(deathPos)
 
             retries[bestKey] = (retries[bestKey] or 0) + 1
             if retries[bestKey] > 4 then
-                -- Ya no aparece: alguien lo recogió o desapareció del servidor
+                dbg("Loot que no vuelve a aparecer, lo dejo:", memory[bestKey].name)
                 done[bestKey] = true
             else
                 setStatus(string.format("Volviendo al loot (%d pendientes)...", pending))
@@ -2127,7 +2153,8 @@ function BS.collectLoot(deathPos)
             end
 
         else
-            -- 4) Nada visible ni pendiente: espera un poco por si el loot aún está apareciendo
+            -- 4) Nada usable todavía: sigue esperando mientras el loot aparece
+            setStatus(string.format("Esperando el loot del jefe (%ds)...", math.max(0, math.ceil(waitUntil - os.clock()))))
             if os.clock() >= waitUntil then
                 break
             end
@@ -2137,6 +2164,13 @@ function BS.collectLoot(deathPos)
 
     BS.pending = 0
     setHover(false)
+
+    if collectedHere == 0 then
+        setStatus("No apareció loot que pueda recoger (mira la consola [COFRES])")
+        dbg("Loot: no se recogió nada. Items en carpeta:", #folder:GetChildren())
+    else
+        setStatus(string.format("Loot recogido: %d cofre(s)", collectedHere))
+    end
 end
 
 -- Un ciclo de auto farm: revisa los jefes marcados en orden, pelea con los que estén y recoge su loot
