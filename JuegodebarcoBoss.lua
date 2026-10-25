@@ -6,6 +6,9 @@
 -- + JEFES DE EVENTO (isla aleatoria en World.Events, sin mar fijo)
 -- + RECOLECCIÓN COMPLETA POR ÁREA (no se salta cofres: recuerda los descargados y vuelve por ellos)
 -- + COFRE EN LA MANO: se entrega al barco antes de buscar otro cofre
+-- + ARMA MELEE AUTOMÁTICA EN JEFES (WeaponType = "Melee" en tu Backpack)
+-- + VERIFICACIÓN DEL LOOT DEL JEFE (vuelve a revisar que no quedan cofres)
+-- + UI "MaykDev" SIEMPRE ENCIMA DE OTRAS UI
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -254,6 +257,8 @@ local CONFIG = {
     JEFE_ESPERA_STREAM = 4,            -- segundos esperando que los cofres vuelvan a cargar al regresar a su posición
     JEFE_LOOT_REINTENTOS = 3,          -- intentos de guardar un cofre antes de descartarlo
     JEFE_LOOT_TIMEOUT = 240,           -- segundos máximos recogiendo el loot de un jefe
+    JEFE_VERIFICAR_VUELTAS = 3,        -- veces que se repite la recogida si al verificar aún quedan cofres de loot
+    JEFE_ESPERA_VERIFICAR = 2,         -- segundos esperando en cada punto al volver a revisar el loot
 
     -- JEFES DE EVENTO
     EVENTO_ISLA_NOMBRE = "Eventlsand_E11", -- nombre exacto de la isla del evento dentro de World.Events (cámbialo si en el juego se llama distinto)
@@ -1796,11 +1801,12 @@ end
 --      Los jefes de evento no tienen isla fija: su isla está en World.Events y aparece en un mar aleatorio.
 --      Si el evento no está activo, el script no se mueve y vuelve a revisar más tarde.
 --   2) Se PEGA a la parte del cuerpo indicada (la sigue aunque el jefe se mueva o gire) y golpea
---      automáticamente (o solo se pega, si eliges golpear tú).
+--      automáticamente (o solo se pega, si eliges golpear tú). Antes de pegarse equipa el arma Melee.
 --   3) MUERTE: el jefe está muerto cuando su propiedad HP (CONFIG.JEFE_PROP_VIDA) llega a 0.
 --      En ese momento se suelta y recoge su loot de World.Dynamic.Loot cofre por cofre.
 --   4) Los cofres lejanos se "descargan" del Workspace (streaming). Por eso se recuerda la posición de cada
 --      cofre pendiente y, tras dejar uno en el barco, se vuelve a esa posición para que carguen de nuevo.
+--   5) Al terminar la recogida vuelve a revisar que no quede ningún cofre de loot (verificación).
 ---------------------------------------------------------------
 -- Busca la entrada de isla (y su mar) de un jefe
 function BS.islandEntry(boss)
@@ -1927,6 +1933,69 @@ function BS.attackCF(partCF)
     return CFrame.lookAt(pos, partCF.Position)
 end
 
+---------------------------------------------------------------
+-- ARMA MELEE (WeaponType = "Melee")
+--   Busca en Players.<tu nombre>.Backpack una tool cuyo WeaponType sea "Melee".
+--   WeaponType puede ser un atributo de la tool o un ValueBase hijo llamado WeaponType.
+---------------------------------------------------------------
+-- ¿Esta tool es de corta distancia?
+function BS.isMelee(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    local wt = tool:GetAttribute("WeaponType")
+    if wt == nil then
+        local v = tool:FindFirstChild("WeaponType")
+        if v and v:IsA("ValueBase") then
+            wt = v.Value
+        end
+    end
+    return wt ~= nil and norm(wt) == "melee"
+end
+
+-- Busca la primera tool Melee en tu mochila
+function BS.findMelee()
+    local backpack
+    local pl = Players:FindFirstChild(LocalPlayer.Name)
+    if pl then
+        backpack = pl:FindFirstChild("Backpack")
+    end
+    backpack = backpack or LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not backpack then return nil end
+
+    for _, t in ipairs(backpack:GetChildren()) do
+        if BS.isMelee(t) then
+            return t
+        end
+    end
+    return nil
+end
+
+-- Deja en la mano el arma Melee. Si ya la tienes, no hace nada.
+-- Si no hay ninguna Melee en la mochila, usa cualquier tool (comportamiento anterior).
+function BS.ensureMelee()
+    local held = CB.getHeldTool()
+    if held and BS.isMelee(held) then
+        return held
+    end
+
+    local melee = BS.findMelee()
+    if melee then
+        local character = LocalPlayer.Character
+        local hum = character and character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function() hum:EquipTool(melee) end)
+            task.wait(0.25)
+        end
+        local now = CB.getHeldTool()
+        if now and BS.isMelee(now) then
+            return now
+        end
+        return now
+    end
+
+    dbg("No encuentro ninguna tool Melee (WeaponType = Melee) en la mochila")
+    return CB.ensureTool()
+end
+
 -- Te pega a la parte del jefe hasta que muera (HP = 0), desaparezca o se acabe el tiempo.
 -- Devuelve: murió?, última posición de la parte, ¿falta tool?
 function BS.fight(boss, model)
@@ -1936,6 +2005,12 @@ function BS.fight(boss, model)
     local lastPos = part and BS.partCFrame(part).Position or model:GetPivot().Position
 
     setHover(true)
+    if BS.autoHit then
+        local melee = BS.ensureMelee()
+        if melee then
+            dbg("Arma para el jefe:", melee.Name)
+        end
+    end
     setStatus("Pegado a " .. boss.nombre .. (BS.autoHit and "" or " (golpea tú)"))
 
     while not closed and BS.enabled and BS.alive(model) and os.clock() - t0 < CONFIG.JEFE_TIMEOUT do
@@ -1955,9 +2030,9 @@ function BS.fight(boss, model)
         end
 
         if BS.autoHit then
-            local tool = CB.ensureTool()
+            local tool = BS.ensureMelee()
             if not tool then
-                setStatus("No tienes ninguna tool en la mano")
+                setStatus("No tienes ninguna arma Melee ni tool en la mano")
                 return false, lastPos, true
             end
             pcall(function() tool:Activate() end)
@@ -2034,25 +2109,21 @@ function BS.streamAround(pos)
     end)
 end
 
--- Recoge TODO el loot del jefe, un cofre cada vez:
---   espera a que aparezca -> recoge -> lleva al barco -> vuelve por el siguiente
-function BS.collectLoot(deathPos)
+-- Una pasada de recogida: va al loot, recoge lo visible y vuelve a por lo descargado.
+--   done = tabla compartida entre pasadas (cofres ya guardados o descartados)
+-- Devuelve: cuántos guardó en esta pasada y las posiciones de los cofres que quedaron pendientes
+function BS.lootPass(deathPos, done)
     local folder = BS.lootFolder()
-    if not folder then
-        setStatus("No encuentro World.Dynamic.Loot")
-        dbg("Loot: no existe la carpeta", table.concat(CONFIG.JEFE_RUTA_LOOT, "."))
-        return
-    end
+    if not folder then return 0, {} end
 
     local dest = getDestinationShip()
     if not dest then
         setStatus(targetLabel ~= MINE_LABEL and ("No encuentro el barco de " .. targetLabel) or "No encuentro tu barco")
-        return
+        return 0, {}
     end
     local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
 
     local memory = {}     -- cofre -> { pos, name }   (pendientes vistos)
-    local done = {}       -- cofre -> true            (guardado o descartado)
     local fails = {}      -- cofre -> intentos fallidos de guardado
     local retries = {}    -- cofre -> veces que volvió a su posición
     local skipLogged = {} -- cofre -> ya se avisó por qué se descartó
@@ -2221,11 +2292,91 @@ function BS.collectLoot(deathPos)
     BS.pending = 0
     setHover(false)
 
+    -- Posiciones de los cofres que siguen pendientes (para revisarlos en la verificación)
+    local pendingPos = {}
+    for k, m in pairs(memory) do
+        if not done[k] then
+            table.insert(pendingPos, m.pos)
+        end
+    end
+
     if collectedHere == 0 then
+        dbg("Pasada de loot: no se recogió nada. Items en carpeta:", #folder:GetChildren())
+    end
+    return collectedHere, pendingPos
+end
+
+-- Cuenta los cofres de loot que siguen en la carpeta y que te interesan (ignora los ya descartados)
+function BS.lootLeft(done)
+    local folder = BS.lootFolder()
+    if not folder then return 0 end
+    local n = 0
+    for _, item in ipairs(folder:GetChildren()) do
+        if not done[item] then
+            local base, prompt = BS.chestParts(item)
+            if base and prompt and BS.wantChest(item) then
+                n += 1
+            end
+        end
+    end
+    return n
+end
+
+-- Verificación: vuelve al punto de muerte y a cada cofre pendiente para que el juego los cargue,
+-- y luego cuenta cuántos cofres de loot quedan
+function BS.verifyLoot(deathPos, pendingPos, done)
+    local spots = {}
+    if deathPos then table.insert(spots, deathPos) end
+    for _, p in ipairs(pendingPos or {}) do
+        table.insert(spots, p)
+    end
+
+    for _, spot in ipairs(spots) do
+        if closed or not BS.enabled then break end
+        setHover(false)
+        teleportTo(spot + Vector3.new(0, CONFIG.ALTURA + 2, 0))
+        BS.streamAround(spot)
+        task.wait(CONFIG.JEFE_ESPERA_VERIFICAR)
+    end
+
+    return BS.lootLeft(done)
+end
+
+-- Recoge TODO el loot del jefe. Tras cada pasada verifica que no quede ningún cofre;
+-- si queda alguno, repite la recogida (hasta JEFE_VERIFICAR_VUELTAS veces).
+function BS.collectLoot(deathPos)
+    if not BS.lootFolder() then
+        setStatus("No encuentro World.Dynamic.Loot")
+        dbg("Loot: no existe la carpeta", table.concat(CONFIG.JEFE_RUTA_LOOT, "."))
+        return
+    end
+
+    local done = {}        -- compartida entre pasadas: cofres guardados o descartados
+    local total = 0
+    local leftover = 0
+
+    for pass = 1, CONFIG.JEFE_VERIFICAR_VUELTAS do
+        if closed or not BS.enabled then break end
+
+        local got, pendingPos = BS.lootPass(deathPos, done)
+        total += got
+
+        setStatus("Verificando que no quedan cofres de loot...")
+        leftover = BS.verifyLoot(deathPos, pendingPos, done)
+        dbg(string.format("Verificación (vuelta %d): quedan %d cofre(s)", pass, leftover))
+
+        if leftover == 0 then break end
+    end
+
+    BS.pending = 0
+    setHover(false)
+
+    if leftover > 0 then
+        setStatus(string.format("Loot recogido: %d. Aún quedan %d cofre(s) tras verificar", total, leftover))
+    elseif total == 0 then
         setStatus("No apareció loot que pueda recoger (mira la consola [COFRES])")
-        dbg("Loot: no se recogió nada. Items en carpeta:", #folder:GetChildren())
     else
-        setStatus(string.format("Loot recogido: %d cofre(s)", collectedHere))
+        setStatus(string.format("Loot recogido: %d cofre(s). Verificado: no quedan cofres", total))
     end
 end
 
@@ -2677,9 +2828,10 @@ local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 local camera = Workspace.CurrentCamera or Workspace:WaitForChild("CurrentCamera")
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "CofresUI"
+gui.Name = "MaykDev"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999999   -- encima de todas las demás UI
 gui.Parent = playerGui
 
 local function corner(parent, radius)
@@ -2965,7 +3117,7 @@ header.Size = UDim2.new(1, 0, 0, 44)
 header.BackgroundTransparency = 1
 header.Parent = content
 
-local title = label(header, "Cofres", 15, PALETTE.text, true)
+local title = label(header, "MaykDev", 15, PALETTE.text, true)
 title.Position = UDim2.new(0, 14, 0, 6)
 title.Size = UDim2.new(1, -100, 0, 18)
 
@@ -3774,7 +3926,7 @@ function BS.refreshPanel()
         .. "   ·   Pendiente: " .. BS.pending
         .. "\nTool en mano: " .. (tool and tool.Name or "ninguna")
         .. "   ·   Golpe: " .. (BS.autoHit and "automático" or "manual")
-        .. "\nLos cofres lejanos se recuerdan y se vuelve por ellos al dejar uno en el barco."
+        .. "\nLos cofres lejanos se recuerdan y se vuelve por ellos. Al terminar se verifica que no quede loot."
 end
 
 ---------------------------------------------------------------
