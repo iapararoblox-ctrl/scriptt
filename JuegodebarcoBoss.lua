@@ -5,6 +5,7 @@
 -- + AUTO FARM DE JEFES (detección de muerte por HP, barra de vida y loot cofre por cofre)
 -- + JEFES DE EVENTO (isla aleatoria en World.Events, sin mar fijo)
 -- + RECOLECCIÓN COMPLETA POR ÁREA (no se salta cofres: recuerda los descargados y vuelve por ellos)
+-- + COFRE EN LA MANO: se entrega al barco antes de buscar otro cofre
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -199,6 +200,8 @@ local CONFIG = {
     ESPERA_STREAM_AREA = 2,        -- segundos esperando que el juego cargue la isla entera
     REVISITA_ESPERA = 3,           -- segundos esperando que un cofre descargado vuelva a cargarse
     REVISITA_MAX = 3,              -- veces que vuelve a un cofre que no reaparece antes de darlo por perdido
+    ESPERA_RECOGIDO = 1.5,         -- segundos esperando confirmar que el cofre ya está en tus manos
+    ENTREGA_REINTENTOS = 3,        -- veces que intenta guardar el cofre que llevas antes de soltarlo
 
     -- PUNTO DE ENTREGA EN EL BARCO
     PUNTO_MODO_INICIAL = "AUTO",   -- "AUTO" = parte alta del centro del barco (como antes), "MANUAL" = el punto que tú fijes
@@ -437,6 +440,9 @@ EX.useGameCounter = svb("useGameCounter", CONFIG.CONTADOR_JUEGO_INICIAL)
 
 -- Recorrer todas las islas del mar elegido (una tras otra) buscando cofres que pasen tus filtros
 EX.sweepMode = svb("sweepMode", false)
+
+-- Cofre que llevas en la mano (se entrega al barco antes de buscar otro)
+EX.carry = nil
 
 -- Posición guardada del panel {xScale, xOffset, yScale, yOffset} y de la burbuja {x, y}
 EX.mainPos = nil
@@ -2288,12 +2294,101 @@ function BS.cycle()
 end
 
 ---------------------------------------------------------------
+-- COFRE EN LA MANO
+--   Al recoger un cofre se confirma que ya está contigo y se guarda en EX.carry.
+--   Mientras EX.carry exista NO se busca ni recoge otro cofre: primero se lleva al barco y se guarda.
+--   Si la bóveda está llena, se vacía y se reintenta. Si el cofre se pierde (muerte, desaparece), se descarta.
+---------------------------------------------------------------
+
+-- ¿El cofre está contigo ahora (dentro de tu personaje o fuera de la carpeta del tesoro)?
+function EX.isCarried(item)
+    if not item then return false end
+    local char = LocalPlayer.Character
+    if char and item:IsDescendantOf(char) then return true end
+    local treasure = getTreasureFolder()
+    return item.Parent ~= nil and item.Parent ~= treasure
+end
+
+-- Espera a que el juego confirme que el cofre ya está contigo
+function EX.waitPicked(item)
+    local t0 = os.clock()
+    while os.clock() - t0 < CONFIG.ESPERA_RECOGIDO and not closed do
+        if EX.isCarried(item) then return true end
+        task.wait(0.1)
+    end
+    return EX.isCarried(item)
+end
+
+-- Intenta guardar el cofre que llevas. Devuelve "ok" | "vault" (bóveda llena) | "lost" (ya no lo tienes) | "fail"
+function EX.deliverCarried(dest)
+    local carry = EX.carry
+    if not EX.isCarried(carry.item) then
+        return "lost"
+    end
+    if usedSpaceOn(dest) + carry.size > EX.capFor(dest) then
+        return "vault"
+    end
+    setStatus("Llevando " .. carry.item.Name .. " al barco...")
+    if storeOnBoat(usedSpaceOn(dest), dest) then
+        return "ok"
+    end
+    return "fail"
+end
+
+-- Entrega el cofre que llevas ANTES de hacer cualquier otra cosa. Devuelve false si no se pudo.
+function EX.deliverPending(dest, destIsMine, entry)
+    local tries = 0
+    while EX.carry and not closed do
+        if not dest.Parent then
+            dest = getDestinationShip()
+            if not dest then return false end
+        end
+
+        local res = EX.deliverCarried(dest)
+        if res == "ok" then
+            local carry = EX.carry
+            EX.carry = nil
+            carry.rec.done = true
+            collectedCount += 1
+            waitOnShip()
+            if returnToSpot and carry.returnCF then
+                setStatus("Volviendo a tu posición...")
+                teleportToCFrame(carry.returnCF)
+                if entry then hoverHere() end
+            end
+        elseif res == "lost" then
+            dbg("Cofre perdido de la mano:", EX.carry.item.Name)
+            EX.carry.rec.done = true
+            EX.carry = nil
+        elseif res == "vault" then
+            tries += 1
+            if not destIsMine or tries > 5 then
+                setStatus("No hay espacio para " .. EX.carry.item.Name)
+                return false
+            end
+            openVault()
+        else
+            EX.carry.fails += 1
+            dbg("No se guardó el cofre en mano, intento", EX.carry.fails)
+            if EX.carry.fails >= CONFIG.ENTREGA_REINTENTOS then
+                setStatus("Soltado " .. EX.carry.item.Name .. ": no se pudo guardar")
+                EX.carry.rec.done = true
+                EX.carry = nil
+                return false
+            end
+        end
+    end
+    return EX.carry == nil
+end
+
+---------------------------------------------------------------
 -- RECOLECCIÓN COMPLETA POR ÁREA (isla o mapa entero)
 --   No se pasa a otra isla hasta que no queda ningún cofre que cumpla tus filtros en la actual.
 --   1) Recoge los cofres cargados que estén en el área (el más cercano primero).
 --   2) Los que se descargan al alejarte se RECUERDAN (nombre + posición) y se vuelve a por ellos.
 --   3) Antes de dar el área por terminada, pide al juego que cargue la zona entera y vuelve a mirar.
 --   4) Si la bóveda se llena, la vacía y vuelve al área donde estaba.
+--   5) Si llevas un cofre en la mano, lo entrega antes de buscar otro.
 ---------------------------------------------------------------
 -- Busca un registro ya conocido con el mismo nombre y casi la misma posición
 function EX.findRecord(records, name, pos)
@@ -2356,6 +2451,11 @@ function EX.collectArea(entry)
     end
     local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
 
+    -- Si llevas un cofre de antes, lo entregas primero (antes de ir a ninguna isla)
+    if EX.carry then
+        if not EX.deliverPending(dest, destIsMine, entry) then return end
+    end
+
     local island
     if entry then
         island = CB.prepareIsland(entry)
@@ -2376,7 +2476,7 @@ function EX.collectArea(entry)
     local records = {}
     local vaultTries = 0
     local streamed = false
-    local collectedHere = 0
+    local startCount = collectedCount
     local t0 = os.clock()
 
     while auto and not closed and os.clock() - t0 < CONFIG.AREA_TIMEOUT do
@@ -2384,6 +2484,14 @@ function EX.collectArea(entry)
             dest = getDestinationShip()
             if not dest then break end
         end
+
+        -- 0) Llevas un cofre: primero se entrega, luego se vuelve al área
+        if EX.carry then
+            if not EX.deliverPending(dest, destIsMine, entry) then break end
+            if entry then island = CB.prepareIsland(entry) or island end
+            streamed = false
+        end
+
         local cap = EX.capFor(dest)
 
         -- 1) Cofres cargados ahora que están en el área y cumplen filtros
@@ -2430,7 +2538,6 @@ function EX.collectArea(entry)
                         break
                     end
                     openVault()
-                    -- Vuelve al área donde estaba y sigue recogiendo
                     if entry then
                         island = CB.prepareIsland(entry) or island
                     end
@@ -2440,26 +2547,17 @@ function EX.collectArea(entry)
                 end
 
             else
+                -- 3) Recoge el cofre y lo deja en la mano. En el siguiente paso se entrega (no se busca otro antes)
                 setStatus(string.format("Recogiendo %s en %s (espacio %d)", c.item.Name, areaName, size))
                 local root0 = getRoot()
                 local returnCF = returnToSpot and root0 and root0.CFrame or nil
-                local usedBefore = usedSpaceOn(dest)
 
                 pickUpChest(c.base, c.prompt, entry and CONFIG.ALTURA_ISLA or CONFIG.ALTURA, true)
                 setHover(false)
 
-                local picked = c.item.Parent ~= treasure
-                if picked then
-                    if storeOnBoat(usedBefore, dest) then
-                        c.rec.done = true
-                        collectedCount += 1
-                        collectedHere += 1
-                        streamed = false   -- hubo progreso: vuelve a comprobar la zona al final
-                        waitOnShip()
-                    else
-                        c.rec.done = true  -- ya recogido pero no guardado: no se reintenta
-                        dbg("Cofre recogido pero no guardado:", c.item.Name)
-                    end
+                if EX.waitPicked(c.item) then
+                    EX.carry = { item = c.item, rec = c.rec, size = size, returnCF = returnCF, fails = 0 }
+                    setStatus("Cofre en mano: " .. c.item.Name .. ", llevándolo al barco")
                 else
                     c.rec.fails += 1
                     dbg("No se pudo recoger:", c.item.Name, "intento", c.rec.fails)
@@ -2467,16 +2565,10 @@ function EX.collectArea(entry)
                         c.rec.done = true
                     end
                 end
-
-                if returnToSpot and returnCF then
-                    setStatus("Volviendo a tu posición...")
-                    teleportToCFrame(returnCF)
-                    if entry then hoverHere() end
-                end
             end
 
         elseif #pending > 0 then
-            -- 3) Cofres descargados: vuelve al más cercano para que el juego lo vuelva a cargar
+            -- 4) Cofres descargados: vuelve al más cercano para que el juego lo vuelva a cargar
             local best, bestDist
             for _, r in ipairs(pending) do
                 if r.revisits < CONFIG.REVISITA_MAX then
@@ -2517,7 +2609,7 @@ function EX.collectArea(entry)
             end
 
         else
-            -- 4) No queda nada visible ni recordado: pide carga de la zona una vez más antes de dar por terminado
+            -- 5) No queda nada visible ni recordado: pide carga de la zona una vez más antes de dar por terminado
             if not streamed then
                 streamed = true
                 setStatus("Buscando más cofres en " .. areaName .. "...")
@@ -2529,7 +2621,13 @@ function EX.collectArea(entry)
         end
     end
 
+    -- No dejes el área con un cofre en la mano sin intentar entregarlo
+    if EX.carry and not closed and dest and dest.Parent then
+        EX.deliverPending(dest, destIsMine, entry)
+    end
+
     setHover(false)
+    local collectedHere = collectedCount - startCount
     if collectedHere > 0 then
         setStatus(string.format("%s: %d cofre(s) recogidos", areaName, collectedHere))
     elseif auto then
