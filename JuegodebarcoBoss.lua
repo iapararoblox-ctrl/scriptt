@@ -3,6 +3,8 @@
 -- + RECORRIDO DE TODAS LAS ISLAS DE UN MAR + RAREZA "Secret" (el filtro incluye la elegida y las superiores)
 -- + PUNTO MANUAL DEL TESORERO (para vaciar la bóveda) + VALIDACIÓN Y DIAGNÓSTICO DE TAMAÑOS DE COFRES
 -- + AUTO FARM DE JEFES (detección de muerte por HP, barra de vida y loot cofre por cofre)
+-- + JEFES DE EVENTO (isla aleatoria en World.Events, sin mar fijo)
+-- + RECOLECCIÓN COMPLETA POR ÁREA (no se salta cofres: recuerda los descargados y vuelve por ellos)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -12,7 +14,7 @@ local LocalPlayer = Players.LocalPlayer
 
 -- Todo el combate vive en esta tabla para no pasar el límite de 200 variables locales
 local CB = {}
--- Punto de entrega, tesorero, tamaños y posiciones de la UI viven aquí por el mismo motivo
+-- Punto de entrega, tesorero, tamaños, recolección y posiciones de la UI viven aquí por el mismo motivo
 local EX = {}
 -- Auto farm de jefes (bosses) y su loot
 local BS = {}
@@ -123,7 +125,8 @@ local ISLAND_GROUPS = {
 ---------------------------------------------------------------
 -- JEFES (BOSSES)
 --   nombre = nombre que se muestra y con el que se guarda tu selección
---   mar / isla = nombres EN INGLÉS de la lista de mares e islas de arriba
+--   mar / isla = nombres EN INGLÉS de la lista de mares e islas de arriba (jefes de isla fija)
+--   evento = true -> el jefe aparece en un evento: su isla es aleatoria (ver EVENT_ISLAND), no tiene mar fijo
 --   ruta = dónde está el modelo del jefe, empezando desde Workspace
 --   parte = parte del cuerpo a la que te pegas. Se escribe como ruta con puntos
 --           ("Head.Body" = dentro de Head, la parte Body). Si no la encuentra, busca por nombre en todo el jefe.
@@ -149,6 +152,12 @@ BS.LIST = {
         isla = "AbyssGate",
         ruta = { "World", "Dynamic", "Bosses", "Boss_Poseidon" },
         parte = "Body.CrownedHead", -- dentro del folder Body hay una parte llamada CrownedHead
+    },
+    {
+        nombre = "Rey de los piratas",
+        evento = true,
+        ruta = { "World", "Dynamic", "Bosses", "Boss_PirateKing" },
+        parte = "Head",
     },
 }
 
@@ -184,6 +193,12 @@ local CONFIG = {
     NOMBRE_BARCO_MANUAL = "",
     ABRIR_RAPIDO = true,
     TAMANO_POR_DEFECTO = 1,
+
+    -- RECOLECCIÓN COMPLETA POR ÁREA
+    AREA_TIMEOUT = 900,            -- segundos máximos recogiendo una isla (o el mapa) de una vez
+    ESPERA_STREAM_AREA = 2,        -- segundos esperando que el juego cargue la isla entera
+    REVISITA_ESPERA = 3,           -- segundos esperando que un cofre descargado vuelva a cargarse
+    REVISITA_MAX = 3,              -- veces que vuelve a un cofre que no reaparece antes de darlo por perdido
 
     -- PUNTO DE ENTREGA EN EL BARCO
     PUNTO_MODO_INICIAL = "AUTO",   -- "AUTO" = parte alta del centro del barco (como antes), "MANUAL" = el punto que tú fijes
@@ -237,6 +252,10 @@ local CONFIG = {
     JEFE_LOOT_REINTENTOS = 3,          -- intentos de guardar un cofre antes de descartarlo
     JEFE_LOOT_TIMEOUT = 240,           -- segundos máximos recogiendo el loot de un jefe
 
+    -- JEFES DE EVENTO
+    EVENTO_ISLA_NOMBRE = "Eventlsand_E11", -- nombre exacto de la isla del evento dentro de World.Events (cámbialo si en el juego se llama distinto)
+    EVENTO_CARPETA = { "World", "Events" }, -- carpeta donde aparece la isla del evento
+
     PANEL_ANCHO_INICIAL = 280,
     PANEL_ALTO_INICIAL = 440,
     PANEL_MIN_ANCHO = 50,
@@ -250,6 +269,19 @@ local CONFIG = {
 
     CONFIG_ARCHIVO = "CofresConfig.json",
     DEBUG = true,
+}
+
+-- Isla de los jefes de evento: no tiene mar fijo, se busca por su ruta en World.Events
+local EVENT_ISLAND = {
+    en = CONFIG.EVENTO_ISLA_NOMBRE,
+    es = "Isla del evento",
+    names = { CONFIG.EVENTO_ISLA_NOMBRE },
+    path = (function()
+        local p = {}
+        for _, s in ipairs(CONFIG.EVENTO_CARPETA) do table.insert(p, s) end
+        table.insert(p, CONFIG.EVENTO_ISLA_NOMBRE)
+        return p
+    end)(),
 }
 
 local BASE_W, BASE_H = 300, 470
@@ -693,6 +725,19 @@ local function isModelOrPart(obj)
 end
 
 local function getIsland(entry)
+    -- Isla con ruta directa (jefes de evento): se busca por su ruta, no por nombre ni por mar
+    if entry.path then
+        local cur = Workspace
+        for _, step in ipairs(entry.path) do
+            cur = cur and cur:FindFirstChild(step)
+            if not cur then return nil end
+        end
+        if isModelOrPart(cur) then
+            return cur
+        end
+        return cur:FindFirstChildWhichIsA("Model") or cur:FindFirstChildWhichIsA("BasePart", true)
+    end
+
     local key = entry.en
     local cached = islandCache[key]
     if cached and cached.Parent then
@@ -1742,6 +1787,8 @@ end
 ---------------------------------------------------------------
 -- JEFES (BOSSES): AUTO FARM
 --   1) Va a la isla del jefe que marcaste y espera a que cargue.
+--      Los jefes de evento no tienen isla fija: su isla está en World.Events y aparece en un mar aleatorio.
+--      Si el evento no está activo, el script no se mueve y vuelve a revisar más tarde.
 --   2) Se PEGA a la parte del cuerpo indicada (la sigue aunque el jefe se mueva o gire) y golpea
 --      automáticamente (o solo se pega, si eliges golpear tú).
 --   3) MUERTE: el jefe está muerto cuando su propiedad HP (CONFIG.JEFE_PROP_VIDA) llega a 0.
@@ -1751,6 +1798,9 @@ end
 ---------------------------------------------------------------
 -- Busca la entrada de isla (y su mar) de un jefe
 function BS.islandEntry(boss)
+    if boss.evento then
+        return EVENT_ISLAND, nil
+    end
     for _, group in ipairs(ISLAND_GROUPS) do
         if group.en == boss.mar then
             for _, entry in ipairs(group.islas) do
@@ -2188,6 +2238,9 @@ function BS.cycle()
                     local entry = BS.islandEntry(boss)
                     if not entry then
                         setStatus("No encuentro la isla de " .. boss.nombre)
+                    elseif boss.evento and not getIsland(entry) then
+                        -- Evento no activo: la isla no aparece en World.Events, no nos movemos
+                        setStatus(boss.nombre .. ": el evento aún no está activo")
                     else
                         setStatus("Buscando a " .. boss.nombre .. "...")
                         local island = CB.prepareIsland(entry)
@@ -2223,7 +2276,11 @@ function BS.cycle()
                     BS.nextCheck[boss.nombre] = os.clock() + BS.recheck
                 else
                     BS.nextCheck[boss.nombre] = os.clock() + BS.recheck
-                    setStatus(boss.nombre .. " no está ahora (reviso en " .. BS.recheck .. " s)")
+                    if not boss.evento or not getIsland(BS.islandEntry(boss)) then
+                        -- ya se mostró el mensaje de evento no activo arriba
+                    else
+                        setStatus(boss.nombre .. " no está ahora (reviso en " .. BS.recheck .. " s)")
+                    end
                 end
             end
         end
@@ -2231,9 +2288,61 @@ function BS.cycle()
 end
 
 ---------------------------------------------------------------
--- CICLO
+-- RECOLECCIÓN COMPLETA POR ÁREA (isla o mapa entero)
+--   No se pasa a otra isla hasta que no queda ningún cofre que cumpla tus filtros en la actual.
+--   1) Recoge los cofres cargados que estén en el área (el más cercano primero).
+--   2) Los que se descargan al alejarte se RECUERDAN (nombre + posición) y se vuelve a por ellos.
+--   3) Antes de dar el área por terminada, pide al juego que cargue la zona entera y vuelve a mirar.
+--   4) Si la bóveda se llena, la vacía y vuelve al área donde estaba.
 ---------------------------------------------------------------
-local function collectCycle(entryOverride)
+-- Busca un registro ya conocido con el mismo nombre y casi la misma posición
+function EX.findRecord(records, name, pos)
+    for _, r in ipairs(records) do
+        if r.name == name and (r.pos - pos).Magnitude < 6 then
+            return r
+        end
+    end
+    return nil
+end
+
+-- Parte base y prompt de un cofre normal (Base > PromptAttachment > TreasurePrompt)
+function EX.chestPromptOf(item)
+    local base = item:FindFirstChild("Base")
+    local attach = base and base:FindFirstChild("PromptAttachment")
+    local prompt = attach and attach:FindFirstChild("TreasurePrompt")
+    if base and base:IsA("BasePart") and prompt and prompt:IsA("ProximityPrompt") then
+        return base, prompt
+    end
+    return nil, nil
+end
+
+-- Pide al juego que cargue la zona: la isla entera, o alrededor del jugador si es todo el mapa
+function EX.streamArea(island)
+    local center, radius
+    if island then
+        if island:IsA("Model") then
+            local cf, size = island:GetBoundingBox()
+            center = cf.Position
+            radius = math.max(size.X, size.Z) / 2 + 20
+        else
+            center = island.Position
+            radius = math.max(island.Size.X, island.Size.Z) / 2 + 20
+        end
+    else
+        local root = getRoot()
+        center = root and root.Position or Vector3.zero
+        radius = 300
+    end
+    radius = math.min(radius, 500)
+    task.spawn(function()
+        pcall(function()
+            LocalPlayer:RequestStreamAroundAsync(center, radius)
+        end)
+    end)
+end
+
+-- Recoge TODOS los cofres de un área que pasen tus filtros (entry = isla, o nil = todo el mapa)
+function EX.collectArea(entry)
     local treasure = getTreasureFolder()
     if not treasure then
         setStatus("No encuentro World.Dynamic.Treasure")
@@ -2242,114 +2351,212 @@ local function collectCycle(entryOverride)
 
     local dest = getDestinationShip()
     if not dest then
-        if targetLabel ~= MINE_LABEL then
-            setStatus("No encuentro el barco de " .. targetLabel)
-        else
-            setStatus("No encuentro tu barco")
-        end
+        setStatus(targetLabel ~= MINE_LABEL and ("No encuentro el barco de " .. targetLabel) or "No encuentro tu barco")
         return
     end
     local destIsMine = (targetLabel == MINE_LABEL or targetLabel == "")
-    local cap = EX.capFor(dest)
-
-    if usedSpaceOn(dest) >= cap then
-        if destIsMine then
-            openVault()
-        else
-            setStatus("El barco de " .. targetLabel .. " está lleno")
-        end
-        return
-    end
 
     local island
-    local useIsland = islandMode or entryOverride ~= nil
-    local islandLabel = islandDisplayName(entryOverride or currentIslandEntry())
-    if useIsland then
-        island = CB.prepareIsland(entryOverride)
+    if entry then
+        island = CB.prepareIsland(entry)
         if not island then return end
     end
+    local areaName = entry and islandDisplayName(entry) or "el mapa"
 
-    local seen, inside, passed = 0, 0, 0
+    local function inArea(pos)
+        return (not island) or isInsideIsland(island, pos)
+    end
 
-    for _, item in ipairs(treasure:GetChildren()) do
-        if closed or not auto then return end
+    -- Bóveda llena al empezar: vacíala antes de nada
+    if destIsMine and usedSpaceOn(dest) >= EX.capFor(dest) then
+        openVault()
+        if entry then island = CB.prepareIsland(entry) or island end
+    end
 
-        local base = item:FindFirstChild("Base")
-        local attach = base and base:FindFirstChild("PromptAttachment")
-        local prompt = attach and attach:FindFirstChild("TreasurePrompt")
+    local records = {}
+    local vaultTries = 0
+    local streamed = false
+    local collectedHere = 0
+    local t0 = os.clock()
 
-        local inIsland = (not island) or (base ~= nil and isInsideIsland(island, base.Position))
-        seen = seen + 1
-        if base and inIsland then inside = inside + 1 end
+    while auto and not closed and os.clock() - t0 < CONFIG.AREA_TIMEOUT do
+        if not dest.Parent then
+            dest = getDestinationShip()
+            if not dest then break end
+        end
+        local cap = EX.capFor(dest)
 
-        if base and prompt and prompt:IsA("ProximityPrompt")
-            and inIsland
-            and passesOwnerFilter(item)
-            and passesValueRarity(item) then
-
-            -- Si el barco de otro jugador se descargó, vuelve a cargarlo
-            if not dest.Parent then
-                dest = getDestinationShip()
-                if not dest then return end
-                cap = EX.capFor(dest)
+        -- 1) Cofres cargados ahora que están en el área y cumplen filtros
+        local visible = {}
+        for _, item in ipairs(treasure:GetChildren()) do
+            local base, prompt = EX.chestPromptOf(item)
+            if base and inArea(base.Position) then
+                local rec = EX.findRecord(records, item.Name, base.Position)
+                if not rec and passesOwnerFilter(item) and passesValueRarity(item) then
+                    rec = { name = item.Name, pos = base.Position, done = false, fails = 0, revisits = 0 }
+                    table.insert(records, rec)
+                end
+                if rec and not rec.done then
+                    table.insert(visible, { rec = rec, item = item, base = base, prompt = prompt })
+                end
             end
+        end
 
-            passed = passed + 1
-            local size = getCargoSize(item)
+        -- 2) Registros pendientes que ahora mismo no están cargados
+        local pending = {}
+        for _, r in ipairs(records) do
+            if not r.done then table.insert(pending, r) end
+        end
+
+        local root = getRoot()
+        local myPos = root and root.Position or Vector3.zero
+
+        if #visible > 0 then
+            table.sort(visible, function(a, b)
+                return (a.base.Position - myPos).Magnitude < (b.base.Position - myPos).Magnitude
+            end)
+            local c = visible[1]
+            local size = getCargoSize(c.item)
 
             if size > cap then
-                setStatus("Cofre más grande que la bóveda, lo salto")
-            else
-                if usedSpaceOn(dest) + size > cap then
-                    if destIsMine then
-                        openVault()
-                    else
-                        setStatus("El barco de " .. targetLabel .. " no tiene espacio")
+                dbg("Cofre más grande que la bóveda, lo salto:", c.item.Name)
+                c.rec.done = true
+
+            elseif usedSpaceOn(dest) + size > cap then
+                if destIsMine then
+                    vaultTries += 1
+                    if vaultTries > 5 then
+                        setStatus("No se pudo vaciar la bóveda: me detengo en " .. areaName)
+                        break
                     end
-                    return
+                    openVault()
+                    -- Vuelve al área donde estaba y sigue recogiendo
+                    if entry then
+                        island = CB.prepareIsland(entry) or island
+                    end
+                else
+                    setStatus("El barco de " .. targetLabel .. " no tiene espacio")
+                    break
                 end
 
-                local root = getRoot()
-                local returnCF = root and root.CFrame
-
-                setStatus("Recogiendo cofre (espacio " .. size .. ")...")
+            else
+                setStatus(string.format("Recogiendo %s en %s (espacio %d)", c.item.Name, areaName, size))
+                local root0 = getRoot()
+                local returnCF = returnToSpot and root0 and root0.CFrame or nil
                 local usedBefore = usedSpaceOn(dest)
-                pickUpChest(base, prompt, useIsland and CONFIG.ALTURA_ISLA or nil, useIsland)
-                collectedCount += 1
 
+                pickUpChest(c.base, c.prompt, entry and CONFIG.ALTURA_ISLA or CONFIG.ALTURA, true)
                 setHover(false)
-                if storeOnBoat(usedBefore, dest) then
-                    waitOnShip()
+
+                local picked = c.item.Parent ~= treasure
+                if picked then
+                    if storeOnBoat(usedBefore, dest) then
+                        c.rec.done = true
+                        collectedCount += 1
+                        collectedHere += 1
+                        streamed = false   -- hubo progreso: vuelve a comprobar la zona al final
+                        waitOnShip()
+                    else
+                        c.rec.done = true  -- ya recogido pero no guardado: no se reintenta
+                        dbg("Cofre recogido pero no guardado:", c.item.Name)
+                    end
+                else
+                    c.rec.fails += 1
+                    dbg("No se pudo recoger:", c.item.Name, "intento", c.rec.fails)
+                    if c.rec.fails >= 3 then
+                        c.rec.done = true
+                    end
                 end
 
                 if returnToSpot and returnCF then
                     setStatus("Volviendo a tu posición...")
                     teleportToCFrame(returnCF)
-                    if useIsland then hoverHere() end
+                    if entry then hoverHere() end
                 end
+            end
+
+        elseif #pending > 0 then
+            -- 3) Cofres descargados: vuelve al más cercano para que el juego lo vuelva a cargar
+            local best, bestDist
+            for _, r in ipairs(pending) do
+                if r.revisits < CONFIG.REVISITA_MAX then
+                    local d = (r.pos - myPos).Magnitude
+                    if not bestDist or d < bestDist then
+                        best, bestDist = r, d
+                    end
+                end
+            end
+
+            if not best then
+                -- Ninguno vuelve a aparecer tras varios intentos: se dan por perdidos
+                for _, r in ipairs(pending) do
+                    dbg("Cofre que no vuelve a aparecer, lo dejo:", r.name)
+                    r.done = true
+                end
+            else
+                best.revisits += 1
+                setStatus(string.format("Volviendo a un cofre de %s (%d pendientes)", areaName, #pending))
+                setHover(false)
+                teleportTo(best.pos + Vector3.new(0, CONFIG.ALTURA + 2, 0))
+                setHover(true)
+                EX.streamArea(island)
+
+                local waitEnd = os.clock() + CONFIG.REVISITA_ESPERA
+                while os.clock() < waitEnd and auto and not closed do
+                    local found = false
+                    for _, item in ipairs(treasure:GetChildren()) do
+                        local b = EX.chestPromptOf(item)
+                        if b and (b.Position - best.pos).Magnitude < 6 then
+                            found = true
+                            break
+                        end
+                    end
+                    if found then break end
+                    task.wait(0.25)
+                end
+            end
+
+        else
+            -- 4) No queda nada visible ni recordado: pide carga de la zona una vez más antes de dar por terminado
+            if not streamed then
+                streamed = true
+                setStatus("Buscando más cofres en " .. areaName .. "...")
+                EX.streamArea(island)
+                task.wait(CONFIG.ESPERA_STREAM_AREA)
+            else
+                break
             end
         end
     end
 
-    if auto then
-        if useIsland then
-            setStatus(string.format("%s: %d cofres en el mapa, %d en la isla, %d válidos con tus filtros",
-                islandLabel, seen, inside, passed))
-        else
-            setStatus("Buscando cofres...")
-        end
+    setHover(false)
+    if collectedHere > 0 then
+        setStatus(string.format("%s: %d cofre(s) recogidos", areaName, collectedHere))
+    elseif auto then
+        setStatus(string.format("%s: sin cofres que pasen tus filtros", areaName))
     end
 end
 
--- Recorre TODAS las islas del mar elegido: va a cada una, recoge los cofres que pasen
--- tus filtros (rareza, valor, dueño) y sigue con la siguiente. Al terminar, el ciclo principal repite.
+---------------------------------------------------------------
+-- CICLO
+---------------------------------------------------------------
+local function collectCycle(entryOverride)
+    local entry = entryOverride
+    if not entry and islandMode then
+        entry = currentIslandEntry()
+    end
+    EX.collectArea(entry)
+end
+
+-- Recorre TODAS las islas del mar elegido: en cada una recoge TODOS los cofres que pasen
+-- tus filtros antes de pasar a la siguiente. Al terminar, el ciclo principal repite.
 function EX.sweepCycle()
     local group = ISLAND_GROUPS[diffIndex]
     for i, entry in ipairs(group.islas) do
         if closed or not auto then return end
         setStatus(string.format("Recorriendo %s: isla %d/%d (%s)",
             seaDisplayName(group), i, #group.islas, islandDisplayName(entry)))
-        collectCycle(entry)
+        EX.collectArea(entry)
     end
 end
 
@@ -3179,9 +3386,9 @@ CB.combatNote.TextWrapped = true
 CB.combatNote.TextYAlignment = Enum.TextYAlignment.Top
 
 ---------------------------------------------------------------
--- PESTAÑA JEFES (AUTO FARM) - diseño nuevo
+-- PESTAÑA JEFES (AUTO FARM)
 --   Cabecera con interruptor y barra de vida del jefe en pelea
---   Una tarjeta por jefe con su estado en vivo (vivo / peleando / derrotado / no está)
+--   Una tarjeta por jefe con su estado en vivo (vivo / peleando / derrotado / no está / evento no activo)
 --   Secciones: JEFES, GOLPE Y POSICIÓN, LOOT
 ---------------------------------------------------------------
 local function sectionLabel(parent, text, order)
@@ -3291,9 +3498,15 @@ local function bossCard(parent, boss, order)
 
         local stateText, stateColor = BS.stateOf(boss)
         dot.BackgroundColor3 = stateColor
-        local entry, group = BS.islandEntry(boss)
-        local sea = group and seaDisplayName(group) or boss.mar
-        local isl = entry and islandDisplayName(entry) or boss.isla
+        local sea, isl
+        if boss.evento then
+            sea = "Evento"
+            isl = "isla aleatoria"
+        else
+            local entry, group = BS.islandEntry(boss)
+            sea = group and seaDisplayName(group) or boss.mar
+            isl = entry and islandDisplayName(entry) or boss.isla
+        end
         subLbl.Text = sea .. " · " .. isl .. " · " .. stateText
     end
 
@@ -3327,6 +3540,9 @@ function BS.stateOf(boss)
     end
     if BS.alive(m) then
         return "vivo", PALETTE.green
+    end
+    if boss.evento and not getIsland(EVENT_ISLAND) then
+        return "evento no activo", PALETTE.muted
     end
     if BS.nextCheck[boss.nombre] then
         return "no está ahora", PALETTE.muted
@@ -3638,9 +3854,9 @@ refreshUI = function()
     islandRow.refresh()
     if EX.sweepMode then
         islandNote.Text = "Recorrerá las " .. #ISLAND_GROUPS[diffIndex].islas .. " islas de "
-            .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. " una por una y recogerá los cofres que pasen tus filtros (pestaña Filtros). Tiene prioridad sobre «Recolectar por isla»."
+            .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. " una por una y en cada una recogerá TODOS los cofres que pasen tus filtros (pestaña Filtros) antes de seguir. Tiene prioridad sobre «Recolectar por isla»."
     elseif islandMode then
-        islandNote.Text = "Irá a " .. currentIslandName() .. " (" .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. ") y solo recogerá cofres dentro de esa isla."
+        islandNote.Text = "Irá a " .. currentIslandName() .. " (" .. seaDisplayName(ISLAND_GROUPS[diffIndex]) .. ") y recogerá todos los cofres de esa isla antes de terminar."
     else
         islandNote.Text = "Activa «Recolectar por isla» (una isla) o «Recorrer TODAS las islas» (todo el mar elegido)."
     end
