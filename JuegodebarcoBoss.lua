@@ -138,7 +138,7 @@ BS.LIST = {
         mar = "Ironbound",
         isla = "TheAnvil",
         ruta = { "World", "Dynamic", "Bosses", "Boss_IronTyrant" },
-        parte = "captain",
+        parte = "captain.Head",
     },
     {
         nombre = "Celestial Serpent",
