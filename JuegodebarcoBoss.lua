@@ -157,6 +157,13 @@ BS.LIST = {
         ruta = { "World", "Dynamic", "Bosses", "Boss_Poseidon" },
         parte = "Body.CrownedHead", -- dentro del folder Body hay una parte llamada CrownedHead
     },
+     {
+        nombre = "Leviatan",
+        mar = "DeadMans",
+        isla = "AbyssGate",
+        ruta = { "World", "Dynamic", "Bosses", "Boss_FrostLeviathan" },
+        parte = "Head.Body", -- dentro del folder Body hay una parte llamada CrownedHead
+    },
     {
         nombre = "Rey de los piratas",
         evento = true,
