@@ -163,6 +163,12 @@ BS.LIST = {
         ruta = { "World", "Dynamic", "Bosses", "Boss_PirateKing" },
         parte = "Head",
     },
+     {
+        nombre = "Hallowen Capitan",
+        evento = true,
+        ruta = { "World", "Dynamic", "Bosses", "Boss_HollowCaptain" },
+        parte = "Body",
+    },
 }
 
 ---------------------------------------------------------------
