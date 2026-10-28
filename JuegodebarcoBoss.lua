@@ -124,6 +124,15 @@ local ISLAND_GROUPS = {
         I("HollowmastGraveyard", "Cementerio del Mástil Hueco"),
         I("Seabed", "Lecho Marino"),
     }},
+    { en = "Serpent", es = "Serpiente", islas = {
+        I("CanopyFortress", "Fortaleza del Vergel"),
+        I("CoilstoneTemple", "Templo de Piedra Espiral"),
+        I("EdenHollow", "Cañada del Edén"),
+        I("EmeraldLanding", "Desembarco Esmeralda"),
+        I("Seabed", "Lecho Marino"),
+        I("SerpentsNest", "Nido de Serpientes"),
+        I("VenomrootJungle", "Selva de Raíz Venenosa"),
+    }},
 }
 
 ---------------------------------------------------------------
@@ -162,6 +171,13 @@ BS.LIST = {
         mar = "DeadMans",
         isla = "AbyssGate",
         ruta = { "World", "Dynamic", "Bosses", "Boss_FrostLeviathan" },
+        parte = "Head.Body", -- dentro del folder Body hay una parte llamada CrownedHead
+    },
+    {
+        nombre = "Serpiente",
+        mar = "Serpent",
+        isla = "SerpentsNest",
+        ruta = { "World", "Dynamic", "Bosses", "Boss_AncientSerpent" },
         parte = "Head.Body", -- dentro del folder Body hay una parte llamada CrownedHead
     },
     {
