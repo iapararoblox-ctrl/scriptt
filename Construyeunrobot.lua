@@ -1,4 +1,4 @@
--- MaykDev · Auto Chatarra v2 (LocalScript · móvil)
+-- MaykDev · Auto Chatarra v3 (LocalScript · móvil)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -10,17 +10,20 @@ local LocalPlayer = Players.LocalPlayer
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
+    -- Carpetas donde están las piezas (se escanean todas)
     CARPETAS = {
         { "Client", "Junkyard", "Heaven", "Spawn", "Parts" },
         { "Client", "Junkyard", "Overworld", "Spawn", "Parts" },
-        { "Server", "Junkyard" },
     },
-    -- Orden de prioridad: de mayor a menor valor
+    -- Cualquier objeto cuyo nombre empiece por uno de estos prefijos es chatarra
+    PREFIJOS = { "Junk" },
+    -- Categorías con valor (si la pieza tiene el atributo). El orden es la prioridad.
     CATEGORIAS = {
         { id = "Scrap/Giant",  nombre = "Gigante", color = Color3.fromRGB(240, 110, 90) },
         { id = "Scrap/Big",    nombre = "Grande",  color = Color3.fromRGB(240, 185, 80) },
         { id = "Scrap/Medium", nombre = "Mediana", color = Color3.fromRGB(110, 170, 255) },
         { id = "Scrap/Small",  nombre = "Pequeña", color = Color3.fromRGB(120, 210, 150) },
+        { id = "Sin categoría", nombre = "Sin categoría", color = Color3.fromRGB(140, 146, 170) },
     },
     VELOCIDAD = { ini = 60, min = 20, max = 200, paso = 10 },  -- studs por segundo
     RETRASO   = { ini = 0.5, min = 0.1, max = 3, paso = 0.1 }, -- segundos de espera
@@ -34,6 +37,7 @@ local CONFIG = {
     REMOTE_NOMBRE = "PickUpJunk",
 }
 
+local SIN_CAT = #CONFIG.CATEGORIAS
 local CAT_INDEX = {}
 for i, c in ipairs(CONFIG.CATEGORIAS) do
     CAT_INDEX[c.id] = i
@@ -50,8 +54,8 @@ local S = {
     retraso = CONFIG.RETRASO.ini,
     altura = CONFIG.ALTURA.ini,
     intentos = CONFIG.INTENTOS.ini,
-    catOn = { true, true, true, true },
-    conteo = { 0, 0, 0, 0 },
+    catOn = { true, true, true, true, true },
+    conteo = { 0, 0, 0, 0, 0 },
     visibles = 0,
     cooldown = {},
     recogidas = 0,
@@ -97,6 +101,27 @@ local function getRoot()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
+local function esJunk(name)
+    for _, p in ipairs(CONFIG.PREFIJOS) do
+        if string.sub(name, 1, #p) == p then
+            return true
+        end
+    end
+    return false
+end
+
+-- Evita contar dos veces las partes que están dentro de una pieza Junk
+local function dentroDeOtroJunk(obj, carpeta)
+    local p = obj.Parent
+    while p and p ~= carpeta do
+        if esJunk(p.Name) then
+            return true
+        end
+        p = p.Parent
+    end
+    return false
+end
+
 local function categoriaDeTexto(s)
     local m = string.match((tostring(s):gsub("%s", "")), "Scrap/%a+")
     if m and CAT_INDEX[m] then
@@ -106,34 +131,23 @@ local function categoriaDeTexto(s)
 end
 
 -- Busca "Scrap/..." en atributos y StringValues del objeto y de su padre
-local function buscarCategoria(inst)
-    local cur, n = inst, 0
+local function indiceCategoria(obj)
+    local cur, n = obj, 0
     while cur and n < 2 do
         for _, v in pairs(cur:GetAttributes()) do
             local c = categoriaDeTexto(v)
-            if c then return c end
+            if c then return CAT_INDEX[c] end
         end
         for _, ch in ipairs(cur:GetChildren()) do
             if ch:IsA("StringValue") then
                 local c = categoriaDeTexto(ch.Value)
-                if c then return c end
+                if c then return CAT_INDEX[c] end
             end
         end
         cur = cur.Parent
         n += 1
     end
-    for _, d in ipairs(inst:GetDescendants()) do
-        if d:IsA("StringValue") then
-            local c = categoriaDeTexto(d.Value)
-            if c then return c end
-        end
-    end
-    return nil
-end
-
-local function indiceCategoria(obj)
-    local c = buscarCategoria(obj)
-    return c and CAT_INDEX[c] or nil
+    return SIN_CAT
 end
 
 local function posOf(obj)
@@ -162,18 +176,21 @@ local function redondear(x)
 end
 
 ---------------------------------------------------------------
--- ESCANEO
+-- ESCANEO: todas las piezas Junk, ordenadas por categoría y distancia
 ---------------------------------------------------------------
 local function escanear()
     local root = getRoot()
     local miPos = root and root.Position or Vector3.zero
     local ahora = os.clock()
     local lista, vistos = {}, {}
-    local conteo = { 0, 0, 0, 0 }
+    local conteo = {}
+    for i = 1, SIN_CAT do conteo[i] = 0 end
+    conteo[SIN_CAT] = 0
+
     local remote = obtenerRemote()
     local diag = {
         carpetas = 0, carpetasTotal = #CONFIG.CARPETAS,
-        piezas = 0, conPrompt = 0, sinCategoria = 0,
+        piezas = 0, conPrompt = 0, sinPrompt = 0,
         remote = remote ~= nil, ejemplo = "ninguno",
     }
 
@@ -182,38 +199,42 @@ local function escanear()
         if carpeta then
             diag.carpetas += 1
             for _, obj in ipairs(carpeta:GetDescendants()) do
-                -- Models, o BaseParts sueltas (las partes de un Model no cuentan doble)
-                local valida = obj:IsA("Model")
-                    or (obj:IsA("BasePart") and not (obj.Parent and obj.Parent:IsA("Model")))
-                if valida and not vistos[obj] then
+                local esPieza = (obj:IsA("Model") or obj:IsA("BasePart"))
+                    and esJunk(obj.Name)
+                    and not vistos[obj]
+                    and not dentroDeOtroJunk(obj, carpeta)
+
+                if esPieza then
                     vistos[obj] = true
                     diag.piezas += 1
+                    if diag.ejemplo == "ninguno" then
+                        diag.ejemplo = obj.Name
+                    end
+
                     local idx = indiceCategoria(obj)
-                    if not idx then
-                        diag.sinCategoria += 1
-                        if diag.ejemplo == "ninguno" then
-                            diag.ejemplo = obj.Name
-                        end
+                    conteo[idx] += 1
+
+                    local prompt = promptDe(obj)
+                    if prompt then
+                        diag.conPrompt += 1
                     else
-                        conteo[idx] += 1
-                        local prompt = promptDe(obj)
-                        if prompt then
-                            diag.conPrompt += 1
-                        end
-                        local libre = not S.cooldown[obj] or S.cooldown[obj] <= ahora
-                        if S.catOn[idx] and libre and (prompt or remote) then
-                            table.insert(lista, {
-                                pieza = obj,
-                                idx = idx,
-                                dist = (posOf(obj) - miPos).Magnitude,
-                            })
-                        end
+                        diag.sinPrompt += 1
+                    end
+
+                    local libre = not S.cooldown[obj] or S.cooldown[obj] <= ahora
+                    if S.catOn[idx] and libre and (prompt or remote) then
+                        table.insert(lista, {
+                            pieza = obj,
+                            idx = idx,
+                            dist = (posOf(obj) - miPos).Magnitude,
+                        })
                     end
                 end
             end
         end
     end
 
+    -- Primero las categorizadas (de mayor a menor valor), luego las sin categoría; dentro, la más cercana
     table.sort(lista, function(a, b)
         if a.idx ~= b.idx then
             return a.idx < b.idx
@@ -304,7 +325,7 @@ local function ciclo()
     end
 
     local nombre = CONFIG.CATEGORIAS[obj.idx].nombre
-    S.estado = "Yendo a: " .. nombre
+    S.estado = "Yendo a: " .. obj.pieza.Name .. " (" .. nombre .. ")"
     local destino = posOf(obj.pieza) + Vector3.new(0, S.altura, 0)
 
     if not deslizarA(destino) then
@@ -316,10 +337,10 @@ local function ciclo()
     end
 
     task.wait(S.retraso)
-    S.estado = "Recogiendo: " .. nombre
+    S.estado = "Recogiendo: " .. obj.pieza.Name
     if recoger(obj.pieza) then
         S.recogidas += 1
-        S.estado = "Recogida: " .. nombre
+        S.estado = "Recogida: " .. obj.pieza.Name
         log("Recogida: " .. obj.pieza.Name)
     else
         S.fallos += 1
@@ -346,11 +367,10 @@ end)
 
 -- Prueba manual: va a una sola pieza y la intenta recoger (con el auto apagado)
 local function probar()
-    if S.activo then
+    if S.activo or S.ocupado then
         log("Apaga el auto antes de probar")
         return
     end
-    if S.ocupado then return end
     S.ocupado = true
     local lista = escanear()
     local obj = lista[1]
@@ -461,7 +481,7 @@ local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.fromOffset(320, 430)
+main.Size = UDim2.fromOffset(320, 440)
 main.BackgroundColor3 = C.bg
 main.BorderSizePixel = 0
 main.ClipsDescendants = true
@@ -475,7 +495,7 @@ uiScale.Parent = main
 local function ajustarEscala()
     local cam = Workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-    uiScale.Scale = math.clamp(math.min(vp.X * 0.94 / 320, vp.Y * 0.82 / 430), 0.5, 1)
+    uiScale.Scale = math.clamp(math.min(vp.X * 0.94 / 320, vp.Y * 0.82 / 440), 0.5, 1)
 end
 ajustarEscala()
 if Workspace.CurrentCamera then
@@ -536,7 +556,7 @@ end
 local function nuevaPagina()
     local p = Instance.new("ScrollingFrame")
     p.Position = UDim2.new(0, 10, 0, 94)
-    p.Size = UDim2.new(1, -20, 0, 326)
+    p.Size = UDim2.new(1, -20, 0, 336)
     p.BackgroundTransparency = 1
     p.BorderSizePixel = 0
     p.ScrollBarThickness = 4
@@ -579,7 +599,7 @@ local estadoLbl = label(pagPrincipal, "Listo", 11, C.muted, false)
 estadoLbl.LayoutOrder = 2
 estadoLbl.Size = UDim2.new(1, -4, 0, 20)
 
-local secLbl = label(pagPrincipal, "CATEGORÍAS · de mayor a menor valor", 10, C.muted, true)
+local secLbl = label(pagPrincipal, "PIEZAS · primero las de mayor valor", 10, C.muted, true)
 secLbl.LayoutOrder = 3
 secLbl.Size = UDim2.new(1, -4, 0, 16)
 
@@ -630,7 +650,7 @@ for i, cat in ipairs(CONFIG.CATEGORIAS) do
 end
 
 local statCard = Instance.new("Frame")
-statCard.LayoutOrder = 9
+statCard.LayoutOrder = 20
 statCard.Size = UDim2.new(1, -4, 0, 40)
 statCard.BackgroundColor3 = C.card
 statCard.BorderSizePixel = 0
@@ -765,7 +785,7 @@ local function refrescar()
     estadoLbl.Text = S.estado
 
     for i, f in ipairs(filas) do
-        f.cuenta.Text = tostring(S.conteo[i])
+        f.cuenta.Text = tostring(S.conteo[i] or 0)
         f.box.BackgroundColor3 = S.catOn[i] and C.green or C.track
         f.tick.Visible = S.catOn[i]
     end
@@ -780,16 +800,14 @@ local function refrescar()
     local d = S.diag
     diagLbl.Text = string.format(
         "Carpetas encontradas: %d de %d\n" ..
-        "Piezas revisadas: %d\n" ..
-        "Con categoría: %d · sin categoría: %d\n" ..
-        "Con ProximityPrompt: %d\n" ..
+        "Piezas Junk encontradas: %d\n" ..
+        "Con ProximityPrompt: %d · sin prompt: %d\n" ..
         "Remote %s: %s\n" ..
-        "Ejemplo sin categoría: %s\n\n" ..
+        "Primera pieza: %s\n\n" ..
         "Últimos eventos:\n%s",
         d.carpetas or 0, d.carpetasTotal or #CONFIG.CARPETAS,
         d.piezas or 0,
-        (d.piezas or 0) - (d.sinCategoria or 0), d.sinCategoria or 0,
-        d.conPrompt or 0,
+        d.conPrompt or 0, d.sinPrompt or 0,
         CONFIG.REMOTE_NOMBRE, (d.remote and "encontrado" or "no encontrado"),
         d.ejemplo or "ninguno",
         #S.log > 0 and table.concat(S.log, "\n") or "(sin eventos todavía)"
