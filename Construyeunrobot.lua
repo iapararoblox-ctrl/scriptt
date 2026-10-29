@@ -1,4 +1,4 @@
--- MaykDev · Auto Chatarra v3 (LocalScript · móvil)
+-- MaykDev · Auto Chatarra v4 (LocalScript · móvil)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -10,31 +10,33 @@ local LocalPlayer = Players.LocalPlayer
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
-    -- Carpetas donde están las piezas (se escanean todas)
     CARPETAS = {
         { "Client", "Junkyard", "Heaven", "Spawn", "Parts" },
         { "Client", "Junkyard", "Overworld", "Spawn", "Parts" },
     },
-    -- Cualquier objeto cuyo nombre empiece por uno de estos prefijos es chatarra
+    JUNKYARD = { "Server", "Junkyard" },   -- atributos: nombre de la pieza -> "Scrap/..."
+    PLOTS = { "Client", "Plots" },         -- carpeta con los plots (numerados)
     PREFIJOS = { "Junk" },
-    -- Categorías con valor (si la pieza tiene el atributo). El orden es la prioridad.
     CATEGORIAS = {
-        { id = "Scrap/Giant",  nombre = "Gigante", color = Color3.fromRGB(240, 110, 90) },
-        { id = "Scrap/Big",    nombre = "Grande",  color = Color3.fromRGB(240, 185, 80) },
-        { id = "Scrap/Medium", nombre = "Mediana", color = Color3.fromRGB(110, 170, 255) },
-        { id = "Scrap/Small",  nombre = "Pequeña", color = Color3.fromRGB(120, 210, 150) },
+        { id = "Scrap/Giant",   nombre = "Gigante", color = Color3.fromRGB(240, 110, 90) },
+        { id = "Scrap/Big",     nombre = "Grande",  color = Color3.fromRGB(240, 185, 80) },
+        { id = "Scrap/Medium",  nombre = "Mediana", color = Color3.fromRGB(110, 170, 255) },
+        { id = "Scrap/Small",   nombre = "Pequeña", color = Color3.fromRGB(120, 210, 150) },
         { id = "Sin categoría", nombre = "Sin categoría", color = Color3.fromRGB(140, 146, 170) },
     },
-    VELOCIDAD = { ini = 60, min = 20, max = 200, paso = 10 },  -- studs por segundo
-    RETRASO   = { ini = 0.5, min = 0.1, max = 3, paso = 0.1 }, -- segundos de espera
-    ALTURA    = { ini = 3, min = 0, max = 10, paso = 1 },      -- studs sobre la pieza
-    INTENTOS  = { ini = 2, min = 1, max = 4, paso = 1 },       -- veces que activa el prompt
+    VELOCIDAD     = { ini = 60, min = 20, max = 200, paso = 10 },  -- studs por segundo
+    RETRASO       = { ini = 0.5, min = 0.1, max = 3, paso = 0.1 }, -- segundos de espera
+    ALTURA        = { ini = 3, min = 0, max = 10, paso = 1 },      -- studs sobre la pieza
+    INTENTOS      = { ini = 2, min = 1, max = 4, paso = 1 },       -- veces que activa el prompt
+    MAX_JUNK      = { ini = 20, min = 1, max = 500, paso = 5 },    -- piezas antes de ir al plot
+    ESPERA_PLOT   = { ini = 4, min = 0, max = 30, paso = 1 },      -- segundos en el plot vaciando
     ESPERA_RECOGER = 0.35,
     COOLDOWN_FALLO = 12,
     ESPERA_CICLO = 0.75,
     TIMEOUT_VUELO = 25,
     REMOTE_RUTA = { "Packages", "Net", "Remotes" },
     REMOTE_NOMBRE = "PickUpJunk",
+    PALABRAS_VENTA = { "vend", "sell", "deposit", "guard", "entreg", "deliver" },
 }
 
 local SIN_CAT = #CONFIG.CATEGORIAS
@@ -54,11 +56,15 @@ local S = {
     retraso = CONFIG.RETRASO.ini,
     altura = CONFIG.ALTURA.ini,
     intentos = CONFIG.INTENTOS.ini,
+    maxJunk = CONFIG.MAX_JUNK.ini,
+    esperaPlot = CONFIG.ESPERA_PLOT.ini,
     catOn = { true, true, true, true, true },
     conteo = { 0, 0, 0, 0, 0 },
     visibles = 0,
     cooldown = {},
+    cargados = 0,
     recogidas = 0,
+    vaciados = 0,
     fallos = 0,
     estado = "Listo",
     diag = {},
@@ -110,7 +116,6 @@ local function esJunk(name)
     return false
 end
 
--- Evita contar dos veces las partes que están dentro de una pieza Junk
 local function dentroDeOtroJunk(obj, carpeta)
     local p = obj.Parent
     while p and p ~= carpeta do
@@ -130,24 +135,26 @@ local function categoriaDeTexto(s)
     return nil
 end
 
--- Busca "Scrap/..." en atributos y StringValues del objeto y de su padre
-local function indiceCategoria(obj)
-    local cur, n = obj, 0
-    while cur and n < 2 do
-        for _, v in pairs(cur:GetAttributes()) do
-            local c = categoriaDeTexto(v)
-            if c then return CAT_INDEX[c] end
+-- Lee Workspace.Server.Junkyard: nombre de la pieza -> índice de categoría
+local function leerCategorias()
+    local map = {}
+    local jy = ruta(Workspace, CONFIG.JUNKYARD)
+    if not jy then return map end
+    for k, v in pairs(jy:GetAttributes()) do
+        local c = categoriaDeTexto(v)
+        if c then
+            map[tostring(k)] = CAT_INDEX[c]
         end
-        for _, ch in ipairs(cur:GetChildren()) do
-            if ch:IsA("StringValue") then
-                local c = categoriaDeTexto(ch.Value)
-                if c then return CAT_INDEX[c] end
+    end
+    for _, ch in ipairs(jy:GetChildren()) do
+        if ch:IsA("ValueBase") then
+            local c = categoriaDeTexto(ch.Value)
+            if c then
+                map[ch.Name] = CAT_INDEX[c]
             end
         end
-        cur = cur.Parent
-        n += 1
     end
-    return SIN_CAT
+    return map
 end
 
 local function posOf(obj)
@@ -155,6 +162,17 @@ local function posOf(obj)
         return obj:GetPivot().Position
     end
     return obj.Position
+end
+
+local function posPlot(p)
+    if p:IsA("Model") then
+        return p:GetPivot().Position
+    end
+    if p:IsA("BasePart") then
+        return p.Position
+    end
+    local bp = p:FindFirstChildWhichIsA("BasePart", true)
+    return bp and bp.Position
 end
 
 local function promptDe(obj)
@@ -176,6 +194,59 @@ local function redondear(x)
 end
 
 ---------------------------------------------------------------
+-- PLOT DEL JUGADOR (atributo "Plot" = número)
+---------------------------------------------------------------
+local function buscarPlot()
+    local num = LocalPlayer:GetAttribute("Plot")
+    if num == nil then
+        return nil, "No tienes el atributo Plot"
+    end
+    local n = tostring(num)
+    local carpeta = ruta(Workspace, CONFIG.PLOTS)
+    if not carpeta then
+        return nil, "No encuentro Client.Plots"
+    end
+    for _, ch in ipairs(carpeta:GetChildren()) do
+        if ch.Name == n or ch.Name == "Plot" .. n or ch.Name == "Plot_" .. n or ch.Name == "Plot " .. n then
+            return ch
+        end
+    end
+    for _, ch in ipairs(carpeta:GetChildren()) do
+        for _, k in ipairs({ "Plot", "Number", "Id", "PlotNumber" }) do
+            local v = ch:GetAttribute(k)
+            if v ~= nil and tostring(v) == n then
+                return ch
+            end
+        end
+    end
+    return nil, "No encuentro el plot " .. n
+end
+
+-- Intenta vender/depositar con los prompts del plot que tengan palabras de venta
+local function venderEnPlot(plot)
+    local activados = 0
+    for _, d in ipairs(plot:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local txt = string.lower((d.ActionText or "") .. " " .. (d.ObjectText or ""))
+            for _, p in ipairs(CONFIG.PALABRAS_VENTA) do
+                if string.find(txt, p, 1, true) then
+                    pcall(function()
+                        d.RequiresLineOfSight = false
+                        if d.MaxActivationDistance < 20 then
+                            d.MaxActivationDistance = 20
+                        end
+                    end)
+                    pcall(fireproximityprompt, d)
+                    activados += 1
+                    break
+                end
+            end
+        end
+    end
+    return activados
+end
+
+---------------------------------------------------------------
 -- ESCANEO: todas las piezas Junk, ordenadas por categoría y distancia
 ---------------------------------------------------------------
 local function escanear()
@@ -185,13 +256,14 @@ local function escanear()
     local lista, vistos = {}, {}
     local conteo = {}
     for i = 1, SIN_CAT do conteo[i] = 0 end
-    conteo[SIN_CAT] = 0
 
+    local catMap = leerCategorias()
     local remote = obtenerRemote()
     local diag = {
         carpetas = 0, carpetasTotal = #CONFIG.CARPETAS,
         piezas = 0, conPrompt = 0, sinPrompt = 0,
-        remote = remote ~= nil, ejemplo = "ninguno",
+        categorizadas = 0, remote = remote ~= nil,
+        ejemplo = "ninguno",
     }
 
     for _, cfg in ipairs(CONFIG.CARPETAS) do
@@ -211,7 +283,10 @@ local function escanear()
                         diag.ejemplo = obj.Name
                     end
 
-                    local idx = indiceCategoria(obj)
+                    local idx = catMap[obj.Name] or SIN_CAT
+                    if idx ~= SIN_CAT then
+                        diag.categorizadas += 1
+                    end
                     conteo[idx] += 1
 
                     local prompt = promptDe(obj)
@@ -234,7 +309,6 @@ local function escanear()
         end
     end
 
-    -- Primero las categorizadas (de mayor a menor valor), luego las sin categoría; dentro, la más cercana
     table.sort(lista, function(a, b)
         if a.idx ~= b.idx then
             return a.idx < b.idx
@@ -313,9 +387,53 @@ local function recoger(pieza)
 end
 
 ---------------------------------------------------------------
+-- IR AL PLOT Y VACIAR
+---------------------------------------------------------------
+local function irAPlot()
+    local plot, err = buscarPlot()
+    if not plot then
+        S.estado = err
+        log(err)
+        task.wait(2)
+        return false
+    end
+
+    local pos = posPlot(plot)
+    if not pos then
+        S.estado = "El plot no tiene posición"
+        log("El plot " .. plot.Name .. " no tiene posición")
+        task.wait(2)
+        return false
+    end
+
+    S.estado = "Lleno (" .. S.cargados .. "): yendo a tu plot " .. plot.Name
+    if not deslizarA(pos + Vector3.new(0, S.altura, 0)) then
+        log("No llegué al plot " .. plot.Name)
+        return false
+    end
+
+    local n = venderEnPlot(plot)
+    S.estado = "Vaciando en plot " .. plot.Name .. "..."
+    log("Plot " .. plot.Name .. ": prompts de venta activados: " .. n)
+    task.wait(S.esperaPlot)
+
+    S.cargados = 0
+    S.vaciados += 1
+    S.estado = "Vaciado, volviendo a buscar"
+    return true
+end
+
+---------------------------------------------------------------
 -- CICLO PRINCIPAL
 ---------------------------------------------------------------
 local function ciclo()
+    if S.cargados >= S.maxJunk then
+        if not irAPlot() then
+            task.wait(1)
+        end
+        return
+    end
+
     local lista = escanear()
     local obj = lista[1]
     if not obj then
@@ -340,8 +458,9 @@ local function ciclo()
     S.estado = "Recogiendo: " .. obj.pieza.Name
     if recoger(obj.pieza) then
         S.recogidas += 1
+        S.cargados += 1
         S.estado = "Recogida: " .. obj.pieza.Name
-        log("Recogida: " .. obj.pieza.Name)
+        log("Recogida: " .. obj.pieza.Name .. " (" .. S.cargados .. "/" .. S.maxJunk .. ")")
     else
         S.fallos += 1
         S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_FALLO
@@ -476,7 +595,6 @@ local function makeDraggable(handle, frame)
     return state
 end
 
--- Panel principal (se escala según la pantalla del móvil)
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -502,7 +620,6 @@ if Workspace.CurrentCamera then
     Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(ajustarEscala)
 end
 
--- Cabecera
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 46)
 header.BackgroundColor3 = C.card
@@ -523,7 +640,6 @@ minBtn.Position = UDim2.new(1, -84, 0, 6)
 local closeBtn = btn(header, "✕", UDim2.fromOffset(38, 34), C.red, 13)
 closeBtn.Position = UDim2.new(1, -42, 0, 6)
 
--- Pestañas
 local tabRow = Instance.new("Frame")
 tabRow.Position = UDim2.new(0, 10, 0, 52)
 tabRow.Size = UDim2.new(1, -20, 0, 34)
@@ -698,10 +814,12 @@ local function stepper(orden, nombreTxt, cfg, key, fmt)
     }
 end
 
-stepper(1, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d studs/s", v) end)
-stepper(2, "Retraso", CONFIG.RETRASO, "retraso", function(v) return string.format("%.1f s", v) end)
-stepper(3, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d studs", v) end)
-stepper(4, "Intentos", CONFIG.INTENTOS, "intentos", function(v) return string.format("%d", v) end)
+stepper(1, "Máximo de Junk", CONFIG.MAX_JUNK, "maxJunk", function(v) return string.format("%d piezas", v) end)
+stepper(2, "Espera en plot", CONFIG.ESPERA_PLOT, "esperaPlot", function(v) return string.format("%d s", v) end)
+stepper(3, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d studs/s", v) end)
+stepper(4, "Retraso", CONFIG.RETRASO, "retraso", function(v) return string.format("%.1f s", v) end)
+stepper(5, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d studs", v) end)
+stepper(6, "Intentos", CONFIG.INTENTOS, "intentos", function(v) return string.format("%d", v) end)
 
 ---------------------------------------------------------------
 -- PESTAÑA DIAGNÓSTICO
@@ -790,25 +908,30 @@ local function refrescar()
         f.tick.Visible = S.catOn[i]
     end
 
-    statLbl.Text = string.format("Recogidas %d · Fallos %d · Disponibles %d",
-        S.recogidas, S.fallos, S.visibles)
+    statLbl.Text = string.format("Cargados %d/%d · Recogidas %d · Vaciados %d · Disponibles %d",
+        S.cargados, S.maxJunk, S.recogidas, S.vaciados, S.visibles)
 
     for _, s in ipairs(steppers) do
         s.refresh()
     end
 
+    local plot, errPlot = buscarPlot()
     local d = S.diag
     diagLbl.Text = string.format(
         "Carpetas encontradas: %d de %d\n" ..
         "Piezas Junk encontradas: %d\n" ..
+        "Con categoría (Junkyard): %d\n" ..
         "Con ProximityPrompt: %d · sin prompt: %d\n" ..
         "Remote %s: %s\n" ..
+        "Tu plot: %s\n" ..
         "Primera pieza: %s\n\n" ..
         "Últimos eventos:\n%s",
         d.carpetas or 0, d.carpetasTotal or #CONFIG.CARPETAS,
         d.piezas or 0,
+        d.categorizadas or 0,
         d.conPrompt or 0, d.sinPrompt or 0,
         CONFIG.REMOTE_NOMBRE, (d.remote and "encontrado" or "no encontrado"),
+        plot and plot.Name or (errPlot or "sin datos"),
         d.ejemplo or "ninguno",
         #S.log > 0 and table.concat(S.log, "\n") or "(sin eventos todavía)"
     )
