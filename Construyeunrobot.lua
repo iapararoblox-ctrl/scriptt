@@ -1,4 +1,4 @@
--- MaykDev · Auto Chatarra v4 (LocalScript · móvil)
+-- MaykDev · Auto Chatarra v5 (LocalScript · móvil)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -10,12 +10,14 @@ local LocalPlayer = Players.LocalPlayer
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
-    CARPETAS = {
-        { "Client", "Junkyard", "Heaven", "Spawn", "Parts" },
-        { "Client", "Junkyard", "Overworld", "Spawn", "Parts" },
+    -- Mundos: piezas en Client.Junkyard.<mundo>.Spawn.Parts y robots en Client.Junkyard.fight.<mundo>
+    MUNDOS = {
+        { nombre = "Space",     color = Color3.fromRGB(170, 120, 255) },
+        { nombre = "Heaven",    color = Color3.fromRGB(120, 220, 255) },
+        { nombre = "Overworld", color = Color3.fromRGB(240, 200, 120) },
     },
     JUNKYARD = { "Server", "Junkyard" },   -- atributos: nombre de la pieza -> "Scrap/..."
-    PLOTS = { "Client", "Plots" },         -- carpeta con los plots (numerados)
+    PLOTS = { "Client", "Plots" },
     PREFIJOS = { "Junk" },
     CATEGORIAS = {
         { id = "Scrap/Giant",   nombre = "Gigante", color = Color3.fromRGB(240, 110, 90) },
@@ -24,18 +26,20 @@ local CONFIG = {
         { id = "Scrap/Small",   nombre = "Pequeña", color = Color3.fromRGB(120, 210, 150) },
         { id = "Sin categoría", nombre = "Sin categoría", color = Color3.fromRGB(140, 146, 170) },
     },
-    VELOCIDAD     = { ini = 60, min = 20, max = 200, paso = 10 },  -- studs por segundo
-    RETRASO       = { ini = 0.5, min = 0.1, max = 3, paso = 0.1 }, -- segundos de espera
-    ALTURA        = { ini = 3, min = 0, max = 10, paso = 1 },      -- studs sobre la pieza
-    INTENTOS      = { ini = 2, min = 1, max = 4, paso = 1 },       -- veces que activa el prompt
-    MAX_JUNK      = { ini = 20, min = 1, max = 500, paso = 5 },    -- piezas antes de ir al plot
-    ESPERA_PLOT   = { ini = 4, min = 0, max = 30, paso = 1 },      -- segundos en el plot vaciando
+    VELOCIDAD      = { ini = 60, min = 20, max = 200, paso = 10 },
+    RETRASO        = { ini = 0.5, min = 0.1, max = 3, paso = 0.1 },
+    ALTURA         = { ini = 3, min = 0, max = 10, paso = 1 },
+    INTENTOS       = { ini = 2, min = 1, max = 4, paso = 1 },
+    MAX_JUNK       = { ini = 20, min = 1, max = 500, paso = 5 },
+    ESPERA_PLOT    = { ini = 4, min = 0, max = 30, paso = 1 },
+    PELIGRO        = { ini = 25, min = 8, max = 80, paso = 5 }, -- distancia a robots que activa la huida
     ESPERA_RECOGER = 0.35,
     COOLDOWN_FALLO = 12,
-    ESPERA_CICLO = 0.75,
-    TIMEOUT_VUELO = 25,
-    REMOTE_RUTA = { "Packages", "Net", "Remotes" },
-    REMOTE_NOMBRE = "PickUpJunk",
+    COOLDOWN_PELIGRO = 6,
+    ESPERA_CICLO   = 0.75,
+    TIMEOUT_VUELO  = 25,
+    REMOTE_RUTA    = { "Packages", "Net", "Remotes" },
+    REMOTE_NOMBRE  = "PickUpJunk",
     PALABRAS_VENTA = { "vend", "sell", "deposit", "guard", "entreg", "deliver" },
 }
 
@@ -58,18 +62,28 @@ local S = {
     intentos = CONFIG.INTENTOS.ini,
     maxJunk = CONFIG.MAX_JUNK.ini,
     esperaPlot = CONFIG.ESPERA_PLOT.ini,
+    peligro = CONFIG.PELIGRO.ini,
+    mundoOn = { true, true, true },
     catOn = { true, true, true, true, true },
-    conteo = { 0, 0, 0, 0, 0 },
+    conteo = {},
+    conteoMundo = {},
+    robotsMundo = {},
     visibles = 0,
     cooldown = {},
     cargados = 0,
     recogidas = 0,
     vaciados = 0,
     fallos = 0,
+    huidas = 0,
     estado = "Listo",
     diag = {},
     log = {},
 }
+for i = 1, SIN_CAT do S.conteo[i] = 0 end
+for i = 1, #CONFIG.MUNDOS do
+    S.conteoMundo[i] = 0
+    S.robotsMundo[i] = 0
+end
 
 local C = {
     bg = Color3.fromRGB(16, 18, 26),
@@ -107,6 +121,14 @@ local function getRoot()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
+local function partsFolder(nombreMundo)
+    return ruta(Workspace, { "Client", "Junkyard", nombreMundo, "Spawn", "Parts" })
+end
+
+local function fightFolder(nombreMundo)
+    return ruta(Workspace, { "Client", "Junkyard", "fight", nombreMundo })
+end
+
 local function esJunk(name)
     for _, p in ipairs(CONFIG.PREFIJOS) do
         if string.sub(name, 1, #p) == p then
@@ -116,10 +138,11 @@ local function esJunk(name)
     return false
 end
 
-local function dentroDeOtroJunk(obj, carpeta)
+-- true si el objeto está dentro de otro Model que a su vez está dentro de "carpeta"
+local function dentroDeModelo(obj, carpeta)
     local p = obj.Parent
     while p and p ~= carpeta do
-        if esJunk(p.Name) then
+        if p:IsA("Model") or esJunk(p.Name) then
             return true
         end
         p = p.Parent
@@ -135,7 +158,6 @@ local function categoriaDeTexto(s)
     return nil
 end
 
--- Lee Workspace.Server.Junkyard: nombre de la pieza -> índice de categoría
 local function leerCategorias()
     local map = {}
     local jy = ruta(Workspace, CONFIG.JUNKYARD)
@@ -194,6 +216,58 @@ local function redondear(x)
 end
 
 ---------------------------------------------------------------
+-- ROBOTS (Client.Junkyard.fight.<mundo>)
+---------------------------------------------------------------
+local function obtenerRobots(nombreMundo)
+    local lista = {}
+    local f = fightFolder(nombreMundo)
+    if not f then return lista end
+    for _, obj in ipairs(f:GetDescendants()) do
+        if (obj:IsA("Model") or obj:IsA("BasePart")) and not dentroDeModelo(obj, f) then
+            table.insert(lista, obj)
+        end
+    end
+    return lista
+end
+
+-- Cache por mundo para no recorrer la carpeta en cada frame
+local cacheRobots = {}
+local function robotsDe(nombresMundo)
+    local ahora = os.clock()
+    local todos = {}
+    for _, w in ipairs(nombresMundo) do
+        local c = cacheRobots[w]
+        if not c or ahora - c.t > 0.3 then
+            c = { t = ahora, lista = obtenerRobots(w) }
+            cacheRobots[w] = c
+        end
+        for _, r in ipairs(c.lista) do
+            table.insert(todos, r)
+        end
+    end
+    return todos
+end
+
+local function robotVivo(r)
+    local h = r:FindFirstChildWhichIsA("Humanoid", true)
+    return not (h and h.Health <= 0)
+end
+
+-- Devuelve el robot vivo más cercano que esté dentro del radio de peligro, o nil
+local function amenaza(pos, robots)
+    local best, bd
+    for _, r in ipairs(robots) do
+        if r.Parent and robotVivo(r) then
+            local d = (posOf(r) - pos).Magnitude
+            if d < S.peligro and (not bd or d < bd) then
+                best, bd = r, d
+            end
+        end
+    end
+    return best
+end
+
+---------------------------------------------------------------
 -- PLOT DEL JUGADOR (atributo "Plot" = número)
 ---------------------------------------------------------------
 local function buscarPlot()
@@ -222,7 +296,6 @@ local function buscarPlot()
     return nil, "No encuentro el plot " .. n
 end
 
--- Intenta vender/depositar con los prompts del plot que tengan palabras de venta
 local function venderEnPlot(plot)
     local activados = 0
     for _, d in ipairs(plot:GetDescendants()) do
@@ -247,34 +320,38 @@ local function venderEnPlot(plot)
 end
 
 ---------------------------------------------------------------
--- ESCANEO: todas las piezas Junk, ordenadas por categoría y distancia
+-- ESCANEO: piezas Junk de los mundos activos, sin las cercanas a robots
 ---------------------------------------------------------------
 local function escanear()
     local root = getRoot()
     local miPos = root and root.Position or Vector3.zero
     local ahora = os.clock()
     local lista, vistos = {}, {}
-    local conteo = {}
+    local conteo, conteoMundo, robotsMundo = {}, {}, {}
     for i = 1, SIN_CAT do conteo[i] = 0 end
 
     local catMap = leerCategorias()
     local remote = obtenerRemote()
     local diag = {
-        carpetas = 0, carpetasTotal = #CONFIG.CARPETAS,
+        carpetas = 0, carpetasTotal = #CONFIG.MUNDOS,
         piezas = 0, conPrompt = 0, sinPrompt = 0,
-        categorizadas = 0, remote = remote ~= nil,
-        ejemplo = "ninguno",
+        categorizadas = 0, peligro = 0,
+        remote = remote ~= nil, ejemplo = "ninguno",
     }
 
-    for _, cfg in ipairs(CONFIG.CARPETAS) do
-        local carpeta = ruta(Workspace, cfg)
+    for mi, m in ipairs(CONFIG.MUNDOS) do
+        conteoMundo[mi] = 0
+        local robots = robotsDe({ m.nombre })
+        robotsMundo[mi] = #robots
+
+        local carpeta = partsFolder(m.nombre)
         if carpeta then
             diag.carpetas += 1
             for _, obj in ipairs(carpeta:GetDescendants()) do
                 local esPieza = (obj:IsA("Model") or obj:IsA("BasePart"))
                     and esJunk(obj.Name)
                     and not vistos[obj]
-                    and not dentroDeOtroJunk(obj, carpeta)
+                    and not dentroDeModelo(obj, carpeta)
 
                 if esPieza then
                     vistos[obj] = true
@@ -282,27 +359,36 @@ local function escanear()
                     if diag.ejemplo == "ninguno" then
                         diag.ejemplo = obj.Name
                     end
+                    conteoMundo[mi] += 1
 
-                    local idx = catMap[obj.Name] or SIN_CAT
-                    if idx ~= SIN_CAT then
-                        diag.categorizadas += 1
-                    end
-                    conteo[idx] += 1
+                    if S.mundoOn[mi] then
+                        local idx = catMap[obj.Name] or SIN_CAT
+                        if idx ~= SIN_CAT then
+                            diag.categorizadas += 1
+                        end
+                        conteo[idx] += 1
 
-                    local prompt = promptDe(obj)
-                    if prompt then
-                        diag.conPrompt += 1
-                    else
-                        diag.sinPrompt += 1
-                    end
+                        local prompt = promptDe(obj)
+                        if prompt then
+                            diag.conPrompt += 1
+                        else
+                            diag.sinPrompt += 1
+                        end
 
-                    local libre = not S.cooldown[obj] or S.cooldown[obj] <= ahora
-                    if S.catOn[idx] and libre and (prompt or remote) then
-                        table.insert(lista, {
-                            pieza = obj,
-                            idx = idx,
-                            dist = (posOf(obj) - miPos).Magnitude,
-                        })
+                        local libre = not S.cooldown[obj] or S.cooldown[obj] <= ahora
+                        if S.catOn[idx] and libre and (prompt or remote) then
+                            local pos = posOf(obj)
+                            if amenaza(pos, robots) then
+                                diag.peligro += 1
+                            else
+                                table.insert(lista, {
+                                    pieza = obj,
+                                    idx = idx,
+                                    mundo = m.nombre,
+                                    dist = (pos - miPos).Magnitude,
+                                })
+                            end
+                        end
                     end
                 end
             end
@@ -317,21 +403,39 @@ local function escanear()
     end)
 
     S.conteo = conteo
+    S.conteoMundo = conteoMundo
+    S.robotsMundo = robotsMundo
     S.visibles = #lista
     S.diag = diag
     return lista
 end
 
 ---------------------------------------------------------------
--- MOVIMIENTO SUAVE (sin teletransporte)
+-- MOVIMIENTO SUAVE
+--   fnRobots (opcional): función que devuelve los robots a evitar.
+--   Devuelve true (llegó), false (falló) o "peligro", robot (hay un robot cerca)
 ---------------------------------------------------------------
-local function deslizarA(destino)
+local function deslizarA(destino, fnRobots)
     local t0 = os.clock()
+    local robots, tRobots = {}, -1
     while not S.cerrado and (S.activo or S.ocupado) and os.clock() - t0 < CONFIG.TIMEOUT_VUELO do
         local root = getRoot()
         if not root then return false end
 
         local actual = root.Position
+
+        if fnRobots and os.clock() - tRobots > 0.2 then
+            robots = fnRobots()
+            tRobots = os.clock()
+        end
+        if fnRobots then
+            local r = amenaza(actual, robots)
+            if r then
+                root.AssemblyLinearVelocity = Vector3.zero
+                return "peligro", r
+            end
+        end
+
         local delta = destino - actual
         local dist = delta.Magnitude
         if dist <= 1.5 then
@@ -347,6 +451,23 @@ local function deslizarA(destino)
         root.CFrame = CFrame.new(nuevo) * (root.CFrame - root.CFrame.Position)
     end
     return false
+end
+
+-- Se aleja del robot en dirección contraria, hasta quedar fuera del radio de peligro
+local function huirDe(robot)
+    local root = getRoot()
+    if not root then return end
+    local me = root.Position
+    local rp = posOf(robot)
+    local dir = Vector3.new(me.X - rp.X, 0, me.Z - rp.Z)
+    if dir.Magnitude < 0.5 then
+        dir = Vector3.new(1, 0, 0)
+    end
+    local dest = me + dir.Unit * (S.peligro + 10)
+    S.huidas += 1
+    S.estado = "Robot cerca: me alejo"
+    log("Me alejo de " .. robot.Name)
+    deslizarA(Vector3.new(dest.X, me.Y, dest.Z), nil)
 end
 
 ---------------------------------------------------------------
@@ -407,7 +528,7 @@ local function irAPlot()
     end
 
     S.estado = "Lleno (" .. S.cargados .. "): yendo a tu plot " .. plot.Name
-    if not deslizarA(pos + Vector3.new(0, S.altura, 0)) then
+    if deslizarA(pos + Vector3.new(0, S.altura, 0), nil) ~= true then
         log("No llegué al plot " .. plot.Name)
         return false
     end
@@ -426,11 +547,27 @@ end
 ---------------------------------------------------------------
 -- CICLO PRINCIPAL
 ---------------------------------------------------------------
+local function mundosActivos()
+    local l = {}
+    for i, m in ipairs(CONFIG.MUNDOS) do
+        if S.mundoOn[i] then
+            table.insert(l, m.nombre)
+        end
+    end
+    return l
+end
+
 local function ciclo()
     if S.cargados >= S.maxJunk then
         if not irAPlot() then
             task.wait(1)
         end
+        return
+    end
+
+    if #mundosActivos() == 0 then
+        S.estado = "Activa al menos un mundo"
+        task.wait(1)
         return
     end
 
@@ -443,10 +580,20 @@ local function ciclo()
     end
 
     local nombre = CONFIG.CATEGORIAS[obj.idx].nombre
-    S.estado = "Yendo a: " .. obj.pieza.Name .. " (" .. nombre .. ")"
+    S.estado = "Yendo a: " .. obj.pieza.Name .. " (" .. obj.mundo .. ", " .. nombre .. ")"
     local destino = posOf(obj.pieza) + Vector3.new(0, S.altura, 0)
 
-    if not deslizarA(destino) then
+    local res, robot = deslizarA(destino, function()
+        return robotsDe({ obj.mundo })
+    end)
+
+    if res == "peligro" then
+        S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_PELIGRO
+        huirDe(robot)
+        return
+    end
+
+    if res ~= true then
         S.fallos += 1
         S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_FALLO
         S.estado = "No llegué, la salto"
@@ -497,7 +644,7 @@ local function probar()
         log("Prueba: no hay chatarra recogible")
     else
         log("Prueba: yendo a " .. obj.pieza:GetFullName())
-        if deslizarA(posOf(obj.pieza) + Vector3.new(0, S.altura, 0)) then
+        if deslizarA(posOf(obj.pieza) + Vector3.new(0, S.altura, 0), nil) == true then
             task.wait(S.retraso)
             log(recoger(obj.pieza) and "Prueba: recogida OK" or "Prueba: no se recogió")
         else
@@ -701,45 +848,27 @@ local pagPrincipal = nuevaPagina()
 local pagAjustes = nuevaPagina()
 local pagDiag = nuevaPagina()
 
----------------------------------------------------------------
--- PESTAÑA PRINCIPAL
----------------------------------------------------------------
-local toggle = btn(pagPrincipal, "○ APAGADO", UDim2.new(1, -4, 0, 50), C.track, 14)
-toggle.LayoutOrder = 1
-toggle.Activated:Connect(function()
-    S.activo = not S.activo
-    S.estado = S.activo and "Buscando chatarra..." or "Apagado"
-end)
-
-local estadoLbl = label(pagPrincipal, "Listo", 11, C.muted, false)
-estadoLbl.LayoutOrder = 2
-estadoLbl.Size = UDim2.new(1, -4, 0, 20)
-
-local secLbl = label(pagPrincipal, "PIEZAS · primero las de mayor valor", 10, C.muted, true)
-secLbl.LayoutOrder = 3
-secLbl.Size = UDim2.new(1, -4, 0, 16)
-
-local filas = {}
-for i, cat in ipairs(CONFIG.CATEGORIAS) do
+-- Fila con punto de color, nombre, contador y casilla
+local function filaCheck(parent, orden, color, nombreTxt, onClick)
     local fila = Instance.new("TextButton")
-    fila.LayoutOrder = 3 + i
+    fila.LayoutOrder = orden
     fila.Size = UDim2.new(1, -4, 0, 44)
     fila.BackgroundColor3 = C.card
     fila.BorderSizePixel = 0
     fila.Text = ""
     fila.AutoButtonColor = false
-    fila.Parent = pagPrincipal
+    fila.Parent = parent
     corner(fila, 10)
 
     local dot = Instance.new("Frame")
     dot.Size = UDim2.fromOffset(12, 12)
     dot.Position = UDim2.new(0, 14, 0.5, -6)
-    dot.BackgroundColor3 = cat.color
+    dot.BackgroundColor3 = color
     dot.BorderSizePixel = 0
     dot.Parent = fila
     corner(dot, 6)
 
-    local nombre = label(fila, cat.nombre, 13, C.text, true)
+    local nombre = label(fila, nombreTxt, 13, C.text, true)
     nombre.Position = UDim2.new(0, 36, 0, 0)
     nombre.Size = UDim2.new(1, -100, 1, 0)
 
@@ -757,12 +886,52 @@ for i, cat in ipairs(CONFIG.CATEGORIAS) do
     local tick = label(box, "✓", 14, C.text, true, Enum.TextXAlignment.Center)
     tick.Size = UDim2.new(1, 0, 1, 0)
 
-    fila.Activated:Connect(function()
+    if onClick then
+        fila.Activated:Connect(onClick)
+    end
+
+    return { cuenta = cuenta, box = box, tick = tick }
+end
+
+local function seccion(parent, orden, texto)
+    local l = label(parent, texto, 10, C.muted, true)
+    l.LayoutOrder = orden
+    l.Size = UDim2.new(1, -4, 0, 16)
+    return l
+end
+
+---------------------------------------------------------------
+-- PESTAÑA PRINCIPAL
+---------------------------------------------------------------
+local toggle = btn(pagPrincipal, "○ APAGADO", UDim2.new(1, -4, 0, 50), C.track, 14)
+toggle.LayoutOrder = 1
+toggle.Activated:Connect(function()
+    S.activo = not S.activo
+    S.estado = S.activo and "Buscando chatarra..." or "Apagado"
+end)
+
+local estadoLbl = label(pagPrincipal, "Listo", 11, C.muted, false)
+estadoLbl.LayoutOrder = 2
+estadoLbl.Size = UDim2.new(1, -4, 0, 20)
+
+seccion(pagPrincipal, 3, "MUNDOS · toca para farmear o no")
+
+local filasMundo = {}
+for i, m in ipairs(CONFIG.MUNDOS) do
+    filasMundo[i] = filaCheck(pagPrincipal, 3 + i, m.color, m.nombre, function()
+        S.mundoOn[i] = not S.mundoOn[i]
+        S.estado = (S.mundoOn[i] and "Farmeando " or "Sin farmear ") .. m.nombre
+    end)
+end
+
+seccion(pagPrincipal, 7, "PIEZAS · primero las de mayor valor")
+
+local filasCat = {}
+for i, cat in ipairs(CONFIG.CATEGORIAS) do
+    filasCat[i] = filaCheck(pagPrincipal, 7 + i, cat.color, cat.nombre, function()
         S.catOn[i] = not S.catOn[i]
         S.estado = (S.catOn[i] and "Activada: " or "Desactivada: ") .. cat.nombre
     end)
-
-    filas[i] = { cuenta = cuenta, box = box, tick = tick }
 end
 
 local statCard = Instance.new("Frame")
@@ -816,10 +985,11 @@ end
 
 stepper(1, "Máximo de Junk", CONFIG.MAX_JUNK, "maxJunk", function(v) return string.format("%d piezas", v) end)
 stepper(2, "Espera en plot", CONFIG.ESPERA_PLOT, "esperaPlot", function(v) return string.format("%d s", v) end)
-stepper(3, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d studs/s", v) end)
-stepper(4, "Retraso", CONFIG.RETRASO, "retraso", function(v) return string.format("%.1f s", v) end)
-stepper(5, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d studs", v) end)
-stepper(6, "Intentos", CONFIG.INTENTOS, "intentos", function(v) return string.format("%d", v) end)
+stepper(3, "Distancia a robots", CONFIG.PELIGRO, "peligro", function(v) return string.format("%d studs", v) end)
+stepper(4, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d studs/s", v) end)
+stepper(5, "Retraso", CONFIG.RETRASO, "retraso", function(v) return string.format("%.1f s", v) end)
+stepper(6, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d studs", v) end)
+stepper(7, "Intentos", CONFIG.INTENTOS, "intentos", function(v) return string.format("%d", v) end)
 
 ---------------------------------------------------------------
 -- PESTAÑA DIAGNÓSTICO
@@ -902,14 +1072,20 @@ local function refrescar()
     toggle.BackgroundColor3 = S.activo and C.green or C.track
     estadoLbl.Text = S.estado
 
-    for i, f in ipairs(filas) do
+    for i, f in ipairs(filasMundo) do
+        f.cuenta.Text = tostring(S.conteoMundo[i] or 0)
+        f.box.BackgroundColor3 = S.mundoOn[i] and C.green or C.track
+        f.tick.Visible = S.mundoOn[i]
+    end
+
+    for i, f in ipairs(filasCat) do
         f.cuenta.Text = tostring(S.conteo[i] or 0)
         f.box.BackgroundColor3 = S.catOn[i] and C.green or C.track
         f.tick.Visible = S.catOn[i]
     end
 
-    statLbl.Text = string.format("Cargados %d/%d · Recogidas %d · Vaciados %d · Disponibles %d",
-        S.cargados, S.maxJunk, S.recogidas, S.vaciados, S.visibles)
+    statLbl.Text = string.format("Cargados %d/%d · Recogidas %d · Huidas %d · Vaciados %d",
+        S.cargados, S.maxJunk, S.recogidas, S.huidas, S.vaciados)
 
     for _, s in ipairs(steppers) do
         s.refresh()
@@ -917,19 +1093,28 @@ local function refrescar()
 
     local plot, errPlot = buscarPlot()
     local d = S.diag
+    local robotsTxt = {}
+    for i, m in ipairs(CONFIG.MUNDOS) do
+        table.insert(robotsTxt, m.nombre .. " " .. (S.robotsMundo[i] or 0))
+    end
+
     diagLbl.Text = string.format(
-        "Carpetas encontradas: %d de %d\n" ..
+        "Carpetas de mundo: %d de %d\n" ..
         "Piezas Junk encontradas: %d\n" ..
         "Con categoría (Junkyard): %d\n" ..
         "Con ProximityPrompt: %d · sin prompt: %d\n" ..
+        "Piezas descartadas por robot: %d\n" ..
+        "Robots: %s\n" ..
         "Remote %s: %s\n" ..
         "Tu plot: %s\n" ..
         "Primera pieza: %s\n\n" ..
         "Últimos eventos:\n%s",
-        d.carpetas or 0, d.carpetasTotal or #CONFIG.CARPETAS,
+        d.carpetas or 0, d.carpetasTotal or #CONFIG.MUNDOS,
         d.piezas or 0,
         d.categorizadas or 0,
         d.conPrompt or 0, d.sinPrompt or 0,
+        d.peligro or 0,
+        table.concat(robotsTxt, " · "),
         CONFIG.REMOTE_NOMBRE, (d.remote and "encontrado" or "no encontrado"),
         plot and plot.Name or (errPlot or "sin datos"),
         d.ejemplo or "ninguno",
