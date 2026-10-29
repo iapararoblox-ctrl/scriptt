@@ -1,4 +1,4 @@
--- MaykDev · Auto Chatarra v5 (LocalScript · móvil)
+-- MaykDev · Auto Chatarra v6 (LocalScript · móvil)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -16,6 +16,7 @@ local CONFIG = {
         { nombre = "Heaven",    color = Color3.fromRGB(120, 220, 255) },
         { nombre = "Overworld", color = Color3.fromRGB(240, 200, 120) },
     },
+    ROBOT_PREFIJO = "Fighter",             -- nombre de los robots que te golpean
     JUNKYARD = { "Server", "Junkyard" },   -- atributos: nombre de la pieza -> "Scrap/..."
     PLOTS = { "Client", "Plots" },
     PREFIJOS = { "Junk" },
@@ -32,7 +33,10 @@ local CONFIG = {
     INTENTOS       = { ini = 2, min = 1, max = 4, paso = 1 },
     MAX_JUNK       = { ini = 20, min = 1, max = 500, paso = 5 },
     ESPERA_PLOT    = { ini = 4, min = 0, max = 30, paso = 1 },
-    PELIGRO        = { ini = 25, min = 8, max = 80, paso = 5 }, -- distancia a robots que activa la huida
+    PELIGRO        = { ini = 25, min = 8, max = 80, paso = 5 },  -- distancia a robots que activa la huida
+    ANTICIPO       = { ini = 1.2, min = 0.4, max = 3, paso = 0.1 }, -- segundos de aviso si el robot viene directo
+    MULT_HUIDA     = 1.6,                  -- multiplicador de velocidad al evadir
+    TIEMPO_EVASION = 4,                    -- segundos máximos evadiendo de una vez
     ESPERA_RECOGER = 0.35,
     COOLDOWN_FALLO = 12,
     COOLDOWN_PELIGRO = 6,
@@ -63,6 +67,8 @@ local S = {
     maxJunk = CONFIG.MAX_JUNK.ini,
     esperaPlot = CONFIG.ESPERA_PLOT.ini,
     peligro = CONFIG.PELIGRO.ini,
+    anticipo = CONFIG.ANTICIPO.ini,
+    reiniciarGolpe = true,
     mundoOn = { true, true, true },
     catOn = { true, true, true, true, true },
     conteo = {},
@@ -75,6 +81,7 @@ local S = {
     vaciados = 0,
     fallos = 0,
     huidas = 0,
+    golpes = 0,
     estado = "Listo",
     diag = {},
     log = {},
@@ -84,6 +91,9 @@ for i = 1, #CONFIG.MUNDOS do
     S.conteoMundo[i] = 0
     S.robotsMundo[i] = 0
 end
+
+-- Distancia anterior a cada robot (para saber si se acerca)
+local memDist = setmetatable({}, { __mode = "k" })
 
 local C = {
     bg = Color3.fromRGB(16, 18, 26),
@@ -138,11 +148,15 @@ local function esJunk(name)
     return false
 end
 
--- true si el objeto está dentro de otro Model que a su vez está dentro de "carpeta"
+local function esRobot(name)
+    return string.sub(name, 1, #CONFIG.ROBOT_PREFIJO) == CONFIG.ROBOT_PREFIJO
+end
+
+-- true si el objeto está dentro de otro Model (o pieza) que está dentro de "carpeta"
 local function dentroDeModelo(obj, carpeta)
     local p = obj.Parent
     while p and p ~= carpeta do
-        if p:IsA("Model") or esJunk(p.Name) then
+        if p:IsA("Model") or esJunk(p.Name) or esRobot(p.Name) then
             return true
         end
         p = p.Parent
@@ -216,28 +230,30 @@ local function redondear(x)
 end
 
 ---------------------------------------------------------------
--- ROBOTS (Client.Junkyard.fight.<mundo>)
+-- ROBOTS (Client.Junkyard.fight.<mundo>, nombres Fighter...)
 ---------------------------------------------------------------
 local function obtenerRobots(nombreMundo)
     local lista = {}
     local f = fightFolder(nombreMundo)
     if not f then return lista end
     for _, obj in ipairs(f:GetDescendants()) do
-        if (obj:IsA("Model") or obj:IsA("BasePart")) and not dentroDeModelo(obj, f) then
+        if (obj:IsA("Model") or obj:IsA("BasePart"))
+            and esRobot(obj.Name)
+            and not dentroDeModelo(obj, f) then
             table.insert(lista, obj)
         end
     end
     return lista
 end
 
--- Cache por mundo para no recorrer la carpeta en cada frame
+-- Cache por mundo: la lista se actualiza cada 0.5 s, pero las posiciones se leen en vivo
 local cacheRobots = {}
 local function robotsDe(nombresMundo)
     local ahora = os.clock()
     local todos = {}
     for _, w in ipairs(nombresMundo) do
         local c = cacheRobots[w]
-        if not c or ahora - c.t > 0.3 then
+        if not c or ahora - c.t > 0.5 then
             c = { t = ahora, lista = obtenerRobots(w) }
             cacheRobots[w] = c
         end
@@ -253,14 +269,31 @@ local function robotVivo(r)
     return not (h and h.Health <= 0)
 end
 
--- Devuelve el robot vivo más cercano que esté dentro del radio de peligro, o nil
-local function amenaza(pos, robots)
-    local best, bd
+-- Devuelve el robot más cercano que sea peligroso.
+--   Peligroso = está dentro del radio de peligro, o (si anticipar) viene hacia ti tan rápido
+--   que llegará al radio de peligro antes de S.anticipo segundos.
+local function amenaza(pos, robots, anticipar)
+    local now = os.clock()
+    local best, bestD
     for _, r in ipairs(robots) do
         if r.Parent and robotVivo(r) then
             local d = (posOf(r) - pos).Magnitude
-            if d < S.peligro and (not bd or d < bd) then
-                best, bd = r, d
+            local peligroAhora = d < S.peligro
+            local acercandose = false
+
+            if anticipar then
+                local prev = memDist[r]
+                memDist[r] = { d = d, t = now }
+                if prev and now > prev.t and now - prev.t < 1 then
+                    local v = (prev.d - d) / (now - prev.t) -- velocidad de acercamiento (studs/s)
+                    if v > 0 and (d - S.peligro) / v < S.anticipo then
+                        acercandose = true
+                    end
+                end
+            end
+
+            if (peligroAhora or acercandose) and (not bestD or d < bestD) then
+                best, bestD = r, d
             end
         end
     end
@@ -317,6 +350,16 @@ local function venderEnPlot(plot)
         end
     end
     return activados
+end
+
+local function mundosActivos()
+    local l = {}
+    for i, m in ipairs(CONFIG.MUNDOS) do
+        if S.mundoOn[i] then
+            table.insert(l, m.nombre)
+        end
+    end
+    return l
 end
 
 ---------------------------------------------------------------
@@ -378,7 +421,7 @@ local function escanear()
                         local libre = not S.cooldown[obj] or S.cooldown[obj] <= ahora
                         if S.catOn[idx] and libre and (prompt or remote) then
                             local pos = posOf(obj)
-                            if amenaza(pos, robots) then
+                            if amenaza(pos, robots, false) then
                                 diag.peligro += 1
                             else
                                 table.insert(lista, {
@@ -411,25 +454,24 @@ local function escanear()
 end
 
 ---------------------------------------------------------------
--- MOVIMIENTO SUAVE
---   fnRobots (opcional): función que devuelve los robots a evitar.
---   Devuelve true (llegó), false (falló) o "peligro", robot (hay un robot cerca)
+-- MOVIMIENTO
+--   fnRobots: función que devuelve los robots a vigilar (nil = no vigilar)
 ---------------------------------------------------------------
+-- Desliza hasta destino. Devuelve true (llegó), false (falló) o "peligro", robot
 local function deslizarA(destino, fnRobots)
     local t0 = os.clock()
     local robots, tRobots = {}, -1
     while not S.cerrado and (S.activo or S.ocupado) and os.clock() - t0 < CONFIG.TIMEOUT_VUELO do
         local root = getRoot()
         if not root then return false end
-
         local actual = root.Position
 
-        if fnRobots and os.clock() - tRobots > 0.2 then
-            robots = fnRobots()
-            tRobots = os.clock()
-        end
         if fnRobots then
-            local r = amenaza(actual, robots)
+            if os.clock() - tRobots > 0.15 then
+                robots = fnRobots()
+                tRobots = os.clock()
+            end
+            local r = amenaza(actual, robots, true)
             if r then
                 root.AssemblyLinearVelocity = Vector3.zero
                 return "peligro", r
@@ -453,27 +495,75 @@ local function deslizarA(destino, fnRobots)
     return false
 end
 
--- Se aleja del robot en dirección contraria, hasta quedar fuera del radio de peligro
-local function huirDe(robot)
-    local root = getRoot()
-    if not root then return end
-    local me = root.Position
-    local rp = posOf(robot)
-    local dir = Vector3.new(me.X - rp.X, 0, me.Z - rp.Z)
-    if dir.Magnitude < 0.5 then
-        dir = Vector3.new(1, 0, 0)
+-- Se queda quieto unos segundos vigilando robots. Devuelve true o "peligro", robot
+local function esperarSeguro(seg, fnRobots)
+    local t0 = os.clock()
+    while os.clock() - t0 < seg and not S.cerrado and (S.activo or S.ocupado) do
+        if fnRobots then
+            local root = getRoot()
+            if root then
+                local r = amenaza(root.Position, fnRobots(), true)
+                if r then
+                    return "peligro", r
+                end
+            end
+        end
+        RunService.Heartbeat:Wait()
     end
-    local dest = me + dir.Unit * (S.peligro + 10)
+    return true
+end
+
+-- Evade a todos los robots cercanos, más rápido que lo normal, hasta quedar libre
+local function evadir(fnRobots)
     S.huidas += 1
-    S.estado = "Robot cerca: me alejo"
-    log("Me alejo de " .. robot.Name)
-    deslizarA(Vector3.new(dest.X, me.Y, dest.Z), nil)
+    S.estado = "¡Robot cerca! Evadiendo"
+    log("Evadiendo robots")
+    local t0 = os.clock()
+
+    while not S.cerrado and (S.activo or S.ocupado) and os.clock() - t0 < CONFIG.TIEMPO_EVASION do
+        local root = getRoot()
+        if not root then return end
+        local me = root.Position
+        local robots = fnRobots and fnRobots() or {}
+
+        local threat = amenaza(me, robots, true)
+        if not threat then
+            return
+        end
+
+        -- Suma de vectores de escape: cada robot cercano empuja hacia el lado contrario
+        local esc = Vector3.zero
+        for _, b in ipairs(robots) do
+            if b.Parent and robotVivo(b) then
+                local bp = posOf(b)
+                local flat = Vector3.new(me.X - bp.X, 0, me.Z - bp.Z)
+                local d = flat.Magnitude
+                if d > 0.1 and d < S.peligro * 2 then
+                    esc += flat.Unit * (S.peligro * 2 - d)
+                end
+            end
+        end
+        if esc.Magnitude < 0.1 then
+            local tp = posOf(threat)
+            esc = Vector3.new(me.X - tp.X, 0, me.Z - tp.Z)
+            if esc.Magnitude < 0.1 then
+                esc = Vector3.new(1, 0, 0)
+            end
+        end
+
+        local dir = esc.Unit
+        local dt = RunService.Heartbeat:Wait()
+        local nuevo = me + dir * (S.velocidad * CONFIG.MULT_HUIDA * dt)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(nuevo) * (root.CFrame - root.CFrame.Position)
+    end
 end
 
 ---------------------------------------------------------------
--- RECOGIDA
+-- RECOGIDA (vigila robots mientras espera)
+--   Devuelve true (recogida), false (no recogida) o "peligro"
 ---------------------------------------------------------------
-local function recoger(pieza)
+local function recoger(pieza, fnRobots)
     local prompt = promptDe(pieza)
     local remote = (not prompt) and obtenerRemote() or nil
     if not prompt and not remote then
@@ -501,7 +591,11 @@ local function recoger(pieza)
                 end
             end)
         end
-        task.wait(CONFIG.ESPERA_RECOGER)
+
+        local res = esperarSeguro(CONFIG.ESPERA_RECOGER, fnRobots)
+        if res ~= true then
+            return "peligro"
+        end
     end
 
     return not pieza:IsDescendantOf(Workspace)
@@ -511,6 +605,10 @@ end
 -- IR AL PLOT Y VACIAR
 ---------------------------------------------------------------
 local function irAPlot()
+    local fnAll = function()
+        return robotsDe(mundosActivos())
+    end
+
     local plot, err = buscarPlot()
     if not plot then
         S.estado = err
@@ -528,7 +626,12 @@ local function irAPlot()
     end
 
     S.estado = "Lleno (" .. S.cargados .. "): yendo a tu plot " .. plot.Name
-    if deslizarA(pos + Vector3.new(0, S.altura, 0), nil) ~= true then
+    local res = deslizarA(pos + Vector3.new(0, S.altura, 0), fnAll)
+    if res == "peligro" then
+        evadir(fnAll)
+        return false
+    end
+    if res ~= true then
         log("No llegué al plot " .. plot.Name)
         return false
     end
@@ -536,7 +639,12 @@ local function irAPlot()
     local n = venderEnPlot(plot)
     S.estado = "Vaciando en plot " .. plot.Name .. "..."
     log("Plot " .. plot.Name .. ": prompts de venta activados: " .. n)
-    task.wait(S.esperaPlot)
+
+    local esp = esperarSeguro(S.esperaPlot, fnAll)
+    if esp ~= true then
+        evadir(fnAll)
+        return false
+    end
 
     S.cargados = 0
     S.vaciados += 1
@@ -547,20 +655,10 @@ end
 ---------------------------------------------------------------
 -- CICLO PRINCIPAL
 ---------------------------------------------------------------
-local function mundosActivos()
-    local l = {}
-    for i, m in ipairs(CONFIG.MUNDOS) do
-        if S.mundoOn[i] then
-            table.insert(l, m.nombre)
-        end
-    end
-    return l
-end
-
 local function ciclo()
     if S.cargados >= S.maxJunk then
         if not irAPlot() then
-            task.wait(1)
+            task.wait(0.3)
         end
         return
     end
@@ -579,20 +677,21 @@ local function ciclo()
         return
     end
 
-    local nombre = CONFIG.CATEGORIAS[obj.idx].nombre
-    S.estado = "Yendo a: " .. obj.pieza.Name .. " (" .. obj.mundo .. ", " .. nombre .. ")"
-    local destino = posOf(obj.pieza) + Vector3.new(0, S.altura, 0)
-
-    local res, robot = deslizarA(destino, function()
-        return robotsDe({ obj.mundo })
-    end)
-
-    if res == "peligro" then
-        S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_PELIGRO
-        huirDe(robot)
-        return
+    local mundo = obj.mundo
+    local fnFarm = function()
+        return robotsDe({ mundo })
     end
 
+    local nombre = CONFIG.CATEGORIAS[obj.idx].nombre
+    S.estado = "Yendo a: " .. obj.pieza.Name .. " (" .. mundo .. ", " .. nombre .. ")"
+    local destino = posOf(obj.pieza) + Vector3.new(0, S.altura, 0)
+
+    local res = deslizarA(destino, fnFarm)
+    if res == "peligro" then
+        S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_PELIGRO
+        evadir(fnFarm)
+        return
+    end
     if res ~= true then
         S.fallos += 1
         S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_FALLO
@@ -601,9 +700,21 @@ local function ciclo()
         return
     end
 
-    task.wait(S.retraso)
+    if esperarSeguro(S.retraso, fnFarm) ~= true then
+        S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_PELIGRO
+        evadir(fnFarm)
+        return
+    end
+
     S.estado = "Recogiendo: " .. obj.pieza.Name
-    if recoger(obj.pieza) then
+    local rec = recoger(obj.pieza, fnFarm)
+    if rec == "peligro" then
+        S.cooldown[obj.pieza] = os.clock() + CONFIG.COOLDOWN_PELIGRO
+        evadir(fnFarm)
+        return
+    end
+
+    if rec then
         S.recogidas += 1
         S.cargados += 1
         S.estado = "Recogida: " .. obj.pieza.Name
@@ -614,7 +725,10 @@ local function ciclo()
         S.estado = "No se recogió"
         log("Falló: " .. obj.pieza.Name)
     end
-    task.wait(S.retraso)
+
+    if esperarSeguro(S.retraso, fnFarm) ~= true then
+        evadir(fnFarm)
+    end
 end
 
 task.spawn(function()
@@ -629,6 +743,33 @@ task.spawn(function()
             ciclo()
         end
     end
+end)
+
+---------------------------------------------------------------
+-- GOLPES: si te pegan, se cuenta y (opcional) se pone a cero el contador de Junk
+---------------------------------------------------------------
+local function vigilarVida(char)
+    local hum = char:WaitForChild("Humanoid", 10)
+    if not hum then return end
+    local last = hum.Health
+    hum.HealthChanged:Connect(function(h)
+        if h < last then
+            S.golpes += 1
+            if S.reiniciarGolpe then
+                S.cargados = 0
+            end
+            S.estado = "¡Te golpearon!"
+            log("Golpe recibido" .. (S.reiniciarGolpe and ": contador de Junk a 0" or ""))
+        end
+        last = h
+    end)
+end
+
+if LocalPlayer.Character then
+    task.spawn(vigilarVida, LocalPlayer.Character)
+end
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.spawn(vigilarVida, char)
 end)
 
 -- Prueba manual: va a una sola pieza y la intenta recoger (con el auto apagado)
@@ -646,7 +787,7 @@ local function probar()
         log("Prueba: yendo a " .. obj.pieza:GetFullName())
         if deslizarA(posOf(obj.pieza) + Vector3.new(0, S.altura, 0), nil) == true then
             task.wait(S.retraso)
-            log(recoger(obj.pieza) and "Prueba: recogida OK" or "Prueba: no se recogió")
+            log(recoger(obj.pieza, nil) == true and "Prueba: recogida OK" or "Prueba: no se recogió")
         else
             log("Prueba: no llegó a la pieza")
         end
@@ -986,10 +1127,16 @@ end
 stepper(1, "Máximo de Junk", CONFIG.MAX_JUNK, "maxJunk", function(v) return string.format("%d piezas", v) end)
 stepper(2, "Espera en plot", CONFIG.ESPERA_PLOT, "esperaPlot", function(v) return string.format("%d s", v) end)
 stepper(3, "Distancia a robots", CONFIG.PELIGRO, "peligro", function(v) return string.format("%d studs", v) end)
-stepper(4, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d studs/s", v) end)
-stepper(5, "Retraso", CONFIG.RETRASO, "retraso", function(v) return string.format("%.1f s", v) end)
-stepper(6, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d studs", v) end)
-stepper(7, "Intentos", CONFIG.INTENTOS, "intentos", function(v) return string.format("%d", v) end)
+stepper(4, "Anticipo de robot", CONFIG.ANTICIPO, "anticipo", function(v) return string.format("%.1f s", v) end)
+stepper(5, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d studs/s", v) end)
+stepper(6, "Retraso", CONFIG.RETRASO, "retraso", function(v) return string.format("%.1f s", v) end)
+stepper(7, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d studs", v) end)
+stepper(8, "Intentos", CONFIG.INTENTOS, "intentos", function(v) return string.format("%d", v) end)
+
+local filaReinicio = filaCheck(pagAjustes, 9, C.red, "Al golpe, contador de Junk a 0", function()
+    S.reiniciarGolpe = not S.reiniciarGolpe
+    S.estado = S.reiniciarGolpe and "Reinicio por golpe: activado" or "Reinicio por golpe: desactivado"
+end)
 
 ---------------------------------------------------------------
 -- PESTAÑA DIAGNÓSTICO
@@ -1084,8 +1231,11 @@ local function refrescar()
         f.tick.Visible = S.catOn[i]
     end
 
-    statLbl.Text = string.format("Cargados %d/%d · Recogidas %d · Huidas %d · Vaciados %d",
-        S.cargados, S.maxJunk, S.recogidas, S.huidas, S.vaciados)
+    filaReinicio.box.BackgroundColor3 = S.reiniciarGolpe and C.green or C.track
+    filaReinicio.tick.Visible = S.reiniciarGolpe
+
+    statLbl.Text = string.format("Cargados %d/%d · Recogidas %d · Huidas %d · Golpes %d · Vaciados %d",
+        S.cargados, S.maxJunk, S.recogidas, S.huidas, S.golpes, S.vaciados)
 
     for _, s in ipairs(steppers) do
         s.refresh()
@@ -1104,7 +1254,7 @@ local function refrescar()
         "Con categoría (Junkyard): %d\n" ..
         "Con ProximityPrompt: %d · sin prompt: %d\n" ..
         "Piezas descartadas por robot: %d\n" ..
-        "Robots: %s\n" ..
+        "Robots %s*: %s\n" ..
         "Remote %s: %s\n" ..
         "Tu plot: %s\n" ..
         "Primera pieza: %s\n\n" ..
@@ -1114,7 +1264,7 @@ local function refrescar()
         d.categorizadas or 0,
         d.conPrompt or 0, d.sinPrompt or 0,
         d.peligro or 0,
-        table.concat(robotsTxt, " · "),
+        CONFIG.ROBOT_PREFIJO, table.concat(robotsTxt, " · "),
         CONFIG.REMOTE_NOMBRE, (d.remote and "encontrado" or "no encontrado"),
         plot and plot.Name or (errPlot or "sin datos"),
         d.ejemplo or "ninguno",
