@@ -1,4 +1,4 @@
--- MaykDev · Auto Orbes (LocalScript · móvil)
+-- MaykDev · Auto Farm (Orbes / Breakables) · LocalScript · móvil
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -9,17 +9,24 @@ local LocalPlayer = Players.LocalPlayer
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CONFIG = {
-    CARPETA      = { "Orbs" },      -- Workspace.Orbs
-    PREFIJO      = "Orb",           -- nombre de cada orbe: Orb
-    NOMBRE_XP    = "XP",            -- propiedad con la experiencia del orbe
-    VELOCIDAD    = { ini = 250, min = 50, max = 800, paso = 50 },
-    ALTURA       = { ini = 2, min = 0, max = 10, paso = 1 },
-    ESPERA_TOQUE = 0.2,             -- segundos tras tocar/activar el orbe
-    INTENTOS     = 3,               -- veces que intenta recogerlo
-    COOLDOWN     = 8,               -- segundos sin reintentar un orbe que no se pudo recoger
-    ESPERA_CICLO = 0.4,             -- espera cuando no hay orbes
-    TIMEOUT_VUELO = 20,
-    TOP = 5,                        -- cuántos orbes se muestran en la lista
+    CARPETA_ORBES  = { "Orbs" },            -- Workspace.Orbs
+    PREFIJO_ORB    = "Orb",                 -- nombre de cada orbe
+    NOMBRE_XP      = "XP",                  -- propiedad con la experiencia
+    CARPETA_BREAK  = { "Breakables" },      -- Workspace.Breakables
+    TIPOS_BREAK    = { "Egg Cluster", "Silk Stash", "Silk Cocoon", "Acorn", "Sugar Cube", "Golden Cocoon", "Puffball" },
+    COLORES_TIPO   = {
+        Color3.fromRGB(240, 170, 200), Color3.fromRGB(200, 200, 230), Color3.fromRGB(180, 230, 200),
+        Color3.fromRGB(210, 150, 90),  Color3.fromRGB(255, 225, 150), Color3.fromRGB(240, 200, 90),
+        Color3.fromRGB(170, 200, 255),
+    },
+    VELOCIDAD      = { ini = 250, min = 50, max = 800, paso = 50 },
+    ALTURA         = { ini = 2, min = 0, max = 10, paso = 1 },
+    ESPERA_TOQUE   = 0.6,                   -- segundos esperando a que se recoja o rompa tras cada intento
+    INTENTOS       = 3,
+    COOLDOWN       = 8,                     -- segundos sin reintentar un objetivo que falló
+    ESPERA_CICLO   = 0.4,
+    TIMEOUT_VUELO  = 20,
+    TOP            = 5,
 }
 
 ---------------------------------------------------------------
@@ -28,9 +35,12 @@ local CONFIG = {
 local S = {
     activo = false,
     cerrado = false,
-    modo = "DESLIZAR",              -- "TP" o "DESLIZAR"
+    fuente = "ORBES",                       -- "ORBES" o "BREAK"
+    modo = "DESLIZAR",                      -- "TP" o "DESLIZAR"
     velocidad = CONFIG.VELOCIDAD.ini,
     altura = CONFIG.ALTURA.ini,
+    tipoOn = {},
+    conteoTipo = {},
     recogidos = 0,
     fallos = 0,
     xpTotal = 0,
@@ -38,9 +48,14 @@ local S = {
     disponibles = 0,
     lista = {},
     cooldown = {},
+    diag = {},
     estado = "Listo",
     log = {},
 }
+for i = 1, #CONFIG.TIPOS_BREAK do
+    S.tipoOn[i] = true
+    S.conteoTipo[i] = 0
+end
 
 local C = {
     bg = Color3.fromRGB(16, 18, 26),
@@ -60,7 +75,7 @@ local function log(msg)
     while #S.log > 8 do
         table.remove(S.log)
     end
-    print("[ORBES]", msg)
+    print("[AUTOFARM]", msg)
 end
 
 local function fmtNum(n)
@@ -97,14 +112,27 @@ local function posOf(obj)
 end
 
 local function esOrb(name)
-    return string.sub(name, 1, #CONFIG.PREFIJO) == CONFIG.PREFIJO
+    return string.sub(name, 1, #CONFIG.PREFIJO_ORB) == CONFIG.PREFIJO_ORB
 end
 
--- true si el objeto está dentro de otro orbe (para no contar sus partes)
-local function dentroDeOrb(obj, carpeta)
+-- Índice del tipo de Breakable si el nombre empieza por uno de los tipos (p. ej. "Acorn" o "Acorn2")
+local function tipoDe(name)
+    for i, t in ipairs(CONFIG.TIPOS_BREAK) do
+        if name == t then
+            return i
+        end
+        if string.sub(name, 1, #t) == t and not string.match(string.sub(name, #t + 1, #t + 1), "%a") then
+            return i
+        end
+    end
+    return nil
+end
+
+-- true si el objeto está dentro de otro objeto que ya cuenta (para no contar sus partes)
+local function dentroDeContado(obj, carpeta, esMarcado)
     local p = obj.Parent
     while p and p ~= carpeta do
-        if p:IsA("Model") or esOrb(p.Name) then
+        if esMarcado(p) then
             return true
         end
         p = p.Parent
@@ -112,7 +140,20 @@ local function dentroDeOrb(obj, carpeta)
     return false
 end
 
--- Lee el XP: atributo "XP" o ValueBase hijo llamado "XP". Devuelve número (0 si no existe)
+local function partesDe(obj)
+    local partes = {}
+    if obj:IsA("BasePart") then
+        table.insert(partes, obj)
+    end
+    for _, d in ipairs(obj:GetDescendants()) do
+        if d:IsA("BasePart") then
+            table.insert(partes, d)
+        end
+    end
+    return partes
+end
+
+-- Lee el XP del orbe: atributo "XP" o ValueBase hijo llamado "XP"
 local function leerXP(obj)
     local v = obj:GetAttribute(CONFIG.NOMBRE_XP)
     if v == nil then
@@ -124,51 +165,112 @@ local function leerXP(obj)
     return tonumber(v) or 0
 end
 
----------------------------------------------------------------
--- ESCANEO: orbes ordenados por XP (mayor primero) y luego por distancia
----------------------------------------------------------------
-local function escanear()
-    local lista = {}
-    local carpeta = ruta(Workspace, CONFIG.CARPETA)
-    local root = getRoot()
-    local miPos = root and root.Position or Vector3.zero
-    local ahora = os.clock()
+local function estaRoto(obj)
+    local h = obj:GetAttribute("Health")
+    if type(h) == "number" and h <= 0 then
+        return true
+    end
+    local hv = obj:FindFirstChild("Health", true)
+    if hv and hv:IsA("ValueBase") and tonumber(hv.Value) and tonumber(hv.Value) <= 0 then
+        return true
+    end
+    return false
+end
 
+---------------------------------------------------------------
+-- ESCANEO
+---------------------------------------------------------------
+local function escanearOrbes(lista, miPos, ahora)
+    local carpeta = ruta(Workspace, CONFIG.CARPETA_ORBES)
+    local diag = { carpeta = carpeta ~= nil, encontrados = 0, conPrompt = 0, conClick = 0, conVida = 0 }
     if carpeta then
         for _, obj in ipairs(carpeta:GetDescendants()) do
             if (obj:IsA("Model") or obj:IsA("BasePart"))
                 and esOrb(obj.Name)
-                and not dentroDeOrb(obj, carpeta)
+                and not dentroDeContado(obj, carpeta, function(p) return esOrb(p.Name) or p:IsA("Model") end)
                 and (not S.cooldown[obj] or S.cooldown[obj] <= ahora) then
+                diag.encontrados += 1
                 table.insert(lista, {
                     obj = obj,
+                    nombre = obj.Name,
                     xp = leerXP(obj),
                     dist = (posOf(obj) - miPos).Magnitude,
                 })
             end
         end
     end
-
     table.sort(lista, function(a, b)
         if a.xp ~= b.xp then
             return a.xp > b.xp
         end
         return a.dist < b.dist
     end)
+    return diag
+end
 
-    S.lista = lista
-    S.disponibles = #lista
-    if lista[1] and lista[1].xp > S.mejorXP then
+local function escanearBreak(lista, miPos, ahora)
+    local carpeta = ruta(Workspace, CONFIG.CARPETA_BREAK)
+    local diag = { carpeta = carpeta ~= nil, encontrados = 0, conPrompt = 0, conClick = 0, conVida = 0 }
+    local conteo = {}
+    for i = 1, #CONFIG.TIPOS_BREAK do conteo[i] = 0 end
+
+    if carpeta then
+        for _, obj in ipairs(carpeta:GetDescendants()) do
+            local idx = (obj:IsA("Model") or obj:IsA("BasePart")) and tipoDe(obj.Name) or nil
+            if idx and not dentroDeContado(obj, carpeta, function(p)
+                    return p:IsA("Model") and tipoDe(p.Name) ~= nil
+                end) then
+                conteo[idx] += 1
+                if S.tipoOn[idx] and (not S.cooldown[obj] or S.cooldown[obj] <= ahora) then
+                    diag.encontrados += 1
+                    if obj:FindFirstChildWhichIsA("ProximityPrompt", true) then diag.conPrompt += 1 end
+                    if obj:FindFirstChildWhichIsA("ClickDetector", true) then diag.conClick += 1 end
+                    if obj:GetAttribute("Health") ~= nil then diag.conVida += 1 end
+                    table.insert(lista, {
+                        obj = obj,
+                        nombre = obj.Name,
+                        tipo = CONFIG.TIPOS_BREAK[idx],
+                        xp = 0,
+                        dist = (posOf(obj) - miPos).Magnitude,
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(lista, function(a, b)
+        return a.dist < b.dist
+    end)
+
+    S.conteoTipo = conteo
+    return diag
+end
+
+local function escanear()
+    local root = getRoot()
+    local miPos = root and root.Position or Vector3.zero
+    local ahora = os.clock()
+    local lista = {}
+    local diag
+
+    if S.fuente == "ORBES" then
+        diag = escanearOrbes(lista, miPos, ahora)
+    else
+        diag = escanearBreak(lista, miPos, ahora)
+    end
+
+    if lista[1] and S.fuente == "ORBES" and lista[1].xp > S.mejorXP then
         S.mejorXP = lista[1].xp
     end
+    S.lista = lista
+    S.disponibles = #lista
+    S.diag = diag
     return lista
 end
 
 ---------------------------------------------------------------
 -- MOVIMIENTO
 ---------------------------------------------------------------
--- Va hasta el orbe. TP: salto directo. DESLIZAR: avance rápido frame a frame.
--- Devuelve true si llegó, false si falló o el orbe desapareció.
 local function moverA(obj)
     local root = getRoot()
     if not root then return false end
@@ -207,11 +309,11 @@ local function moverA(obj)
 end
 
 ---------------------------------------------------------------
--- RECOGIDA: toca las partes del orbe y activa su prompt si tiene
+-- INTERACCIÓN: toca, activa prompts y clicks, espera a que se recoja o rompa
 ---------------------------------------------------------------
-local function recogerOrb(obj)
+local function interactuar(obj)
     for _ = 1, CONFIG.INTENTOS do
-        if not obj:IsDescendantOf(Workspace) then
+        if not obj:IsDescendantOf(Workspace) or estaRoto(obj) then
             return true
         end
 
@@ -220,71 +322,85 @@ local function recogerOrb(obj)
             return false
         end
 
-        local partes = {}
-        if obj:IsA("BasePart") then
-            table.insert(partes, obj)
-        end
-        for _, d in ipairs(obj:GetDescendants()) do
-            if d:IsA("BasePart") then
-                table.insert(partes, d)
-            end
-        end
-        for _, p in ipairs(partes) do
+        for _, p in ipairs(partesDe(obj)) do
             pcall(function()
                 firetouchinterest(root, p, 0)
                 firetouchinterest(root, p, 1)
             end)
         end
 
-        local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if prompt then
-            pcall(function()
-                prompt.RequiresLineOfSight = false
-                if prompt.MaxActivationDistance < 20 then
-                    prompt.MaxActivationDistance = 20
-                end
-            end)
-            pcall(fireproximityprompt, prompt)
+        for _, d in ipairs(obj:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then
+                pcall(function()
+                    d.RequiresLineOfSight = false
+                    if d.MaxActivationDistance < 20 then
+                        d.MaxActivationDistance = 20
+                    end
+                end)
+                pcall(fireproximityprompt, d)
+            elseif d:IsA("ClickDetector") then
+                pcall(fireclickdetector, d)
+            end
         end
 
-        task.wait(CONFIG.ESPERA_TOQUE)
+        local t0 = os.clock()
+        while os.clock() - t0 < CONFIG.ESPERA_TOQUE do
+            if not obj:IsDescendantOf(Workspace) or estaRoto(obj) then
+                break
+            end
+            task.wait(0.05)
+        end
     end
-    return not obj:IsDescendantOf(Workspace)
+    return not obj:IsDescendantOf(Workspace) or estaRoto(obj)
 end
 
 ---------------------------------------------------------------
 -- CICLO
 ---------------------------------------------------------------
+local function nombreFuente()
+    return S.fuente == "ORBES" and "orbes" or "breakables"
+end
+
 local function ciclo()
     local lista = escanear()
     local top = lista[1]
 
     if not top then
-        S.estado = "Sin orbes disponibles"
+        S.estado = "Sin " .. nombreFuente() .. " disponibles"
         task.wait(CONFIG.ESPERA_CICLO)
         return
     end
 
-    S.estado = string.format("Yendo al orbe de %s XP", fmtNum(top.xp))
+    if S.fuente == "ORBES" then
+        S.estado = "Yendo a orbe de " .. fmtNum(top.xp) .. " XP"
+    else
+        S.estado = "Yendo a " .. top.nombre
+    end
+
     if not moverA(top.obj) then
         S.fallos += 1
         S.cooldown[top.obj] = os.clock() + CONFIG.COOLDOWN
-        S.estado = "No llegué al orbe"
-        log("No llegó a " .. top.obj.Name)
+        S.estado = "No llegué a " .. top.nombre
+        log("No llegó a " .. top.nombre)
         return
     end
 
-    S.estado = "Recogiendo orbe de " .. fmtNum(top.xp) .. " XP"
-    if recogerOrb(top.obj) then
+    S.estado = "Interactuando con " .. top.nombre
+    if interactuar(top.obj) then
         S.recogidos += 1
-        S.xpTotal += top.xp
-        S.estado = "Recogido: +" .. fmtNum(top.xp) .. " XP"
-        log("+" .. fmtNum(top.xp) .. " XP (" .. top.obj.Name .. ")")
+        if S.fuente == "ORBES" then
+            S.xpTotal += top.xp
+            S.estado = "Recogido: +" .. fmtNum(top.xp) .. " XP"
+            log("+" .. fmtNum(top.xp) .. " XP (" .. top.nombre .. ")")
+        else
+            S.estado = "Conseguido: " .. top.nombre
+            log("Conseguido: " .. top.nombre)
+        end
     else
         S.fallos += 1
         S.cooldown[top.obj] = os.clock() + CONFIG.COOLDOWN
-        S.estado = "No se recogió el orbe"
-        log("Falló: " .. top.obj.Name)
+        S.estado = "No se pudo con " .. top.nombre
+        log("Falló: " .. top.nombre)
     end
 end
 
@@ -306,7 +422,7 @@ end)
 -- UI
 ---------------------------------------------------------------
 local gui = Instance.new("ScreenGui")
-gui.Name = "MaykDev_Orbes"
+gui.Name = "MaykDev_AutoFarm"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.DisplayOrder = 999999
@@ -394,7 +510,7 @@ local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.fromOffset(320, 460)
+main.Size = UDim2.fromOffset(320, 480)
 main.BackgroundColor3 = C.bg
 main.BorderSizePixel = 0
 main.ClipsDescendants = true
@@ -408,7 +524,7 @@ uiScale.Parent = main
 local function ajustarEscala()
     local cam = Workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-    uiScale.Scale = math.clamp(math.min(vp.X * 0.94 / 320, vp.Y * 0.84 / 460), 0.5, 1)
+    uiScale.Scale = math.clamp(math.min(vp.X * 0.94 / 320, vp.Y * 0.86 / 480), 0.5, 1)
 end
 ajustarEscala()
 if Workspace.CurrentCamera then
@@ -428,7 +544,7 @@ headerGrad.Color = ColorSequence.new(Color3.fromRGB(120, 90, 180), Color3.fromRG
 headerGrad.Rotation = 20
 headerGrad.Parent = header
 
-local title = label(header, "✨  Auto Orbes", 16, C.text, true)
+local title = label(header, "✨  Auto Farm", 16, C.text, true)
 title.Position = UDim2.new(0, 16, 0, 8)
 title.Size = UDim2.new(1, -110, 0, 20)
 
@@ -447,7 +563,7 @@ local toggle = btn(main, "○  APAGADO", UDim2.new(1, -24, 0, 46), C.track, 15)
 toggle.Position = UDim2.new(0, 12, 0, 62)
 toggle.Activated:Connect(function()
     S.activo = not S.activo
-    S.estado = S.activo and "Buscando orbes..." or "Apagado"
+    S.estado = S.activo and "Buscando..." or "Apagado"
 end)
 
 -- Estado
@@ -463,10 +579,39 @@ local estadoLbl = label(estadoCard, "Listo", 11, C.muted, false)
 estadoLbl.Position = UDim2.new(0, 12, 0, 0)
 estadoLbl.Size = UDim2.new(1, -24, 1, 0)
 
+-- Selector de fuente: Orbes / Breakables
+local fuenteRow = Instance.new("Frame")
+fuenteRow.Position = UDim2.new(0, 12, 0, 154)
+fuenteRow.Size = UDim2.new(1, -24, 0, 36)
+fuenteRow.BackgroundTransparency = 1
+fuenteRow.Parent = main
+
+local fuenteLayout = Instance.new("UIListLayout")
+fuenteLayout.FillDirection = Enum.FillDirection.Horizontal
+fuenteLayout.Padding = UDim.new(0, 6)
+fuenteLayout.SortOrder = Enum.SortOrder.LayoutOrder
+fuenteLayout.Parent = fuenteRow
+
+local btnOrbes = btn(fuenteRow, "✨ Orbes", UDim2.new(0.5, -3, 1, 0), C.track, 13)
+btnOrbes.LayoutOrder = 1
+local btnBreak = btn(fuenteRow, "🌰 Breakables", UDim2.new(0.5, -3, 1, 0), C.track, 13)
+btnBreak.LayoutOrder = 2
+
+btnOrbes.Activated:Connect(function()
+    S.fuente = "ORBES"
+    S.lista = {}
+    S.estado = "Farmeando orbes"
+end)
+btnBreak.Activated:Connect(function()
+    S.fuente = "BREAK"
+    S.lista = {}
+    S.estado = "Farmeando breakables"
+end)
+
 -- Selector de modo: TP / Deslizar
 local modoRow = Instance.new("Frame")
-modoRow.Position = UDim2.new(0, 12, 0, 154)
-modoRow.Size = UDim2.new(1, -24, 0, 36)
+modoRow.Position = UDim2.new(0, 12, 0, 196)
+modoRow.Size = UDim2.new(1, -24, 0, 32)
 modoRow.BackgroundTransparency = 1
 modoRow.Parent = main
 
@@ -476,9 +621,9 @@ modoLayout.Padding = UDim.new(0, 6)
 modoLayout.SortOrder = Enum.SortOrder.LayoutOrder
 modoLayout.Parent = modoRow
 
-local btnTP = btn(modoRow, "⚡ TP", UDim2.new(0.5, -3, 1, 0), C.track, 13)
+local btnTP = btn(modoRow, "⚡ TP", UDim2.new(0.5, -3, 1, 0), C.track, 12)
 btnTP.LayoutOrder = 1
-local btnDes = btn(modoRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), C.track, 13)
+local btnDes = btn(modoRow, "🌊 Deslizar", UDim2.new(0.5, -3, 1, 0), C.track, 12)
 btnDes.LayoutOrder = 2
 
 btnTP.Activated:Connect(function()
@@ -492,7 +637,7 @@ end)
 
 -- Fichas
 local chipsRow = Instance.new("Frame")
-chipsRow.Position = UDim2.new(0, 12, 0, 198)
+chipsRow.Position = UDim2.new(0, 12, 0, 236)
 chipsRow.Size = UDim2.new(1, -24, 0, 50)
 chipsRow.BackgroundTransparency = 1
 chipsRow.Parent = main
@@ -530,8 +675,8 @@ chip(4, "DISPONIBLES", "disponibles")
 
 -- Página con desplegables
 local page = Instance.new("ScrollingFrame")
-page.Position = UDim2.new(0, 12, 0, 256)
-page.Size = UDim2.new(1, -24, 1, -268)
+page.Position = UDim2.new(0, 12, 0, 296)
+page.Size = UDim2.new(1, -24, 1, -308)
 page.BackgroundTransparency = 1
 page.BorderSizePixel = 0
 page.ScrollBarThickness = 3
@@ -613,8 +758,53 @@ local function desplegable(orden, icono, titulo)
     return { cuerpo = cuerpo, resumen = res }
 end
 
--- Fila de un orbe en la lista
-local function filaOrbe(parent, orden)
+-- Fila con punto de color, nombre, contador y casilla
+local function fila(parent, orden, color, nombreTxt, onClick)
+    local f = Instance.new("TextButton")
+    f.LayoutOrder = orden
+    f.Size = UDim2.new(1, 0, 0, 40)
+    f.BackgroundColor3 = C.row
+    f.BorderSizePixel = 0
+    f.Text = ""
+    f.AutoButtonColor = false
+    f.Parent = parent
+    corner(f, 10)
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(10, 10)
+    dot.Position = UDim2.new(0, 12, 0.5, -5)
+    dot.BackgroundColor3 = color
+    dot.BorderSizePixel = 0
+    dot.Parent = f
+    corner(dot, 5)
+
+    local nombre = label(f, nombreTxt, 12, C.text, true)
+    nombre.Position = UDim2.new(0, 30, 0, 0)
+    nombre.Size = UDim2.new(1, -90, 1, 0)
+
+    local cuenta = label(f, "0", 11, C.muted, true, Enum.TextXAlignment.Right)
+    cuenta.Position = UDim2.new(1, -60, 0, 0)
+    cuenta.Size = UDim2.new(0, 28, 1, 0)
+
+    local box = Instance.new("Frame")
+    box.Size = UDim2.fromOffset(20, 20)
+    box.Position = UDim2.new(1, -28, 0.5, -10)
+    box.BorderSizePixel = 0
+    box.Parent = f
+    corner(box, 6)
+
+    local tick = label(box, "✓", 13, C.text, true, Enum.TextXAlignment.Center)
+    tick.Size = UDim2.new(1, 0, 1, 0)
+
+    if onClick then
+        f.Activated:Connect(onClick)
+    end
+
+    return { cuenta = cuenta, box = box, tick = tick }
+end
+
+-- Fila de un objetivo en la lista (top)
+local function filaObjetivo(parent, orden)
     local f = Instance.new("Frame")
     f.LayoutOrder = orden
     f.Size = UDim2.new(1, 0, 0, 36)
@@ -631,30 +821,19 @@ local function filaOrbe(parent, orden)
     nombre.Position = UDim2.new(0, 44, 0, 0)
     nombre.Size = UDim2.new(1, -150, 1, 0)
 
-    local xp = label(f, "", 12, C.gold, true, Enum.TextXAlignment.Right)
-    xp.Position = UDim2.new(1, -104, 0, 0)
-    xp.Size = UDim2.new(0, 90, 1, 0)
+    local valor = label(f, "", 11, C.gold, true, Enum.TextXAlignment.Right)
+    valor.Position = UDim2.new(1, -104, 0, 0)
+    valor.Size = UDim2.new(0, 90, 1, 0)
 
     local dist = label(f, "", 10, C.muted, false, Enum.TextXAlignment.Right)
     dist.Position = UDim2.new(1, -12, 0, 0)
     dist.Size = UDim2.new(0, 0, 1, 0)
     dist.AutomaticSize = Enum.AutomaticSize.X
 
-    return { frame = f, nombre = nombre, xp = xp, dist = dist }
+    return { frame = f, nombre = nombre, valor = valor, dist = dist }
 end
 
----------------------------------------------------------------
--- DESPLEGABLE: ORBES (top de mayor XP)
----------------------------------------------------------------
-local dOrbes = desplegable(1, "🔮", "Orbes")
-local filasTop = {}
-for i = 1, CONFIG.TOP do
-    filasTop[i] = filaOrbe(dOrbes.cuerpo, i)
-end
-
----------------------------------------------------------------
--- DESPLEGABLE: AJUSTES
----------------------------------------------------------------
+-- Fila de ajuste numérico con − y +
 local steppers = {}
 local function stepper(body, orden, nombreTxt, cfg, key, fmt)
     local row = Instance.new("Frame")
@@ -688,14 +867,38 @@ local function stepper(body, orden, nombreTxt, cfg, key, fmt)
     }
 end
 
-local dAjustes = desplegable(2, "⚙️", "Ajustes")
+---------------------------------------------------------------
+-- DESPLEGABLE: LISTA
+---------------------------------------------------------------
+local dLista = desplegable(1, "📋", "Objetivos")
+local filasTop = {}
+for i = 1, CONFIG.TOP do
+    filasTop[i] = filaObjetivo(dLista.cuerpo, i)
+end
+
+---------------------------------------------------------------
+-- DESPLEGABLE: TIPOS DE BREAKABLES
+---------------------------------------------------------------
+local dTipos = desplegable(2, "🌰", "Tipos de Breakables")
+local filasTipo = {}
+for i, t in ipairs(CONFIG.TIPOS_BREAK) do
+    filasTipo[i] = fila(dTipos.cuerpo, i, CONFIG.COLORES_TIPO[i], t, function()
+        S.tipoOn[i] = not S.tipoOn[i]
+        S.estado = (S.tipoOn[i] and "Farmeando " or "Ignorando ") .. t
+    end)
+end
+
+---------------------------------------------------------------
+-- DESPLEGABLE: AJUSTES
+---------------------------------------------------------------
+local dAjustes = desplegable(3, "⚙️", "Ajustes")
 stepper(dAjustes.cuerpo, 1, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d/s", v) end)
 stepper(dAjustes.cuerpo, 2, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d st", v) end)
 
 ---------------------------------------------------------------
 -- DESPLEGABLE: DIAGNÓSTICO
 ---------------------------------------------------------------
-local dDiag = desplegable(3, "🧪", "Diagnóstico")
+local dDiag = desplegable(4, "🧪", "Diagnóstico")
 
 local diagCard = Instance.new("Frame")
 diagCard.LayoutOrder = 1
@@ -757,11 +960,15 @@ end)
 ---------------------------------------------------------------
 -- REFRESCO
 ---------------------------------------------------------------
+local filasTipoRef = filasTipo
+
 local function refrescar()
     toggle.Text = S.activo and "●  ENCENDIDO" or "○  APAGADO"
     toggle.BackgroundColor3 = S.activo and C.green or C.track
     estadoLbl.Text = S.estado
 
+    btnOrbes.BackgroundColor3 = S.fuente == "ORBES" and C.accent or C.track
+    btnBreak.BackgroundColor3 = S.fuente == "BREAK" and C.accent or C.track
     btnTP.BackgroundColor3 = S.modo == "TP" and C.accent or C.track
     btnDes.BackgroundColor3 = S.modo == "DESLIZAR" and C.accent or C.track
 
@@ -776,31 +983,46 @@ local function refrescar()
         local e = S.lista[i]
         if e then
             f.frame.Visible = true
-            f.nombre.Text = e.obj.Name
-            f.xp.Text = fmtNum(e.xp) .. " XP"
+            f.nombre.Text = e.nombre
+            if S.fuente == "ORBES" then
+                f.valor.Text = fmtNum(e.xp) .. " XP"
+            else
+                f.valor.Text = e.tipo or ""
+            end
             f.dist.Text = string.format("%d st", math.floor((posOf(e.obj) - miPos).Magnitude))
         else
             f.frame.Visible = i == 1
             if i == 1 then
-                f.nombre.Text = "Sin orbes"
-                f.xp.Text = ""
+                f.nombre.Text = "Sin objetivos"
+                f.valor.Text = ""
                 f.dist.Text = ""
             end
         end
     end
-    dOrbes.resumen.Text = S.disponibles .. " orbes"
+    dLista.resumen.Text = S.disponibles .. " disp."
+
+    local nTipos = 0
+    for i, f in ipairs(filasTipoRef) do
+        f.cuenta.Text = tostring(S.conteoTipo[i] or 0)
+        f.box.BackgroundColor3 = S.tipoOn[i] and C.green or C.track
+        f.tick.Visible = S.tipoOn[i]
+        if S.tipoOn[i] then nTipos += 1 end
+    end
+    dTipos.resumen.Text = nTipos .. "/" .. #CONFIG.TIPOS_BREAK
 
     for _, s in ipairs(steppers) do
         s.refresh()
     end
     dAjustes.resumen.Text = S.modo == "TP" and "TP" or string.format("%d/s", S.velocidad)
 
-    local carpeta = ruta(Workspace, CONFIG.CARPETA)
+    local d = S.diag or {}
+    local carpetaTxt = S.fuente == "ORBES"
+        and table.concat(CONFIG.CARPETA_ORBES, ".")
+        or table.concat(CONFIG.CARPETA_BREAK, ".")
     local lines = {
-        "Carpeta " .. table.concat(CONFIG.CARPETA, ".") .. ": " .. (carpeta and "encontrada" or "no encontrada"),
-        "Orbes con prefijo '" .. CONFIG.PREFIJO .. "': " .. S.disponibles,
-        "Propiedad de XP: " .. CONFIG.NOMBRE_XP,
-        "Modo: " .. S.modo,
+        "Carpeta " .. carpetaTxt .. ": " .. (d.carpeta and "encontrada" or "no encontrada"),
+        "Objetivos disponibles: " .. (d.encontrados or 0),
+        "Con ProximityPrompt: " .. (d.conPrompt or 0) .. " · ClickDetector: " .. (d.conClick or 0) .. " · Vida: " .. (d.conVida or 0),
         "",
         "Últimos eventos:",
         #S.log > 0 and table.concat(S.log, "\n") or "(sin eventos todavía)",
