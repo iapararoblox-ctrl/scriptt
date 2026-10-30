@@ -18,7 +18,6 @@ local CONFIG = {
         Color3.fromRGB(210, 150, 90),  Color3.fromRGB(255, 225, 150), Color3.fromRGB(240, 200, 90),
         Color3.fromRGB(170, 200, 255),
     },
-    -- Nombres posibles de la propiedad de XP (atributo o ValueBase), se prueban en orden
     NOMBRES_XP     = { "XP", "Xp", "xp", "EXP", "Exp", "exp" },
     VELOCIDAD      = { ini = 250, min = 50, max = 800, paso = 50 },
     ALTURA         = { ini = 2, min = 0, max = 10, paso = 1 },
@@ -28,6 +27,7 @@ local CONFIG = {
     ESPERA_CICLO   = 0.4,
     TIMEOUT_VUELO  = 20,
     TOP            = 5,
+    NOMBRE_FLOTE   = "AutoFarmFlote",   -- nombre del BodyVelocity que mantiene el aire
 }
 
 ---------------------------------------------------------------
@@ -36,8 +36,9 @@ local CONFIG = {
 local S = {
     activo = false,
     cerrado = false,
-    fuente = "ORBES",               -- "ORBES" o "BREAK"
-    modo = "DESLIZAR",              -- "TP" o "DESLIZAR"
+    fuente = "ORBES",
+    modo = "DESLIZAR",
+    flotar = true,
     velocidad = CONFIG.VELOCIDAD.ini,
     altura = CONFIG.ALTURA.ini,
     tipoOn = {},
@@ -105,6 +106,26 @@ local function getRoot()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
+-- Mantiene al personaje en el aire: BodyVelocity con velocidad cero y fuerza alta.
+-- No se usa Anchored: un personaje anclado no envía su posición al servidor.
+local function setFlote(on)
+    local root = getRoot()
+    if not root then return end
+    local old = root:FindFirstChild(CONFIG.NOMBRE_FLOTE)
+    if on then
+        if not old then
+            local bv = Instance.new("BodyVelocity")
+            bv.Name = CONFIG.NOMBRE_FLOTE
+            bv.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+            bv.P = 1e4
+            bv.Velocity = Vector3.zero
+            bv.Parent = root
+        end
+    elseif old then
+        old:Destroy()
+    end
+end
+
 local function posOf(obj)
     if obj:IsA("Model") then
         return obj:GetPivot().Position
@@ -116,7 +137,6 @@ local function esOrb(name)
     return string.sub(name, 1, #CONFIG.PREFIJO_ORB) == CONFIG.PREFIJO_ORB
 end
 
--- Índice del tipo de Breakable (exacto o seguido de un número/sufijo, p. ej. "Acorn2")
 local function tipoDe(name)
     for i, t in ipairs(CONFIG.TIPOS_BREAK) do
         if name == t then
@@ -153,7 +173,6 @@ local function partesDe(obj)
     return partes
 end
 
--- Lee el XP: prueba varios nombres, primero como atributo y luego como ValueBase (en el objeto o dentro)
 local function leerXP(obj)
     for _, n in ipairs(CONFIG.NOMBRES_XP) do
         local v = obj:GetAttribute(n)
@@ -182,7 +201,6 @@ local function estaRoto(obj)
     return false
 end
 
--- Orden común: mayor XP primero; si empatan, el más cercano
 local function ordenar(lista)
     table.sort(lista, function(a, b)
         if a.xp ~= b.xp then
@@ -425,6 +443,14 @@ task.spawn(function()
         else
             ciclo()
         end
+    end
+end)
+
+-- Mantiene el flote mientras farmeas (y lo vuelve a poner si reapareces)
+task.spawn(function()
+    while not S.cerrado do
+        setFlote(S.activo and S.flotar)
+        task.wait(0.2)
     end
 end)
 
@@ -884,6 +910,10 @@ end
 local dAjustes = desplegable(3, "⚙️", "Ajustes")
 stepper(dAjustes.cuerpo, 1, "Velocidad", CONFIG.VELOCIDAD, "velocidad", function(v) return string.format("%d/s", v) end)
 stepper(dAjustes.cuerpo, 2, "Altura", CONFIG.ALTURA, "altura", function(v) return string.format("%d st", v) end)
+local filaFlote = fila(dAjustes.cuerpo, 3, C.green, "Flotar (no caer)", function()
+    S.flotar = not S.flotar
+    S.estado = S.flotar and "Flotar activado" or "Flotar desactivado"
+end)
 
 local dDiag = desplegable(4, "🧪", "Diagnóstico")
 
@@ -938,6 +968,7 @@ end)
 closeBtn.Activated:Connect(function()
     S.cerrado = true
     S.activo = false
+    setFlote(false)
     gui:Destroy()
 end)
 
@@ -992,6 +1023,8 @@ local function refrescar()
     for _, s in ipairs(steppers) do
         s.refresh()
     end
+    filaFlote.box.BackgroundColor3 = S.flotar and C.green or C.track
+    filaFlote.tick.Visible = S.flotar
     dAjustes.resumen.Text = S.modo == "TP" and "TP" or string.format("%d/s", S.velocidad)
 
     local d = S.diag or {}
@@ -1003,6 +1036,7 @@ local function refrescar()
         "Objetivos: " .. (d.encontrados or 0) .. " · con XP: " .. (d.conXP or 0),
         "XP del objetivo #1: " .. (d.topXP and fmtNum(d.topXP) or "—"),
         "Prompt: " .. (d.conPrompt or 0) .. " · Click: " .. (d.conClick or 0) .. " · Vida: " .. (d.conVida or 0),
+        "Flote: " .. (root and root:FindFirstChild(CONFIG.NOMBRE_FLOTE) and "activo" or "inactivo"),
         "Propiedades de XP buscadas: " .. table.concat(CONFIG.NOMBRES_XP, ", "),
         "",
         "Últimos eventos:",
