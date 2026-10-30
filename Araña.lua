@@ -19,6 +19,7 @@ local CONFIG = {
         Color3.fromRGB(170, 200, 255),
     },
     NOMBRES_XP     = { "XP", "Xp", "xp", "EXP", "Exp", "exp" },
+    NOMBRES_COINS  = { "Coins", "Coin", "coins", "coin", "Money", "Cash" },
     VELOCIDAD      = { ini = 250, min = 50, max = 800, paso = 50 },
     ALTURA         = { ini = 2, min = 0, max = 10, paso = 1 },
     ESPERA_TOQUE   = 0.6,
@@ -27,7 +28,7 @@ local CONFIG = {
     ESPERA_CICLO   = 0.4,
     TIMEOUT_VUELO  = 20,
     TOP            = 5,
-    NOMBRE_FLOTE   = "AutoFarmFlote",   -- nombre del BodyVelocity que mantiene el aire
+    NOMBRE_FLOTE   = "AutoFarmFlote",
 }
 
 ---------------------------------------------------------------
@@ -36,8 +37,9 @@ local CONFIG = {
 local S = {
     activo = false,
     cerrado = false,
-    fuente = "ORBES",
-    modo = "DESLIZAR",
+    fuente = "ORBES",               -- "ORBES" o "BREAK"
+    criterio = "XP",                -- en Breakables: "XP" o "COINS"
+    modo = "DESLIZAR",              -- "TP" o "DESLIZAR"
     flotar = true,
     velocidad = CONFIG.VELOCIDAD.ini,
     altura = CONFIG.ALTURA.ini,
@@ -46,7 +48,8 @@ local S = {
     recogidos = 0,
     fallos = 0,
     xpTotal = 0,
-    mejorXP = 0,
+    coinsTotal = 0,
+    mejor = 0,
     disponibles = 0,
     lista = {},
     cooldown = {},
@@ -89,6 +92,14 @@ local function fmtNum(n)
     return tostring(math.floor(n))
 end
 
+-- Etiqueta del valor que se está farmeando ahora
+local function unidad()
+    if S.fuente == "BREAK" and S.criterio == "COINS" then
+        return "Coins"
+    end
+    return "XP"
+end
+
 ---------------------------------------------------------------
 -- UTILIDADES
 ---------------------------------------------------------------
@@ -106,8 +117,7 @@ local function getRoot()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
--- Mantiene al personaje en el aire: BodyVelocity con velocidad cero y fuerza alta.
--- No se usa Anchored: un personaje anclado no envía su posición al servidor.
+-- Mantiene al personaje en el aire con un BodyVelocity de velocidad cero (sin Anchored)
 local function setFlote(on)
     local root = getRoot()
     if not root then return end
@@ -173,14 +183,15 @@ local function partesDe(obj)
     return partes
 end
 
-local function leerXP(obj)
-    for _, n in ipairs(CONFIG.NOMBRES_XP) do
+-- Lee un valor numérico probando varios nombres: primero atributos, luego ValueBase
+local function leerNumero(obj, nombres)
+    for _, n in ipairs(nombres) do
         local v = obj:GetAttribute(n)
         if v ~= nil and tonumber(v) then
             return tonumber(v)
         end
     end
-    for _, n in ipairs(CONFIG.NOMBRES_XP) do
+    for _, n in ipairs(nombres) do
         local c = obj:FindFirstChild(n, true)
         if c and c:IsA("ValueBase") and tonumber(c.Value) then
             return tonumber(c.Value)
@@ -201,10 +212,11 @@ local function estaRoto(obj)
     return false
 end
 
+-- Orden común: mayor valor primero; si empatan, el más cercano
 local function ordenar(lista)
     table.sort(lista, function(a, b)
-        if a.xp ~= b.xp then
-            return a.xp > b.xp
+        if a.valor ~= b.valor then
+            return a.valor > b.valor
         end
         return a.dist < b.dist
     end)
@@ -215,20 +227,22 @@ end
 ---------------------------------------------------------------
 local function escanearOrbes(lista, miPos, ahora)
     local carpeta = ruta(Workspace, CONFIG.CARPETA_ORBES)
-    local diag = { carpeta = carpeta ~= nil, encontrados = 0, conXP = 0, conPrompt = 0, conClick = 0, conVida = 0 }
+    local diag = { carpeta = carpeta ~= nil, encontrados = 0, conValor = 0, conPrompt = 0, conClick = 0, conVida = 0 }
     if carpeta then
         for _, obj in ipairs(carpeta:GetDescendants()) do
             if (obj:IsA("Model") or obj:IsA("BasePart"))
                 and esOrb(obj.Name)
                 and not dentroDe(obj, carpeta, function(p) return esOrb(p.Name) or p:IsA("Model") end)
                 and (not S.cooldown[obj] or S.cooldown[obj] <= ahora) then
-                local xp = leerXP(obj)
+                local xp = leerNumero(obj, CONFIG.NOMBRES_XP)
                 diag.encontrados += 1
-                if xp > 0 then diag.conXP += 1 end
+                if xp > 0 then diag.conValor += 1 end
                 table.insert(lista, {
                     obj = obj,
                     nombre = obj.Name,
                     xp = xp,
+                    coins = 0,
+                    valor = xp,
                     dist = (posOf(obj) - miPos).Magnitude,
                 })
             end
@@ -240,9 +254,10 @@ end
 
 local function escanearBreak(lista, miPos, ahora)
     local carpeta = ruta(Workspace, CONFIG.CARPETA_BREAK)
-    local diag = { carpeta = carpeta ~= nil, encontrados = 0, conXP = 0, conPrompt = 0, conClick = 0, conVida = 0 }
+    local diag = { carpeta = carpeta ~= nil, encontrados = 0, conValor = 0, conPrompt = 0, conClick = 0, conVida = 0 }
     local conteo = {}
     for i = 1, #CONFIG.TIPOS_BREAK do conteo[i] = 0 end
+    local porCoins = S.criterio == "COINS"
 
     if carpeta then
         for _, obj in ipairs(carpeta:GetDescendants()) do
@@ -250,9 +265,11 @@ local function escanearBreak(lista, miPos, ahora)
             if idx and not dentroDe(obj, carpeta, function(p) return p:IsA("Model") and tipoDe(p.Name) ~= nil end) then
                 conteo[idx] += 1
                 if S.tipoOn[idx] and (not S.cooldown[obj] or S.cooldown[obj] <= ahora) then
-                    local xp = leerXP(obj)
+                    local xp = leerNumero(obj, CONFIG.NOMBRES_XP)
+                    local coins = leerNumero(obj, CONFIG.NOMBRES_COINS)
+                    local valor = porCoins and coins or xp
                     diag.encontrados += 1
-                    if xp > 0 then diag.conXP += 1 end
+                    if valor > 0 then diag.conValor += 1 end
                     if obj:FindFirstChildWhichIsA("ProximityPrompt", true) then diag.conPrompt += 1 end
                     if obj:FindFirstChildWhichIsA("ClickDetector", true) then diag.conClick += 1 end
                     if obj:GetAttribute("Health") ~= nil then diag.conVida += 1 end
@@ -261,6 +278,8 @@ local function escanearBreak(lista, miPos, ahora)
                         nombre = obj.Name,
                         tipo = CONFIG.TIPOS_BREAK[idx],
                         xp = xp,
+                        coins = coins,
+                        valor = valor,
                         dist = (posOf(obj) - miPos).Magnitude,
                     })
                 end
@@ -286,10 +305,11 @@ local function escanear()
         diag = escanearBreak(lista, miPos, ahora)
     end
 
-    if lista[1] and lista[1].xp > S.mejorXP then
-        S.mejorXP = lista[1].xp
+    if lista[1] and lista[1].valor > S.mejor then
+        S.mejor = lista[1].valor
     end
-    diag.topXP = lista[1] and lista[1].xp or nil
+    diag.topValor = lista[1] and lista[1].valor or nil
+    diag.topCoins = lista[1] and lista[1].coins or nil
     S.lista = lista
     S.disponibles = #lista
     S.diag = diag
@@ -399,8 +419,8 @@ local function ciclo()
         return
     end
 
-    if top.xp > 0 then
-        S.estado = "Yendo a " .. top.nombre .. " (" .. fmtNum(top.xp) .. " XP)"
+    if top.valor > 0 then
+        S.estado = "Yendo a " .. top.nombre .. " (" .. fmtNum(top.valor) .. " " .. unidad() .. ")"
     else
         S.estado = "Yendo a " .. top.nombre
     end
@@ -416,10 +436,14 @@ local function ciclo()
     S.estado = "Interactuando con " .. top.nombre
     if interactuar(top.obj) then
         S.recogidos += 1
-        S.xpTotal += top.xp
-        if top.xp > 0 then
-            S.estado = "Recogido: +" .. fmtNum(top.xp) .. " XP"
-            log("+" .. fmtNum(top.xp) .. " XP (" .. top.nombre .. ")")
+        if S.fuente == "BREAK" and S.criterio == "COINS" then
+            S.coinsTotal += top.coins
+        else
+            S.xpTotal += top.xp
+        end
+        if top.valor > 0 then
+            S.estado = "Recogido: +" .. fmtNum(top.valor) .. " " .. unidad()
+            log("+" .. fmtNum(top.valor) .. " " .. unidad() .. " (" .. top.nombre .. ")")
         else
             S.estado = "Conseguido: " .. top.nombre
             log("Conseguido: " .. top.nombre)
@@ -446,7 +470,6 @@ task.spawn(function()
     end
 end)
 
--- Mantiene el flote mientras farmeas (y lo vuelve a poner si reapareces)
 task.spawn(function()
     while not S.cerrado do
         setFlote(S.activo and S.flotar)
@@ -546,7 +569,7 @@ local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0.5, 0.5)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
-main.Size = UDim2.fromOffset(320, 480)
+main.Size = UDim2.fromOffset(320, 520)
 main.BackgroundColor3 = C.bg
 main.BorderSizePixel = 0
 main.ClipsDescendants = true
@@ -560,7 +583,7 @@ uiScale.Parent = main
 local function ajustarEscala()
     local cam = Workspace.CurrentCamera
     local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-    uiScale.Scale = math.clamp(math.min(vp.X * 0.94 / 320, vp.Y * 0.86 / 480), 0.5, 1)
+    uiScale.Scale = math.clamp(math.min(vp.X * 0.94 / 320, vp.Y * 0.86 / 520), 0.5, 1)
 end
 ajustarEscala()
 if Workspace.CurrentCamera then
@@ -612,6 +635,7 @@ local estadoLbl = label(estadoCard, "Listo", 11, C.muted, false)
 estadoLbl.Position = UDim2.new(0, 12, 0, 0)
 estadoLbl.Size = UDim2.new(1, -24, 1, 0)
 
+-- Fuente: Orbes / Breakables
 local fuenteRow = Instance.new("Frame")
 fuenteRow.Position = UDim2.new(0, 12, 0, 154)
 fuenteRow.Size = UDim2.new(1, -24, 0, 36)
@@ -632,16 +656,48 @@ btnBreak.LayoutOrder = 2
 btnOrbes.Activated:Connect(function()
     S.fuente = "ORBES"
     S.lista = {}
-    S.estado = "Farmeando orbes"
+    S.mejor = 0
+    S.estado = "Farmeando orbes (XP)"
 end)
 btnBreak.Activated:Connect(function()
     S.fuente = "BREAK"
     S.lista = {}
-    S.estado = "Farmeando breakables"
+    S.mejor = 0
+    S.estado = "Farmeando breakables (" .. unidad() .. ")"
 end)
 
+-- Criterio en Breakables: XP / Coins
+local critRow = Instance.new("Frame")
+critRow.Position = UDim2.new(0, 12, 0, 196)
+critRow.Size = UDim2.new(1, -24, 0, 32)
+critRow.BackgroundTransparency = 1
+critRow.Parent = main
+
+local critLayout = Instance.new("UIListLayout")
+critLayout.FillDirection = Enum.FillDirection.Horizontal
+critLayout.Padding = UDim.new(0, 6)
+critLayout.SortOrder = Enum.SortOrder.LayoutOrder
+critLayout.Parent = critRow
+
+local btnCritXP = btn(critRow, "⭐ Por XP", UDim2.new(0.5, -3, 1, 0), C.track, 12)
+btnCritXP.LayoutOrder = 1
+local btnCritCoins = btn(critRow, "🪙 Por Coins", UDim2.new(0.5, -3, 1, 0), C.track, 12)
+btnCritCoins.LayoutOrder = 2
+
+btnCritXP.Activated:Connect(function()
+    S.criterio = "XP"
+    S.mejor = 0
+    S.estado = "Breakables por XP"
+end)
+btnCritCoins.Activated:Connect(function()
+    S.criterio = "COINS"
+    S.mejor = 0
+    S.estado = "Breakables por Coins"
+end)
+
+-- Modo: TP / Deslizar
 local modoRow = Instance.new("Frame")
-modoRow.Position = UDim2.new(0, 12, 0, 196)
+modoRow.Position = UDim2.new(0, 12, 0, 236)
 modoRow.Size = UDim2.new(1, -24, 0, 32)
 modoRow.BackgroundTransparency = 1
 modoRow.Parent = main
@@ -666,8 +722,9 @@ btnDes.Activated:Connect(function()
     S.estado = "Modo deslizar"
 end)
 
+-- Fichas
 local chipsRow = Instance.new("Frame")
-chipsRow.Position = UDim2.new(0, 12, 0, 236)
+chipsRow.Position = UDim2.new(0, 12, 0, 276)
 chipsRow.Size = UDim2.new(1, -24, 0, 50)
 chipsRow.BackgroundTransparency = 1
 chipsRow.Parent = main
@@ -679,6 +736,7 @@ chipsLayout.SortOrder = Enum.SortOrder.LayoutOrder
 chipsLayout.Parent = chipsRow
 
 local chipVals = {}
+local chipLabs = {}
 local function chip(orden, texto, key, color)
     local f = Instance.new("Frame")
     f.LayoutOrder = orden
@@ -697,15 +755,17 @@ local function chip(orden, texto, key, color)
     c.Size = UDim2.new(1, 0, 0, 14)
 
     chipVals[key] = v
+    chipLabs[key] = c
 end
 chip(1, "RECOGIDOS", "recogidos")
-chip(2, "XP TOTAL", "xpTotal", C.gold)
-chip(3, "MEJOR XP", "mejorXP", C.gold)
+chip(2, "XP TOTAL", "total", C.gold)
+chip(3, "MEJOR", "mejor", C.gold)
 chip(4, "DISPONIBLES", "disponibles")
 
+-- Página con desplegables
 local page = Instance.new("ScrollingFrame")
-page.Position = UDim2.new(0, 12, 0, 296)
-page.Size = UDim2.new(1, -24, 1, -308)
+page.Position = UDim2.new(0, 12, 0, 336)
+page.Size = UDim2.new(1, -24, 1, -348)
 page.BackgroundTransparency = 1
 page.BorderSizePixel = 0
 page.ScrollBarThickness = 3
@@ -977,16 +1037,32 @@ local function refrescar()
     toggle.BackgroundColor3 = S.activo and C.green or C.track
     estadoLbl.Text = S.estado
 
+    local esBreak = S.fuente == "BREAK"
+    local porCoins = esBreak and S.criterio == "COINS"
+
     btnOrbes.BackgroundColor3 = S.fuente == "ORBES" and C.accent or C.track
-    btnBreak.BackgroundColor3 = S.fuente == "BREAK" and C.accent or C.track
+    btnBreak.BackgroundColor3 = esBreak and C.accent or C.track
+    btnCritXP.BackgroundColor3 = (esBreak and not porCoins) and C.accent or C.track
+    btnCritCoins.BackgroundColor3 = porCoins and C.accent or C.track
+    btnCritXP.TextTransparency = esBreak and 0 or 0.5
+    btnCritCoins.TextTransparency = esBreak and 0 or 0.5
     btnTP.BackgroundColor3 = S.modo == "TP" and C.accent or C.track
     btnDes.BackgroundColor3 = S.modo == "DESLIZAR" and C.accent or C.track
 
     chipVals.recogidos.Text = tostring(S.recogidos)
-    chipVals.xpTotal.Text = fmtNum(S.xpTotal)
-    chipVals.mejorXP.Text = fmtNum(S.mejorXP)
+    if porCoins then
+        chipLabs.total.Text = "COINS TOTAL"
+        chipVals.total.Text = fmtNum(S.coinsTotal)
+        chipLabs.mejor.Text = "MEJOR COINS"
+    else
+        chipLabs.total.Text = "XP TOTAL"
+        chipVals.total.Text = fmtNum(S.xpTotal)
+        chipLabs.mejor.Text = "MEJOR XP"
+    end
+    chipVals.mejor.Text = fmtNum(S.mejor)
     chipVals.disponibles.Text = tostring(S.disponibles)
 
+    local unidadTxt = porCoins and "Coins" or "XP"
     local root = getRoot()
     local miPos = root and root.Position or Vector3.zero
     for i, f in ipairs(filasTop) do
@@ -994,10 +1070,10 @@ local function refrescar()
         if e then
             f.frame.Visible = true
             f.nombre.Text = e.nombre
-            if e.xp > 0 then
-                f.valor.Text = fmtNum(e.xp) .. " XP"
+            if e.valor > 0 then
+                f.valor.Text = fmtNum(e.valor) .. " " .. unidadTxt
             else
-                f.valor.Text = e.tipo or "sin XP"
+                f.valor.Text = e.tipo or "sin valor"
             end
             f.dist.Text = string.format("%d st", math.floor((posOf(e.obj) - miPos).Magnitude))
         else
@@ -1033,11 +1109,13 @@ local function refrescar()
         or table.concat(CONFIG.CARPETA_BREAK, ".")
     local lines = {
         "Carpeta " .. carpetaTxt .. ": " .. (d.carpeta and "encontrada" or "no encontrada"),
-        "Objetivos: " .. (d.encontrados or 0) .. " · con XP: " .. (d.conXP or 0),
-        "XP del objetivo #1: " .. (d.topXP and fmtNum(d.topXP) or "—"),
+        "Objetivos: " .. (d.encontrados or 0) .. " · con valor: " .. (d.conValor or 0),
+        "Valor del objetivo #1: " .. (d.topValor and fmtNum(d.topValor) or "—") .. " " .. unidadTxt,
+        "Coins del objetivo #1: " .. (d.topCoins and fmtNum(d.topCoins) or "—"),
         "Prompt: " .. (d.conPrompt or 0) .. " · Click: " .. (d.conClick or 0) .. " · Vida: " .. (d.conVida or 0),
         "Flote: " .. (root and root:FindFirstChild(CONFIG.NOMBRE_FLOTE) and "activo" or "inactivo"),
-        "Propiedades de XP buscadas: " .. table.concat(CONFIG.NOMBRES_XP, ", "),
+        "XP buscado en: " .. table.concat(CONFIG.NOMBRES_XP, ", "),
+        "Coins buscado en: " .. table.concat(CONFIG.NOMBRES_COINS, ", "),
         "",
         "Últimos eventos:",
         #S.log > 0 and table.concat(S.log, "\n") or "(sin eventos todavía)",
