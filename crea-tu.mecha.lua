@@ -1,5 +1,5 @@
--- MECHA PANEL v2 · Auto-recolección + retorno a la base (LocalScript móvil)
--- Compacto, minimizable a burbuja. Usa CarryTotal / CarryCapacity del mecha.
+-- MECHA PANEL v3 · Recolección por pilas reales + retorno a la base
+-- LocalScript móvil (StarterPlayer > StarterPlayerScripts)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,22 +12,54 @@ local LocalPlayer = Players.LocalPlayer
 ---------------------------------------------------------------
 local CFG = {
 	GUI_NAME = "MechaMobilePanel",
-	PANEL_W = 240,
-	PANEL_H = 340,
+	PANEL_W = 250,
+	PANEL_H = 440,
 	BUBBLE = 48,
-	SPEED_MIN = 10,
-	SPEED_MAX = 150,
-	SPEED_STEP = 10,
-	SPEED_DEFAULT = 40,
-	RANGO_RECOGER = 40,      -- studs para activar piezas con ProximityPrompt
-	CAP_DEFECTO = 16,        -- capacidad si el mecha no tiene CarryCapacity
-	VUELO_VEL = 110,         -- studs por segundo al desplazarse
-	ESPERA_PROMPT = 0.2,     -- pausa entre prompts
-	COOLDOWN_PROMPT = 1.5,   -- segundos antes de volver a activar el mismo prompt
-	ESPERA_DESCARGA = 6,     -- segundos máximos esperando que se vacíe en la base
-	ALTURA = 4,              -- studs sobre el punto de destino
-	TICK = 0.6,              -- espera entre ciclos si no hay piezas cerca
+
+	-- Dónde están las pilas: Workspace.World.Arenas.<nivel>.PartPiles.<tipo>
+	ARENAS = { "World", "Arenas" },
+	LEVELS = {
+		"Level1_ScrapYard",
+		"Level2_RustyRails",
+		"Level3_SkylineHeights",
+		"Level4_ToxicBog",
+		"Level5_OutpostZero",
+		"Level9_KaijuBay",
+		"Level10_EmpireCity",
+	},
+	LEVEL_LABELS = {
+		"Scrap Yard", "Rusty Rails", "Skyline Heights", "Toxic Bog",
+		"Outpost Zero", "Kaiju Bay", "Empire City",
+	},
+	PILES = {
+		"Chunk", "LightPartPile", "ScrapPartPile", "HeavyPartPile",
+		"MediumPartPile", "ColossalPartPile", "TitanPartPile", "BigScrapPartPile",
+	},
+	PILE_LABELS = {
+		"Chunk", "Ligera", "Chatarra", "Pesada",
+		"Media", "Colosal", "Titán", "G.Chat",
+	},
+
+	VEL_MIN = 20,
+	VEL_MAX = 250,
+	VEL_STEP = 10,
+	VEL_DEFAULT = 90,     -- studs por segundo al desplazarse
+
+	ALTURA = 3,           -- studs sobre la pila o la base
+	LLEGADA = 5,          -- distancia para considerar que llegaste
+	RANGO_PROMPT = 20,    -- alcance que se da al ProximityPrompt
+	ESPERA_CARGA = 1.5,   -- segundos esperando que suba CarryTotal tras activar la pila
+	ESPERA_DESCARGA = 25, -- segundos máximos esperando a descargar en la base
+	COOLDOWN_OK = 2,      -- segundos sin tocar una pila recogida
+	COOLDOWN_FALLO = 6,   -- segundos sin tocar una pila que no dio carga
+	REVISAR_MECHA = 2,    -- cada cuántos segundos se vuelve a buscar el mecha
+	BASE_MARCADOR = "YourBaseMarker",
 }
+
+local PILE_INDEX = {}
+for i, n in ipairs(CFG.PILES) do
+	PILE_INDEX[n] = i
+end
 
 local COLOR = {
 	bg = Color3.fromRGB(20, 22, 30),
@@ -51,22 +83,37 @@ local COLOR = {
 local S = {
 	closed = false,
 	on = false,
-	speed = CFG.SPEED_DEFAULT,
-	state = "Parado",
+	vel = CFG.VEL_DEFAULT,
+	levelIdx = 0,                 -- 0 = todos los niveles, 1..7 = un nivel
+	pileOn = { true, true, true, true, true, true, true, true },
+	mech = nil,
+	mechCheck = 0,
 	total = 0,
-	cap = CFG.CAP_DEFECTO,
-	base = nil,        -- Vector3 guardado con el botón 📍 Base
-	zone = nil,        -- Vector3 guardado con el botón 📍 Zona
+	cap = 16,
+	ligero = 0,
+	chatarra = 0,
+	max = 0,
+	base = nil,                   -- Vector3 guardado con el botón 📍 Base
+	estado = "Parado",
 	placed = false,
 	minimized = false,
 }
 
 local cooldown = setmetatable({}, { __mode = "k" })
-local ui = {}
+local ui = { piles = {} }
 
 ---------------------------------------------------------------
--- HELPERS DE INTERFAZ
+-- HELPERS GENERALES
 ---------------------------------------------------------------
+local function ruta(root, pasos)
+	local cur = root
+	for _, p in ipairs(pasos) do
+		cur = cur and cur:FindFirstChild(p)
+		if not cur then return nil end
+	end
+	return cur
+end
+
 local function getParent()
 	local ok, h = pcall(function() return gethui and gethui() end)
 	if ok and h then return h end
@@ -75,6 +122,361 @@ local function getParent()
 	return LocalPlayer:WaitForChild("PlayerGui")
 end
 
+local function viewport()
+	local cam = Workspace.CurrentCamera
+	return cam and cam.ViewportSize or Vector2.new(390, 844)
+end
+
+local function clampPos(x, y, w, h)
+	local vp = viewport()
+	return math.clamp(x, 0, math.max(0, vp.X - w)), math.clamp(y, 0, math.max(0, vp.Y - h))
+end
+
+local function fitScale()
+	local vp = viewport()
+	return math.clamp(math.min(vp.X * 0.9 / CFG.PANEL_W, vp.Y * 0.78 / CFG.PANEL_H, 1.1), 0.6, 1.1)
+end
+
+local function posOf(obj)
+	if obj:IsA("Model") then
+		return obj:GetPivot().Position
+	end
+	if obj:IsA("BasePart") then
+		return obj.Position
+	end
+	local bp = obj:FindFirstChildWhichIsA("BasePart", true)
+	return bp and bp.Position
+end
+
+local function num(v, d)
+	return tonumber(v) or d
+end
+
+---------------------------------------------------------------
+-- MECHA
+---------------------------------------------------------------
+-- ¿Este modelo es mío? Compara OwnerName/Owner con tu nombre, DisplayName o UserId
+local function esMio(m)
+	local nombre = LocalPlayer.Name
+	local dueño = m:GetAttribute("OwnerName") or m:GetAttribute("Owner")
+	if dueño ~= nil then
+		local s = tostring(dueño)
+		return s == "LocalPlayer" or s == nombre or s == LocalPlayer.DisplayName or s == tostring(LocalPlayer.UserId)
+	end
+	return string.find(m.Name, nombre, 1, true) ~= nil
+end
+
+local function buscarMecha()
+	local candidato
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("Model") and (d:GetAttribute("MechId") ~= nil or d:GetAttribute("CarryCapacity") ~= nil) then
+			if esMio(d) then
+				if d:GetAttribute("MechId") ~= nil then
+					return d
+				end
+				candidato = candidato or d
+			end
+		end
+	end
+	return candidato
+end
+
+local function getMech()
+	local ahora = os.clock()
+	if S.mech and S.mech.Parent and ahora < S.mechCheck then
+		return S.mech
+	end
+	S.mech = buscarMecha()
+	S.mechCheck = ahora + CFG.REVISAR_MECHA
+	return S.mech
+end
+
+-- Lee la carga del mecha: total, capacidad, ligera, chatarra y máximo
+local function leerCarga(m)
+	local total = num(m:GetAttribute("CarryTotal"), 0)
+	local cap = num(m:GetAttribute("CarryCapacity"), 16)
+	local ligero = num(m:GetAttribute("Carry_Light"), 0)
+	local chatarra = num(m:GetAttribute("Carry_Scrap"), 0)
+	local max = num(m:GetAttribute("CarryMax"), cap)
+	return total, cap, ligero, chatarra, max
+end
+
+-- Parte que se mueve: el asiento del mecha si estás pilotando, si no tu personaje
+local function parteMovil()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.SeatPart then
+		return hum.SeatPart:GetRootPart() or hum.SeatPart
+	end
+	return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getBase()
+	if S.base then
+		return S.base
+	end
+	local m = Workspace:FindFirstChild(CFG.BASE_MARCADOR)
+	if m then
+		return posOf(m)
+	end
+	return nil
+end
+
+---------------------------------------------------------------
+-- MOVIMIENTO SUAVE
+---------------------------------------------------------------
+local function glideTo(target, tolerancia)
+	local inicio = parteMovil()
+	if not inicio then return false end
+	local dist0 = (target - inicio.Position).Magnitude
+	local limite = os.clock() + math.max(6, dist0 / math.max(S.vel, 1) * 3)
+
+	while S.on and not S.closed do
+		local part = parteMovil()
+		if not part or not part.Parent then return false end
+
+		local cur = part.Position
+		local delta = target - cur
+		local dist = delta.Magnitude
+		if dist <= tolerancia then
+			part.AssemblyLinearVelocity = Vector3.zero
+			return true
+		end
+		if os.clock() > limite then return false end
+
+		local dt = RunService.Heartbeat:Wait()
+		local paso = math.min(dist, S.vel * dt)
+		part.AssemblyLinearVelocity = Vector3.zero
+		part.CFrame = CFrame.new(cur + delta.Unit * paso) * (part.CFrame - part.CFrame.Position)
+	end
+	return false
+end
+
+---------------------------------------------------------------
+-- PILAS (solo dentro de PartPiles)
+---------------------------------------------------------------
+-- Devuelve la lista de pilas disponibles (más cercana primero) y si existe World.Arenas
+local function listarPilas()
+	local lista = {}
+	local arenas = ruta(Workspace, CFG.ARENAS)
+	if not arenas then
+		return lista, false
+	end
+
+	local origen = parteMovil()
+	local origenPos = origen and origen.Position or Vector3.zero
+	local ahora = os.clock()
+
+	for li, nombreNivel in ipairs(CFG.LEVELS) do
+		if S.levelIdx == 0 or S.levelIdx == li then
+			local nivel = arenas:FindFirstChild(nombreNivel)
+			local piles = nivel and nivel:FindFirstChild("PartPiles")
+			if piles then
+				for _, pile in ipairs(piles:GetChildren()) do
+					local ti = PILE_INDEX[pile.Name]
+					if ti and S.pileOn[ti] then
+						local prompt = pile:FindFirstChildWhichIsA("ProximityPrompt", true)
+						local pos = posOf(pile)
+						if prompt and prompt.Enabled and pos and (not cooldown[prompt] or cooldown[prompt] <= ahora) then
+							table.insert(lista, {
+								prompt = prompt,
+								pos = pos,
+								nombre = CFG.PILE_LABELS[ti],
+								dist = (pos - origenPos).Magnitude,
+							})
+						end
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(lista, function(a, b) return a.dist < b.dist end)
+	return lista, true
+end
+
+local function activarPrompt(prompt)
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		if prompt.MaxActivationDistance < CFG.RANGO_PROMPT then
+			prompt.MaxActivationDistance = CFG.RANGO_PROMPT
+		end
+	end)
+	if fireproximityprompt then
+		pcall(fireproximityprompt, prompt)
+		return true
+	end
+	return false
+end
+
+-- Va a la pila, la activa y espera a que suba CarryTotal. Devuelve ok, motivo
+local function recolectar(p, mech)
+	if not glideTo(p.pos + Vector3.new(0, CFG.ALTURA, 0), CFG.LLEGADA) then
+		return false, "no llegué"
+	end
+	if not S.on then
+		return false, "parado"
+	end
+	if not activarPrompt(p.prompt) then
+		return false, "sin fireproximityprompt"
+	end
+
+	local antes = leerCarga(mech)
+	local t0 = os.clock()
+	while S.on and os.clock() - t0 < CFG.ESPERA_CARGA do
+		task.wait(0.1)
+		if not p.prompt.Parent then
+			return true -- la pila desapareció: se recogió
+		end
+		if leerCarga(mech) > antes then
+			cooldown[p.prompt] = os.clock() + CFG.COOLDOWN_OK
+			return true
+		end
+	end
+
+	cooldown[p.prompt] = os.clock() + CFG.COOLDOWN_FALLO
+	return false, "la carga no subió"
+end
+
+---------------------------------------------------------------
+-- ESTADO EN PANTALLA
+---------------------------------------------------------------
+local function setEstado(texto, color)
+	S.estado = texto
+	if ui.estado then
+		ui.estado.Text = texto
+		ui.estado.TextColor3 = color or COLOR.sub
+	end
+end
+
+local msgId = 0
+local function setMsg(texto, color)
+	msgId += 1
+	local my = msgId
+	if ui.msg then
+		ui.msg.Text = texto
+		ui.msg.TextColor3 = color or COLOR.sub
+	end
+	task.delay(3, function()
+		if my == msgId and ui.msg and ui.msg.Parent then
+			ui.msg.Text = ""
+		end
+	end)
+end
+
+local function refreshUI()
+	if S.closed or not ui.carry then return end
+
+	ui.carry.Text = S.total .. " / " .. S.cap
+	local r = math.clamp(S.total / math.max(S.cap, 1), 0, 1)
+	ui.fill.Size = UDim2.new(r, 0, 1, 0)
+	ui.fill.BackgroundColor3 = (r >= 1 and COLOR.red) or (r >= 0.7 and COLOR.amber) or COLOR.green
+
+	ui.sub.Text = "Ligera " .. S.ligero .. "  ·  Chatarra " .. S.chatarra .. "  ·  Máx " .. S.max
+
+	ui.auto.Text = S.on and "■  DETENER" or "▶  AUTO RECOLECTAR"
+	ui.auto.BackgroundColor3 = S.on and COLOR.red or COLOR.green
+	ui.bubble.BackgroundColor3 = S.on and COLOR.green or COLOR.accent
+
+	ui.level.Text = (S.levelIdx == 0) and "Todos los niveles" or CFG.LEVEL_LABELS[S.levelIdx]
+
+	for i, b in ipairs(ui.piles) do
+		b.BackgroundColor3 = S.pileOn[i] and COLOR.accent or COLOR.btn
+		b.TextColor3 = S.pileOn[i] and COLOR.dark or COLOR.text
+	end
+
+	ui.vel.Text = tostring(S.vel)
+
+	local mech = S.mech
+	if mech then
+		local id = tostring(mech:GetAttribute("MechId") or mech.Name)
+		local pilot = tostring(mech:GetAttribute("PilotMode") or "—")
+		ui.mech.Text = id .. "  ·  " .. pilot
+	else
+		ui.mech.Text = "Sin mecha detectado"
+	end
+
+	local tieneBase = S.base ~= nil or getBase() ~= nil
+	ui.base.Text = "Base: " .. (S.base and "guardada aquí" or (tieneBase and "marcador del mapa" or "✖ sin base"))
+end
+
+---------------------------------------------------------------
+-- CICLO AUTOMÁTICO
+---------------------------------------------------------------
+local function autoStep()
+	local mech = getMech()
+	if not mech then
+		setEstado("Sin mecha", COLOR.red)
+		task.wait(1.5)
+		return
+	end
+	if not parteMovil() then
+		setEstado("Esperando personaje", COLOR.sub)
+		task.wait(1)
+		return
+	end
+
+	local total, cap, lig, chat, max = leerCarga(mech)
+	S.total, S.cap, S.ligero, S.chatarra, S.max = total, cap, lig, chat, max
+
+	-- LLENO: volver a la base y esperar a que baje la carga
+	if total >= cap then
+		local base = getBase()
+		if not base then
+			setEstado("Lleno · guarda tu base", COLOR.red)
+			task.wait(2)
+			return
+		end
+		setEstado("Lleno · vuelvo a la base", COLOR.amber)
+		if glideTo(base + Vector3.new(0, CFG.ALTURA, 0), CFG.LLEGADA) then
+			setEstado("Descargando...", COLOR.amber)
+			local t0 = os.clock()
+			while S.on and os.clock() - t0 < CFG.ESPERA_DESCARGA do
+				task.wait(0.5)
+				if leerCarga(mech) < cap then
+					break
+				end
+			end
+		end
+		return
+	end
+
+	-- HAY ESPACIO: ir a la pila más cercana de las seleccionadas
+	local lista, existe = listarPilas()
+	if not existe then
+		setEstado("No encuentro World.Arenas", COLOR.red)
+		task.wait(2)
+		return
+	end
+
+	local p = lista[1]
+	if not p then
+		setEstado("Sin pilas en la selección", COLOR.cyan)
+		task.wait(1.5)
+		return
+	end
+
+	setEstado("Yendo a " .. p.nombre, COLOR.green)
+	local ok, motivo = recolectar(p, mech)
+	if ok then
+		setMsg("✅ " .. p.nombre .. " recogida", COLOR.green)
+	elseif motivo == "parado" then
+		setEstado("Parado", COLOR.sub)
+	else
+		setMsg("⚠ " .. p.nombre .. ": " .. tostring(motivo), COLOR.amber)
+	end
+end
+
+local function setAuto(v)
+	S.on = v
+	setEstado(v and "Iniciando" or "Parado", v and COLOR.green or COLOR.sub)
+	refreshUI()
+end
+
+---------------------------------------------------------------
+-- INTERFAZ (todo con Instance.new)
+---------------------------------------------------------------
 local function corner(obj, r)
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, r)
@@ -133,7 +535,7 @@ local function card(parent, order, h)
 	return f
 end
 
-local function row(parent, order, h)
+local function hRow(parent, order, h)
 	local f = Instance.new("Frame")
 	f.Size = UDim2.new(1, 0, 0, h)
 	f.BackgroundTransparency = 1
@@ -145,21 +547,6 @@ local function row(parent, order, h)
 	l.SortOrder = Enum.SortOrder.LayoutOrder
 	l.Parent = f
 	return f
-end
-
-local function viewport()
-	local cam = Workspace.CurrentCamera
-	return cam and cam.ViewportSize or Vector2.new(390, 844)
-end
-
-local function clampPos(x, y, w, h)
-	local vp = viewport()
-	return math.clamp(x, 0, math.max(0, vp.X - w)), math.clamp(y, 0, math.max(0, vp.Y - h))
-end
-
-local function fitScale()
-	local vp = viewport()
-	return math.clamp(math.min(vp.X * 0.9 / CFG.PANEL_W, vp.Y * 0.75 / CFG.PANEL_H, 1.1), 0.6, 1.1)
 end
 
 -- Arrastrar con dedo o ratón. onTap = toque corto, onEnd = al soltar tras arrastrar
@@ -206,244 +593,7 @@ local function makeDrag(handle, target, onTap, onEnd)
 	end)
 end
 
----------------------------------------------------------------
--- MECHA Y PERSONAJE
----------------------------------------------------------------
-local function hrpNow()
-	local char = LocalPlayer.Character
-	return char and char:FindFirstChild("HumanoidRootPart")
-end
-
--- Prefiere el modelo que tenga CarryCapacity; si no, el que coincida con tu nombre
-local function getMech()
-	local name = LocalPlayer.Name
-	local fallback
-	for _, obj in ipairs(Workspace:GetChildren()) do
-		if obj:IsA("Model") then
-			local owned = obj:GetAttribute("OwnerName") == name or string.find(obj.Name, name, 1, true) ~= nil
-			if owned then
-				if obj:GetAttribute("CarryCapacity") ~= nil then
-					return obj
-				end
-				fallback = fallback or obj
-			end
-		end
-	end
-	return fallback
-end
-
--- Devuelve (total, capacidad) leídos de los atributos del mecha
-local function getCarry(mech)
-	local total = tonumber(mech:GetAttribute("CarryTotal")) or 0
-	local cap = tonumber(mech:GetAttribute("CarryCapacity")) or CFG.CAP_DEFECTO
-	return total, cap
-end
-
--- Base: la que guardaste a mano, o workspace.YourBaseMarker
-local function getBasePos()
-	if S.base then
-		return S.base
-	end
-	local m = Workspace:FindFirstChild("YourBaseMarker")
-	if m then
-		if m:IsA("BasePart") then return m.Position end
-		if m:IsA("Model") then return m:GetPivot().Position end
-	end
-	return nil
-end
-
-local function applySpeed()
-	local mech = getMech()
-	if not mech then
-		return 0, false
-	end
-	for _, m in ipairs({ mech }) do
-		if m:GetAttribute("WalkSpeed") ~= nil then
-			m:SetAttribute("WalkSpeed", S.speed)
-		end
-		if m:GetAttribute("RunSpeed") ~= nil then
-			m:SetAttribute("RunSpeed", S.speed + 20)
-		end
-		for _, d in ipairs(m:GetDescendants()) do
-			if d:IsA("Humanoid") then
-				d.WalkSpeed = S.speed
-			end
-		end
-	end
-	return 1, true
-end
-
--- Activa los prompts de piezas cercanas. Devuelve cuántos activó, o -1 si el ejecutor no lo soporta
-local function recogerCercanas()
-	local root = hrpNow()
-	if not root or not fireproximityprompt then
-		return -1
-	end
-	local now = os.clock()
-	local n = 0
-	for _, d in ipairs(Workspace:GetDescendants()) do
-		if S.closed or not S.on and S.state ~= "Manual" then
-			-- Si se apaga el auto en mitad del ciclo, se corta
-		end
-		if d:IsA("ProximityPrompt") and d.Enabled and d.Parent and d.Parent:IsA("BasePart") then
-			if (d.Parent.Position - root.Position).Magnitude <= CFG.RANGO_RECOGER then
-				local last = cooldown[d]
-				if not last or now - last >= CFG.COOLDOWN_PROMPT then
-					cooldown[d] = now
-					pcall(fireproximityprompt, d)
-					n = n + 1
-					task.wait(CFG.ESPERA_PROMPT)
-				end
-			end
-		end
-	end
-	return n
-end
-
--- Se desliza hasta el destino (sin teletransporte brusco). Devuelve true si llegó
-local function glideTo(target)
-	local t0 = os.clock()
-	while S.on and not S.closed do
-		local root = hrpNow()
-		if not root then return false end
-		local cur = root.Position
-		local delta = target - cur
-		local dist = delta.Magnitude
-		if dist <= 2 then
-			root.AssemblyLinearVelocity = Vector3.zero
-			return true
-		end
-		if os.clock() - t0 > 40 then
-			return false
-		end
-		local dt = RunService.Heartbeat:Wait()
-		local step = math.min(dist, CFG.VUELO_VEL * dt)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.CFrame = CFrame.new(cur + delta.Unit * step) * (root.CFrame - root.CFrame.Position)
-	end
-	return false
-end
-
----------------------------------------------------------------
--- ESTADO EN PANTALLA
----------------------------------------------------------------
-local function setState(text, color)
-	S.state = text
-	if ui.stateLbl then
-		ui.stateLbl.Text = text
-		ui.stateLbl.TextColor3 = color or COLOR.sub
-	end
-end
-
-local msgToken = 0
-local function setStatus(text, color)
-	msgToken += 1
-	local my = msgToken
-	ui.msgLbl.Text = text
-	ui.msgLbl.TextColor3 = color or COLOR.sub
-	task.delay(3, function()
-		if my == msgToken and ui.msgLbl and ui.msgLbl.Parent then
-			ui.msgLbl.Text = ""
-		end
-	end)
-end
-
-local function refreshUI()
-	if S.closed or not ui.carryNum then return end
-
-	ui.carryNum.Text = S.total .. " / " .. S.cap
-	local r = math.clamp(S.total / math.max(S.cap, 1), 0, 1)
-	ui.fill.Size = UDim2.new(r, 0, 1, 0)
-	ui.fill.BackgroundColor3 = (r >= 1 and COLOR.red) or (r >= 0.7 and COLOR.amber) or COLOR.green
-
-	ui.speedVal.Text = tostring(S.speed)
-
-	ui.autoBtn.Text = S.on and "■  DETENER AUTO" or "▶  AUTO RECOLECTAR"
-	ui.autoBtn.BackgroundColor3 = S.on and COLOR.red or COLOR.green
-	ui.bubble.BackgroundColor3 = S.on and COLOR.green or COLOR.accent
-
-	local hasBase = S.base or getBasePos()
-	local baseTxt = S.base and "guardada" or (hasBase and "marcador" or "✖")
-	ui.infoLbl.Text = "Base: " .. baseTxt .. "   ·   Zona: " .. (S.zone and "✔" or "✖")
-end
-
----------------------------------------------------------------
--- CICLO AUTOMÁTICO: recolecta, y si está lleno vuelve a la base
----------------------------------------------------------------
-local function autoStep()
-	local mech = getMech()
-	if not mech then
-		setState("Sin mecha", COLOR.red)
-		task.wait(1.5)
-		return
-	end
-	if not hrpNow() then
-		setState("Esperando personaje", COLOR.sub)
-		task.wait(1)
-		return
-	end
-
-	local total, cap = getCarry(mech)
-	S.total, S.cap = total, cap
-
-	-- LLENO: volver a la base y esperar a que se vacíe
-	if total >= cap then
-		local base = getBasePos()
-		if not base then
-			setState("Lleno · guarda tu base", COLOR.red)
-			task.wait(2)
-			return
-		end
-		setState("Lleno · vuelvo a base", COLOR.amber)
-		if glideTo(base + Vector3.new(0, CFG.ALTURA, 0)) then
-			setState("Descargando...", COLOR.amber)
-			local t0 = os.clock()
-			while S.on and mech.Parent and os.clock() - t0 < CFG.ESPERA_DESCARGA do
-				task.wait(0.5)
-				total = getCarry(mech)
-				S.total = total
-				if total < cap then
-					break
-				end
-			end
-		end
-		return
-	end
-
-	-- HAY ESPACIO: recoger lo que esté cerca
-	setState("Recolectando", COLOR.green)
-	local n = recogerCercanas()
-	if n < 0 then
-		setState("Sin fireproximityprompt", COLOR.red)
-		task.wait(2)
-		return
-	end
-	if n > 0 then
-		task.wait(0.2)
-		return
-	end
-
-	-- Sin piezas a la vista: ir a la zona guardada
-	if S.zone and S.on then
-		setState("Buscando en zona", COLOR.cyan)
-		glideTo(S.zone + Vector3.new(0, CFG.ALTURA, 0))
-	end
-	task.wait(CFG.TICK)
-end
-
-local function setAuto(v)
-	S.on = v
-	if v then
-		setState("Iniciando", COLOR.green)
-	else
-		setState("Parado", COLOR.sub)
-	end
-	refreshUI()
-end
-
----------------------------------------------------------------
--- CONSTRUCCIÓN DE LA INTERFAZ
----------------------------------------------------------------
+-- Ventana
 local parent = getParent()
 local old = parent:FindFirstChild(CFG.GUI_NAME)
 if old then old:Destroy() end
@@ -456,7 +606,6 @@ screen.DisplayOrder = 999998
 screen.Parent = parent
 ui.screen = screen
 
--- Panel
 local panel = Instance.new("Frame")
 panel.Size = UDim2.fromOffset(CFG.PANEL_W, CFG.PANEL_H)
 panel.BackgroundColor3 = COLOR.bg
@@ -498,15 +647,16 @@ bodyLayout.Padding = UDim.new(0, 6)
 bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
 bodyLayout.Parent = body
 
--- 1) Carga del mecha
-local carga = card(body, 1, 64)
+-- 1) Carga
+local carga = card(body, 1, 66)
 lbl(carga, "CARGA", UDim2.new(0.5, 0, 0, 12), UDim2.fromOffset(10, 6), 9, COLOR.sub, Enum.Font.GothamBold)
-ui.stateLbl = lbl(carga, "Parado", UDim2.new(0.5, -10, 0, 12), UDim2.new(0.5, 0, 0, 6), 9, COLOR.sub, Enum.Font.GothamBold)
-ui.stateLbl.TextXAlignment = Enum.TextXAlignment.Right
-ui.carryNum = lbl(carga, "0 / 16", UDim2.new(1, -20, 0, 26), UDim2.fromOffset(10, 18), 20, COLOR.green, Enum.Font.GothamBlack)
+ui.estado = lbl(carga, "Parado", UDim2.new(0.5, -10, 0, 12), UDim2.new(0.5, 0, 0, 6), 9, COLOR.sub, Enum.Font.GothamBold)
+ui.estado.TextXAlignment = Enum.TextXAlignment.Right
+
+ui.carry = lbl(carga, "0 / 16", UDim2.new(1, -20, 0, 24), UDim2.fromOffset(10, 18), 19, COLOR.green, Enum.Font.GothamBlack)
 
 local track = Instance.new("Frame")
-track.Position = UDim2.fromOffset(10, 50)
+track.Position = UDim2.fromOffset(10, 45)
 track.Size = UDim2.new(1, -20, 0, 6)
 track.BackgroundColor3 = COLOR.track
 track.BorderSizePixel = 0
@@ -520,45 +670,144 @@ ui.fill.BorderSizePixel = 0
 ui.fill.Parent = track
 corner(ui.fill, 3)
 
--- 2) Velocidad
-local spd = card(body, 2, 46)
-lbl(spd, "VELOCIDAD", UDim2.new(0.5, 0, 0, 12), UDim2.fromOffset(10, 4), 9, COLOR.sub, Enum.Font.GothamBold)
-local minusBtn = btn(spd, "−", UDim2.fromOffset(40, 26), UDim2.fromOffset(8, 16), COLOR.btn, 16)
-local plusBtn = btn(spd, "+", UDim2.fromOffset(40, 26), UDim2.new(1, -48, 0, 16), COLOR.btn, 16)
-ui.speedVal = lbl(spd, "40", UDim2.new(1, -110, 0, 26), UDim2.fromOffset(55, 16), 16, COLOR.cyan, Enum.Font.GothamBlack)
-ui.speedVal.TextXAlignment = Enum.TextXAlignment.Center
+ui.sub = lbl(carga, "", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 52), 9, COLOR.sub, Enum.Font.Gotham)
 
--- 3) Botón principal de automatización
-ui.autoBtn = btn(body, "▶  AUTO RECOLECTAR", UDim2.new(1, 0, 0, 40), nil, COLOR.green, 13)
-ui.autoBtn.LayoutOrder = 3
-ui.autoBtn.TextColor3 = COLOR.white
+-- 2) Botón principal
+ui.auto = btn(body, "▶  AUTO RECOLECTAR", UDim2.new(1, 0, 0, 40), nil, COLOR.green, 13)
+ui.auto.LayoutOrder = 2
+ui.auto.TextColor3 = COLOR.white
+ui.auto.Activated:Connect(function()
+	setAuto(not S.on)
+end)
 
--- 4) Base y zona
-local rBases = row(body, 4, 34)
-ui.baseBtn = btn(rBases, "📍 Base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
-ui.zoneBtn = btn(rBases, "📍 Zona", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
+-- 3) Nivel (◀ nivel ▶)
+local nivelTitulo = lbl(body, "NIVEL", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
+nivelTitulo.LayoutOrder = 3
 
--- 5) Acciones manuales
-local rActs = row(body, 5, 34)
-local applyBtn = btn(rActs, "⚡ Velocidad", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
-local pickBtn = btn(rActs, "🧲 Recoger", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
+local nivelRow = hRow(body, 4, 34)
+local prevBtn = btn(nivelRow, "◀", UDim2.fromOffset(40, 34), nil, COLOR.btn, 14)
+prevBtn.LayoutOrder = 1
+ui.level = btn(nivelRow, "", UDim2.new(1, -88, 1, 0), nil, COLOR.card, 12)
+ui.level.LayoutOrder = 2
+local nextBtn = btn(nivelRow, "▶", UDim2.fromOffset(40, 34), nil, COLOR.btn, 14)
+nextBtn.LayoutOrder = 3
 
--- 6) Estadísticas y limpieza
-local rStats = row(body, 6, 30)
-local statsBtn = btn(rStats, "📊 Stats", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
-local clearBtn = btn(rStats, "↺ Limpiar", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
-clearBtn.TextColor3 = COLOR.red
+prevBtn.Activated:Connect(function()
+	S.levelIdx = S.levelIdx - 1
+	if S.levelIdx < 0 then S.levelIdx = #CFG.LEVELS end
+	refreshUI()
+end)
+nextBtn.Activated:Connect(function()
+	S.levelIdx = S.levelIdx + 1
+	if S.levelIdx > #CFG.LEVELS then S.levelIdx = 0 end
+	refreshUI()
+end)
+ui.level.Activated:Connect(function()
+	S.levelIdx = (S.levelIdx + 1) % (#CFG.LEVELS + 1)
+	refreshUI()
+end)
 
--- Mensajes e información
-ui.msgLbl = lbl(body, "", UDim2.new(1, 0, 0, 16), nil, 10, COLOR.sub, Enum.Font.Gotham)
-ui.msgLbl.LayoutOrder = 7
-ui.msgLbl.TextXAlignment = Enum.TextXAlignment.Center
+-- 4) Tipos de pila (cuadrícula 4 x 2)
+local pilasTitulo = lbl(body, "PILAS A RECOGER", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
+pilasTitulo.LayoutOrder = 5
 
-ui.infoLbl = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
-ui.infoLbl.LayoutOrder = 8
-ui.infoLbl.TextXAlignment = Enum.TextXAlignment.Center
+local grid = Instance.new("Frame")
+grid.Size = UDim2.new(1, 0, 0, 58)
+grid.BackgroundTransparency = 1
+grid.LayoutOrder = 6
+grid.Parent = body
+local gridLayout = Instance.new("UIGridLayout")
+gridLayout.CellSize = UDim2.fromOffset(54, 26)
+gridLayout.CellPadding = UDim2.fromOffset(4, 4)
+gridLayout.SortOrder = Enum.SortOrder.LayoutOrder
+gridLayout.Parent = grid
 
--- Burbuja (aparece al minimizar)
+for i, nombre in ipairs(CFG.PILE_LABELS) do
+	local b = btn(grid, nombre, UDim2.fromOffset(54, 26), nil, COLOR.accent, 9)
+	b.LayoutOrder = i
+	b.Activated:Connect(function()
+		S.pileOn[i] = not S.pileOn[i]
+		refreshUI()
+	end)
+	ui.piles[i] = b
+end
+
+-- 5) Velocidad de desplazamiento
+local velCard = card(body, 7, 38)
+lbl(velCard, "Vuelo", UDim2.new(0, 60, 1, 0), UDim2.fromOffset(10, 0), 11, COLOR.sub, Enum.Font.GothamBold)
+local velMinus = btn(velCard, "−", UDim2.fromOffset(36, 28), UDim2.new(1, -116, 0.5, -14), COLOR.btn, 16)
+ui.vel = lbl(velCard, "", UDim2.fromOffset(44, 28), UDim2.new(1, -78, 0.5, -14), 14, COLOR.cyan, Enum.Font.GothamBlack)
+ui.vel.TextXAlignment = Enum.TextXAlignment.Center
+local velPlus = btn(velCard, "+", UDim2.fromOffset(36, 28), UDim2.new(1, -40, 0.5, -14), COLOR.btn, 16)
+
+velMinus.Activated:Connect(function()
+	S.vel = math.max(CFG.VEL_MIN, S.vel - CFG.VEL_STEP)
+	refreshUI()
+end)
+velPlus.Activated:Connect(function()
+	S.vel = math.min(CFG.VEL_MAX, S.vel + CFG.VEL_STEP)
+	refreshUI()
+end)
+
+-- 6) Base y acciones
+local acciones = hRow(body, 8, 30)
+local baseBtn = btn(acciones, "📍 Guardar base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+baseBtn.LayoutOrder = 1
+local limpiarBtn = btn(acciones, "↺ Borrar base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+limpiarBtn.LayoutOrder = 2
+limpiarBtn.TextColor3 = COLOR.red
+
+baseBtn.Activated:Connect(function()
+	local part = parteMovil()
+	if not part then
+		setMsg("❌ Sin personaje", COLOR.red)
+		return
+	end
+	S.base = part.Position
+	setMsg("✅ Base guardada aquí", COLOR.green)
+	refreshUI()
+end)
+
+limpiarBtn.Activated:Connect(function()
+	S.base = nil
+	setMsg("↺ Base borrada", COLOR.amber)
+	refreshUI()
+end)
+
+local statsBtn = btn(body, "📊 Ver stats del mecha (F9)", UDim2.new(1, 0, 0, 28), nil, COLOR.btn, 11)
+statsBtn.LayoutOrder = 9
+statsBtn.Activated:Connect(function()
+	local mech = getMech()
+	if not mech then
+		setMsg("❌ No encuentro tu mecha", COLOR.red)
+		return
+	end
+	print("--- STATS DE MECHA ---")
+	print("Nombre:", mech.Name)
+	print("MechId:", mech:GetAttribute("MechId"))
+	print("PilotMode:", mech:GetAttribute("PilotMode"))
+	print("CarryTotal:", mech:GetAttribute("CarryTotal"))
+	print("CarryCapacity:", mech:GetAttribute("CarryCapacity"))
+	print("CarryMax:", mech:GetAttribute("CarryMax"))
+	print("Carry_Light:", mech:GetAttribute("Carry_Light"))
+	print("Carry_Scrap:", mech:GetAttribute("Carry_Scrap"))
+	setMsg("✅ Stats impresos en F9", COLOR.green)
+end)
+
+-- 7) Información y mensajes
+ui.base = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
+ui.base.LayoutOrder = 10
+ui.base.TextXAlignment = Enum.TextXAlignment.Center
+
+ui.mech = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
+ui.mech.LayoutOrder = 11
+ui.mech.TextXAlignment = Enum.TextXAlignment.Center
+
+ui.msg = lbl(body, "", UDim2.new(1, 0, 0, 16), nil, 10, COLOR.sub, Enum.Font.Gotham)
+ui.msg.LayoutOrder = 12
+ui.msg.TextXAlignment = Enum.TextXAlignment.Center
+
+-- Burbuja
 ui.bubble = Instance.new("TextButton")
 ui.bubble.Name = "Bubble"
 ui.bubble.Size = UDim2.fromOffset(CFG.BUBBLE, CFG.BUBBLE)
@@ -585,7 +834,7 @@ local function layout()
 
 	if not S.placed then
 		S.placed = true
-		local x, y = clampPos((vp.X - w) / 2, vp.Y * 0.18, w, h)
+		local x, y = clampPos((vp.X - w) / 2, vp.Y * 0.14, w, h)
 		panel.Position = UDim2.fromOffset(x, y)
 		ui.bubble.Position = UDim2.fromOffset(vp.X - CFG.BUBBLE - 12, vp.Y * 0.45)
 	else
@@ -608,85 +857,6 @@ local function setMinimized(v)
 	panel.Visible = not v
 	ui.bubble.Visible = v
 end
-
----------------------------------------------------------------
--- EVENTOS
----------------------------------------------------------------
-minusBtn.Activated:Connect(function()
-	S.speed = math.max(CFG.SPEED_MIN, S.speed - CFG.SPEED_STEP)
-	refreshUI()
-end)
-
-plusBtn.Activated:Connect(function()
-	S.speed = math.min(CFG.SPEED_MAX, S.speed + CFG.SPEED_STEP)
-	refreshUI()
-end)
-
-ui.autoBtn.Activated:Connect(function()
-	setAuto(not S.on)
-end)
-
-ui.baseBtn.Activated:Connect(function()
-	local root = hrpNow()
-	if not root then
-		setStatus("❌ Sin personaje", COLOR.red)
-		return
-	end
-	S.base = root.Position
-	setStatus("✅ Base guardada aquí", COLOR.green)
-	refreshUI()
-end)
-
-ui.zoneBtn.Activated:Connect(function()
-	local root = hrpNow()
-	if not root then
-		setStatus("❌ Sin personaje", COLOR.red)
-		return
-	end
-	S.zone = root.Position
-	setStatus("✅ Zona guardada aquí", COLOR.green)
-	refreshUI()
-end)
-
-clearBtn.Activated:Connect(function()
-	S.base, S.zone = nil, nil
-	setStatus("↺ Base y zona borradas", COLOR.amber)
-	refreshUI()
-end)
-
-applyBtn.Activated:Connect(function()
-	local n, found = applySpeed()
-	if found then
-		setStatus("✅ Velocidad " .. S.speed .. " aplicada", COLOR.green)
-	else
-		setStatus("❌ No se encontró tu mecha", COLOR.red)
-	end
-end)
-
-pickBtn.Activated:Connect(function()
-	task.spawn(function()
-		local n = recogerCercanas()
-		if n < 0 then
-			setStatus("❌ Tu ejecutor no tiene fireproximityprompt", COLOR.red)
-		else
-			setStatus("✅ Piezas activadas: " .. n, COLOR.green)
-		end
-	end)
-end)
-
-statsBtn.Activated:Connect(function()
-	local mech = getMech()
-	if not mech then
-		setStatus("❌ No se encontró tu mecha", COLOR.red)
-		return
-	end
-	local total, cap = getCarry(mech)
-	print("--- STATS DE MECHA ---")
-	print("Nombre:", mech.Name)
-	print("CarryTotal:", total)
-	print("CarryCapacity:", cap)
-	setStatus("✅ Stats impresos (F9): " .. total .. "/" .. cap, COLOR.green)
-end)
 
 minBtn.Activated:Connect(function()
 	setMinimized(true)
@@ -721,7 +891,7 @@ task.spawn(function()
 		if S.on then
 			local ok, err = pcall(autoStep)
 			if not ok then
-				setState("Error", COLOR.red)
+				setEstado("Error", COLOR.red)
 				warn("[MECHA] " .. tostring(err))
 				task.wait(1)
 			end
@@ -734,6 +904,7 @@ end)
 -- Refresco de la interfaz
 task.spawn(function()
 	while not S.closed do
+		getMech()
 		refreshUI()
 		task.wait(0.25)
 	end
@@ -744,5 +915,5 @@ local cam = Workspace.CurrentCamera
 if cam then
 	cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
 end
-setState("Parado", COLOR.sub)
+setEstado("Parado", COLOR.sub)
 refreshUI()
