@@ -1,5 +1,7 @@
--- MECHA PANEL v7 · Delta (móvil)
--- Sin fireproximityprompt: usa InputHoldBegin/InputHoldEnd de ProximityPrompt
+-- MECHA PANEL v7 · (móvil)
+-- Activa prompts con: 1) fireproximityprompt (si el ejecutor la tiene)
+--                     2) InputHoldBegin/InputHoldEnd (método de Roblox)
+-- Todo protegido con pcall: si algo no existe, el script NO colapsa.
 
 local function main()
 	local Players = game:GetService("Players")
@@ -41,6 +43,10 @@ local function main()
 	local COOLDOWN_FALLO = 6
 	local REVISAR_MECHA = 2
 	local BASE_MARCADOR = "YourBaseMarker"
+
+	-- Si tu ejecutor tiene fireproximityprompt pero no hace nada, pon true
+	-- para saltarla y usar solo el método de Roblox.
+	local FORZAR_HOLD = false
 
 	local PILE_INDEX = {}
 	for i, n in ipairs(PILES) do
@@ -85,6 +91,23 @@ local function main()
 
 	local cooldown = {}
 	local ui = { piles = {} }
+	local conns = {} -- conexiones globales que hay que limpiar al cerrar
+
+	---------------------------------------------------------------
+	-- DETECCIÓN SEGURA DE FUNCIONES DEL EJECUTOR
+	---------------------------------------------------------------
+	local fireFn = nil
+	do
+		local ok, f = pcall(function()
+			return fireproximityprompt
+		end)
+		if ok and typeof(f) == "function" then
+			fireFn = f
+		end
+	end
+	if FORZAR_HOLD then
+		fireFn = nil
+	end
 
 	---------------------------------------------------------------
 	-- HELPERS
@@ -275,9 +298,13 @@ local function main()
 		return lista, true
 	end
 
-	-- Mantiene pulsado el ProximityPrompt (método de Roblox, no del ejecutor).
-	-- Devuelve false si el método no está disponible.
+	-- Activa el ProximityPrompt con tres niveles de seguridad.
+	-- Devuelve true si algún método se pudo ejecutar, false si ninguno.
 	local function mantenerPrompt(prompt)
+		if not prompt or not prompt.Parent then
+			return false
+		end
+
 		pcall(function()
 			prompt.RequiresLineOfSight = false
 			if prompt.MaxActivationDistance < RANGO_PROMPT then
@@ -285,20 +312,28 @@ local function main()
 			end
 		end)
 
+		-- 1) Función nativa del ejecutor (si existe y no da error)
+		if fireFn then
+			local ok = pcall(fireFn, prompt)
+			if ok then
+				return true
+			end
+		end
+
+		-- 2) Método de Roblox: mantener pulsado
 		local okBegin = pcall(function()
 			prompt:InputHoldBegin()
 		end)
-		if not okBegin then
-			return false
+		if okBegin then
+			task.wait(math.max(num(prompt.HoldDuration, 0), 0) + 0.2)
+			pcall(function()
+				prompt:InputHoldEnd()
+			end)
+			return true
 		end
 
-		local espera = math.max(num(prompt.HoldDuration, 0), 0) + 0.2
-		task.wait(espera)
-
-		pcall(function()
-			prompt:InputHoldEnd()
-		end)
-		return true
+		-- 3) Nada disponible: no rompe, solo informa
+		return false
 	end
 
 	-- Va a la pila, activa el prompt y espera a que suba la carga. Devuelve ok, motivo
@@ -567,7 +602,7 @@ local function main()
 			end)
 		end)
 
-		UserInputService.InputChanged:Connect(function(input)
+		table.insert(conns, UserInputService.InputChanged:Connect(function(input)
 			if not dragging then return end
 			local t = input.UserInputType
 			if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseMovement then
@@ -580,7 +615,7 @@ local function main()
 			if moved then
 				target.Position = UDim2.fromOffset(startPos.X + d.X, startPos.Y + d.Y)
 			end
-		end)
+		end))
 	end
 
 	local screen = Instance.new("ScreenGui")
@@ -783,6 +818,7 @@ local function main()
 		print("CarryMax:", mech:GetAttribute("CarryMax"))
 		print("Carry_Light:", mech:GetAttribute("Carry_Light"))
 		print("Carry_Scrap:", mech:GetAttribute("Carry_Scrap"))
+		print("Método de prompt:", fireFn and "fireproximityprompt + hold" or "hold (InputHoldBegin/End)")
 		setMsg("✅ Stats impresos en F9", C.green)
 	end)
 
@@ -837,6 +873,9 @@ local function main()
 	closeBtn.Activated:Connect(function()
 		S.closed = true
 		S.on = false
+		for _, c in ipairs(conns) do
+			pcall(function() c:Disconnect() end)
+		end
 		screen:Destroy()
 	end)
 
@@ -875,12 +914,12 @@ local function main()
 	layout()
 	local cam = Workspace.CurrentCamera
 	if cam then
-		cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
+		table.insert(conns, cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout))
 	end
 
 	setEstado("Parado", C.sub)
 	refreshUI()
-	print("[MECHA] Panel creado correctamente")
+	print("[MECHA] Panel creado correctamente · prompt: " .. (fireFn and "fireproximityprompt" or "InputHold"))
 
 	---------------------------------------------------------------
 	-- BUCLES
@@ -902,8 +941,10 @@ local function main()
 
 	task.spawn(function()
 		while not S.closed do
-			getMech()
-			refreshUI()
+			pcall(function()
+				getMech()
+				refreshUI()
+			end)
 			task.wait(0.25)
 		end
 	end)
