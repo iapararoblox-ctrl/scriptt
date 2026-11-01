@@ -1,31 +1,28 @@
--- MECHA PANEL v3 · Recolección por pilas reales + retorno a la base
--- LocalScript móvil (StarterPlayer > StarterPlayerScripts)
+-- MECHA PANEL v4 · LocalScript móvil
+-- Colócalo en StarterPlayer > StarterPlayerScripts (o ejecútalo con tu ejecutor)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+print("[MECHA] Iniciando panel...")
 
 ---------------------------------------------------------------
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CFG = {
-	GUI_NAME = "MechaMobilePanel",
+	GUI_NAME = "MechaPanelV4",
 	PANEL_W = 250,
 	PANEL_H = 440,
 	BUBBLE = 48,
 
-	-- Dónde están las pilas: Workspace.World.Arenas.<nivel>.PartPiles.<tipo>
 	ARENAS = { "World", "Arenas" },
 	LEVELS = {
-		"Level1_ScrapYard",
-		"Level2_RustyRails",
-		"Level3_SkylineHeights",
-		"Level4_ToxicBog",
-		"Level5_OutpostZero",
-		"Level9_KaijuBay",
-		"Level10_EmpireCity",
+		"Level1_ScrapYard", "Level2_RustyRails", "Level3_SkylineHeights", "Level4_ToxicBog",
+		"Level5_OutpostZero", "Level9_KaijuBay", "Level10_EmpireCity",
 	},
 	LEVEL_LABELS = {
 		"Scrap Yard", "Rusty Rails", "Skyline Heights", "Toxic Bog",
@@ -35,24 +32,21 @@ local CFG = {
 		"Chunk", "LightPartPile", "ScrapPartPile", "HeavyPartPile",
 		"MediumPartPile", "ColossalPartPile", "TitanPartPile", "BigScrapPartPile",
 	},
-	PILE_LABELS = {
-		"Chunk", "Ligera", "Chatarra", "Pesada",
-		"Media", "Colosal", "Titán", "G.Chat",
-	},
+	PILE_LABELS = { "Chunk", "Ligera", "Chatarra", "Pesada", "Media", "Colosal", "Titán", "G.Chat" },
 
 	VEL_MIN = 20,
 	VEL_MAX = 250,
 	VEL_STEP = 10,
-	VEL_DEFAULT = 90,     -- studs por segundo al desplazarse
+	VEL_DEFAULT = 90,
 
-	ALTURA = 3,           -- studs sobre la pila o la base
-	LLEGADA = 5,          -- distancia para considerar que llegaste
-	RANGO_PROMPT = 20,    -- alcance que se da al ProximityPrompt
-	ESPERA_CARGA = 1.5,   -- segundos esperando que suba CarryTotal tras activar la pila
-	ESPERA_DESCARGA = 25, -- segundos máximos esperando a descargar en la base
-	COOLDOWN_OK = 2,      -- segundos sin tocar una pila recogida
-	COOLDOWN_FALLO = 6,   -- segundos sin tocar una pila que no dio carga
-	REVISAR_MECHA = 2,    -- cada cuántos segundos se vuelve a buscar el mecha
+	ALTURA = 3,
+	LLEGADA = 5,
+	RANGO_PROMPT = 20,
+	ESPERA_CARGA = 1.5,
+	ESPERA_DESCARGA = 25,
+	COOLDOWN_OK = 2,
+	COOLDOWN_FALLO = 6,
+	REVISAR_MECHA = 2,
 	BASE_MARCADOR = "YourBaseMarker",
 }
 
@@ -84,7 +78,7 @@ local S = {
 	closed = false,
 	on = false,
 	vel = CFG.VEL_DEFAULT,
-	levelIdx = 0,                 -- 0 = todos los niveles, 1..7 = un nivel
+	levelIdx = 0,
 	pileOn = { true, true, true, true, true, true, true, true },
 	mech = nil,
 	mechCheck = 0,
@@ -93,7 +87,7 @@ local S = {
 	ligero = 0,
 	chatarra = 0,
 	max = 0,
-	base = nil,                   -- Vector3 guardado con el botón 📍 Base
+	base = nil,
 	estado = "Parado",
 	placed = false,
 	minimized = false,
@@ -103,7 +97,7 @@ local cooldown = setmetatable({}, { __mode = "k" })
 local ui = { piles = {} }
 
 ---------------------------------------------------------------
--- HELPERS GENERALES
+-- HELPERS
 ---------------------------------------------------------------
 local function ruta(root, pasos)
 	local cur = root
@@ -114,17 +108,13 @@ local function ruta(root, pasos)
 	return cur
 end
 
-local function getParent()
-	local ok, h = pcall(function() return gethui and gethui() end)
-	if ok and h then return h end
-	local ok2, cg = pcall(function() return game:GetService("CoreGui") end)
-	if ok2 and cg then return cg end
-	return LocalPlayer:WaitForChild("PlayerGui")
-end
-
 local function viewport()
 	local cam = Workspace.CurrentCamera
-	return cam and cam.ViewportSize or Vector2.new(390, 844)
+	local v = cam and cam.ViewportSize or Vector2.new(0, 0)
+	if v.X < 100 or v.Y < 100 then
+		return Vector2.new(390, 844)
+	end
+	return v
 end
 
 local function clampPos(x, y, w, h)
@@ -152,10 +142,17 @@ local function num(v, d)
 	return tonumber(v) or d
 end
 
+local function getGuiParent()
+	local ok, h = pcall(function() return gethui and gethui() end)
+	if ok and h then
+		return h
+	end
+	return PlayerGui
+end
+
 ---------------------------------------------------------------
 -- MECHA
 ---------------------------------------------------------------
--- ¿Este modelo es mío? Compara OwnerName/Owner con tu nombre, DisplayName o UserId
 local function esMio(m)
 	local nombre = LocalPlayer.Name
 	local dueño = m:GetAttribute("OwnerName") or m:GetAttribute("Owner")
@@ -169,13 +166,11 @@ end
 local function buscarMecha()
 	local candidato
 	for _, d in ipairs(Workspace:GetDescendants()) do
-		if d:IsA("Model") and (d:GetAttribute("MechId") ~= nil or d:GetAttribute("CarryCapacity") ~= nil) then
-			if esMio(d) then
-				if d:GetAttribute("MechId") ~= nil then
-					return d
-				end
-				candidato = candidato or d
+		if d:IsA("Model") and (d:GetAttribute("MechId") ~= nil or d:GetAttribute("CarryCapacity") ~= nil) and esMio(d) then
+			if d:GetAttribute("MechId") ~= nil then
+				return d
 			end
+			candidato = candidato or d
 		end
 	end
 	return candidato
@@ -191,14 +186,13 @@ local function getMech()
 	return S.mech
 end
 
--- Lee la carga del mecha: total, capacidad, ligera, chatarra y máximo
 local function leerCarga(m)
-	local total = num(m:GetAttribute("CarryTotal"), 0)
-	local cap = num(m:GetAttribute("CarryCapacity"), 16)
-	local ligero = num(m:GetAttribute("Carry_Light"), 0)
-	local chatarra = num(m:GetAttribute("Carry_Scrap"), 0)
-	local max = num(m:GetAttribute("CarryMax"), cap)
-	return total, cap, ligero, chatarra, max
+	return
+		num(m:GetAttribute("CarryTotal"), 0),
+		num(m:GetAttribute("CarryCapacity"), 16),
+		num(m:GetAttribute("Carry_Light"), 0),
+		num(m:GetAttribute("Carry_Scrap"), 0),
+		num(m:GetAttribute("CarryMax"), num(m:GetAttribute("CarryCapacity"), 16))
 end
 
 -- Parte que se mueve: el asiento del mecha si estás pilotando, si no tu personaje
@@ -217,14 +211,11 @@ local function getBase()
 		return S.base
 	end
 	local m = Workspace:FindFirstChild(CFG.BASE_MARCADOR)
-	if m then
-		return posOf(m)
-	end
-	return nil
+	return m and posOf(m) or nil
 end
 
 ---------------------------------------------------------------
--- MOVIMIENTO SUAVE
+-- MOVIMIENTO
 ---------------------------------------------------------------
 local function glideTo(target, tolerancia)
 	local inicio = parteMovil()
@@ -254,9 +245,8 @@ local function glideTo(target, tolerancia)
 end
 
 ---------------------------------------------------------------
--- PILAS (solo dentro de PartPiles)
+-- PILAS (solo dentro de World.Arenas.<nivel>.PartPiles)
 ---------------------------------------------------------------
--- Devuelve la lista de pilas disponibles (más cercana primero) y si existe World.Arenas
 local function listarPilas()
 	local lista = {}
 	local arenas = ruta(Workspace, CFG.ARENAS)
@@ -310,7 +300,6 @@ local function activarPrompt(prompt)
 	return false
 end
 
--- Va a la pila, la activa y espera a que suba CarryTotal. Devuelve ok, motivo
 local function recolectar(p, mech)
 	if not glideTo(p.pos + Vector3.new(0, CFG.ALTURA, 0), CFG.LLEGADA) then
 		return false, "no llegué"
@@ -327,7 +316,7 @@ local function recolectar(p, mech)
 	while S.on and os.clock() - t0 < CFG.ESPERA_CARGA do
 		task.wait(0.1)
 		if not p.prompt.Parent then
-			return true -- la pila desapareció: se recogió
+			return true
 		end
 		if leerCarga(mech) > antes then
 			cooldown[p.prompt] = os.clock() + CFG.COOLDOWN_OK
@@ -340,7 +329,7 @@ local function recolectar(p, mech)
 end
 
 ---------------------------------------------------------------
--- ESTADO EN PANTALLA
+-- TEXTOS Y ESTADO EN PANTALLA
 ---------------------------------------------------------------
 local function setEstado(texto, color)
 	S.estado = texto
@@ -374,7 +363,6 @@ local function refreshUI()
 	ui.fill.BackgroundColor3 = (r >= 1 and COLOR.red) or (r >= 0.7 and COLOR.amber) or COLOR.green
 
 	ui.sub.Text = "Ligera " .. S.ligero .. "  ·  Chatarra " .. S.chatarra .. "  ·  Máx " .. S.max
-
 	ui.auto.Text = S.on and "■  DETENER" or "▶  AUTO RECOLECTAR"
 	ui.auto.BackgroundColor3 = S.on and COLOR.red or COLOR.green
 	ui.bubble.BackgroundColor3 = S.on and COLOR.green or COLOR.accent
@@ -388,11 +376,8 @@ local function refreshUI()
 
 	ui.vel.Text = tostring(S.vel)
 
-	local mech = S.mech
-	if mech then
-		local id = tostring(mech:GetAttribute("MechId") or mech.Name)
-		local pilot = tostring(mech:GetAttribute("PilotMode") or "—")
-		ui.mech.Text = id .. "  ·  " .. pilot
+	if S.mech then
+		ui.mech.Text = tostring(S.mech:GetAttribute("MechId") or S.mech.Name) .. "  ·  " .. tostring(S.mech:GetAttribute("PilotMode") or "—")
 	else
 		ui.mech.Text = "Sin mecha detectado"
 	end
@@ -420,7 +405,6 @@ local function autoStep()
 	local total, cap, lig, chat, max = leerCarga(mech)
 	S.total, S.cap, S.ligero, S.chatarra, S.max = total, cap, lig, chat, max
 
-	-- LLENO: volver a la base y esperar a que baje la carga
 	if total >= cap then
 		local base = getBase()
 		if not base then
@@ -442,7 +426,6 @@ local function autoStep()
 		return
 	end
 
-	-- HAY ESPACIO: ir a la pila más cercana de las seleccionadas
 	local lista, existe = listarPilas()
 	if not existe then
 		setEstado("No encuentro World.Arenas", COLOR.red)
@@ -475,7 +458,7 @@ local function setAuto(v)
 end
 
 ---------------------------------------------------------------
--- INTERFAZ (todo con Instance.new)
+-- INTERFAZ
 ---------------------------------------------------------------
 local function corner(obj, r)
 	local c = Instance.new("UICorner")
@@ -493,10 +476,9 @@ local function stroke(obj, color, transparency, thickness)
 	return s
 end
 
-local function btn(parent, text, size, pos, color, textSize)
+local function btn(parent, text, size, color, textSize)
 	local b = Instance.new("TextButton")
 	b.Size = size
-	b.Position = pos or UDim2.new()
 	b.BackgroundColor3 = color or COLOR.btn
 	b.BorderSizePixel = 0
 	b.Text = text
@@ -549,7 +531,6 @@ local function hRow(parent, order, h)
 	return f
 end
 
--- Arrastrar con dedo o ratón. onTap = toque corto, onEnd = al soltar tras arrastrar
 local function makeDrag(handle, target, onTap, onEnd)
 	local dragging, moved = false, false
 	local startInput, startPos
@@ -593,240 +574,287 @@ local function makeDrag(handle, target, onTap, onEnd)
 	end)
 end
 
--- Ventana
-local parent = getParent()
-local old = parent:FindFirstChild(CFG.GUI_NAME)
-if old then old:Destroy() end
+-- Construye toda la interfaz. Devuelve la ScreenGui.
+local function build()
+	local parent = getGuiParent()
+	local old = parent:FindFirstChild(CFG.GUI_NAME) or PlayerGui:FindFirstChild(CFG.GUI_NAME)
+	if old then old:Destroy() end
 
-local screen = Instance.new("ScreenGui")
-screen.Name = CFG.GUI_NAME
-screen.ResetOnSpawn = false
-screen.IgnoreGuiInset = true
-screen.DisplayOrder = 999998
-screen.Parent = parent
-ui.screen = screen
+	local screen = Instance.new("ScreenGui")
+	screen.Name = CFG.GUI_NAME
+	screen.ResetOnSpawn = false
+	screen.IgnoreGuiInset = true
+	screen.DisplayOrder = 999998
+	screen.Parent = parent
+	ui.screen = screen
 
-local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(CFG.PANEL_W, CFG.PANEL_H)
-panel.BackgroundColor3 = COLOR.bg
-panel.BorderSizePixel = 0
-panel.ClipsDescendants = true
-panel.Parent = screen
-corner(panel, 12)
-stroke(panel, COLOR.accent, 0.5, 1)
-ui.panel = panel
-ui.panelScale = Instance.new("UIScale")
-ui.panelScale.Parent = panel
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.Size = UDim2.fromOffset(CFG.PANEL_W, CFG.PANEL_H)
+	panel.BackgroundColor3 = COLOR.bg
+	panel.BorderSizePixel = 0
+	panel.ClipsDescendants = true
+	panel.Visible = true
+	panel.Parent = screen
+	corner(panel, 12)
+	stroke(panel, COLOR.accent, 0.5, 1)
+	ui.panel = panel
+	ui.panelScale = Instance.new("UIScale")
+	ui.panelScale.Parent = panel
 
--- Cabecera (zona para arrastrar)
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 38)
-header.BackgroundTransparency = 1
-header.Active = true
-header.Parent = panel
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, 38)
+	header.BackgroundTransparency = 1
+	header.Active = true
+	header.Parent = panel
 
-lbl(header, "MECHA PANEL", UDim2.new(1, -80, 1, 0), UDim2.fromOffset(10, 0), 12, COLOR.accent, Enum.Font.GothamBold)
-local minBtn = btn(header, "–", UDim2.fromOffset(28, 28), UDim2.new(1, -64, 0, 5), COLOR.btn, 15)
-local closeBtn = btn(header, "✕", UDim2.fromOffset(28, 28), UDim2.new(1, -32, 0, 5), COLOR.btn, 12)
-closeBtn.TextColor3 = COLOR.red
+	lbl(header, "MECHA PANEL", UDim2.new(1, -80, 1, 0), UDim2.fromOffset(10, 0), 12, COLOR.accent, Enum.Font.GothamBold)
+	local minBtn = btn(header, "–", UDim2.fromOffset(28, 28), COLOR.btn, 15)
+	minBtn.Position = UDim2.new(1, -64, 0, 5)
+	local closeBtn = btn(header, "✕", UDim2.fromOffset(28, 28), COLOR.btn, 12)
+	closeBtn.Position = UDim2.new(1, -32, 0, 5)
+	closeBtn.TextColor3 = COLOR.red
 
--- Contenido desplazable
-local body = Instance.new("ScrollingFrame")
-body.Position = UDim2.fromOffset(8, 42)
-body.Size = UDim2.new(1, -16, 1, -50)
-body.BackgroundTransparency = 1
-body.BorderSizePixel = 0
-body.ScrollBarThickness = 2
-body.ScrollBarImageColor3 = COLOR.accent
-body.CanvasSize = UDim2.new()
-body.AutomaticCanvasSize = Enum.AutomaticSize.Y
-body.Parent = panel
+	local body = Instance.new("ScrollingFrame")
+	body.Position = UDim2.fromOffset(8, 42)
+	body.Size = UDim2.new(1, -16, 1, -50)
+	body.BackgroundTransparency = 1
+	body.BorderSizePixel = 0
+	body.ScrollBarThickness = 2
+	body.ScrollBarImageColor3 = COLOR.accent
+	body.CanvasSize = UDim2.new()
+	body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	body.Parent = panel
 
-local bodyLayout = Instance.new("UIListLayout")
-bodyLayout.Padding = UDim.new(0, 6)
-bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
-bodyLayout.Parent = body
+	local bodyLayout = Instance.new("UIListLayout")
+	bodyLayout.Padding = UDim.new(0, 6)
+	bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	bodyLayout.Parent = body
 
--- 1) Carga
-local carga = card(body, 1, 66)
-lbl(carga, "CARGA", UDim2.new(0.5, 0, 0, 12), UDim2.fromOffset(10, 6), 9, COLOR.sub, Enum.Font.GothamBold)
-ui.estado = lbl(carga, "Parado", UDim2.new(0.5, -10, 0, 12), UDim2.new(0.5, 0, 0, 6), 9, COLOR.sub, Enum.Font.GothamBold)
-ui.estado.TextXAlignment = Enum.TextXAlignment.Right
+	-- Carga
+	local carga = card(body, 1, 66)
+	lbl(carga, "CARGA", UDim2.new(0.5, 0, 0, 12), UDim2.fromOffset(10, 6), 9, COLOR.sub, Enum.Font.GothamBold)
+	ui.estado = lbl(carga, "Parado", UDim2.new(0.5, -10, 0, 12), UDim2.new(0.5, 0, 0, 6), 9, COLOR.sub, Enum.Font.GothamBold)
+	ui.estado.TextXAlignment = Enum.TextXAlignment.Right
+	ui.carry = lbl(carga, "0 / 16", UDim2.new(1, -20, 0, 24), UDim2.fromOffset(10, 18), 19, COLOR.green, Enum.Font.GothamBlack)
 
-ui.carry = lbl(carga, "0 / 16", UDim2.new(1, -20, 0, 24), UDim2.fromOffset(10, 18), 19, COLOR.green, Enum.Font.GothamBlack)
+	local track = Instance.new("Frame")
+	track.Position = UDim2.fromOffset(10, 45)
+	track.Size = UDim2.new(1, -20, 0, 6)
+	track.BackgroundColor3 = COLOR.track
+	track.BorderSizePixel = 0
+	track.Parent = carga
+	corner(track, 3)
 
-local track = Instance.new("Frame")
-track.Position = UDim2.fromOffset(10, 45)
-track.Size = UDim2.new(1, -20, 0, 6)
-track.BackgroundColor3 = COLOR.track
-track.BorderSizePixel = 0
-track.Parent = carga
-corner(track, 3)
+	ui.fill = Instance.new("Frame")
+	ui.fill.Size = UDim2.new(0, 0, 1, 0)
+	ui.fill.BackgroundColor3 = COLOR.green
+	ui.fill.BorderSizePixel = 0
+	ui.fill.Parent = track
+	corner(ui.fill, 3)
 
-ui.fill = Instance.new("Frame")
-ui.fill.Size = UDim2.new(0, 0, 1, 0)
-ui.fill.BackgroundColor3 = COLOR.green
-ui.fill.BorderSizePixel = 0
-ui.fill.Parent = track
-corner(ui.fill, 3)
+	ui.sub = lbl(carga, "", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 52), 9, COLOR.sub, Enum.Font.Gotham)
 
-ui.sub = lbl(carga, "", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 52), 9, COLOR.sub, Enum.Font.Gotham)
+	-- Botón principal
+	ui.auto = btn(body, "▶  AUTO RECOLECTAR", UDim2.new(1, 0, 0, 40), COLOR.green, 13)
+	ui.auto.LayoutOrder = 2
+	ui.auto.TextColor3 = COLOR.white
+	ui.auto.Activated:Connect(function()
+		setAuto(not S.on)
+	end)
 
--- 2) Botón principal
-ui.auto = btn(body, "▶  AUTO RECOLECTAR", UDim2.new(1, 0, 0, 40), nil, COLOR.green, 13)
-ui.auto.LayoutOrder = 2
-ui.auto.TextColor3 = COLOR.white
-ui.auto.Activated:Connect(function()
-	setAuto(not S.on)
-end)
+	-- Nivel
+	local nivelTitulo = lbl(body, "NIVEL", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
+	nivelTitulo.LayoutOrder = 3
 
--- 3) Nivel (◀ nivel ▶)
-local nivelTitulo = lbl(body, "NIVEL", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
-nivelTitulo.LayoutOrder = 3
+	local nivelRow = hRow(body, 4, 34)
+	local prevBtn = btn(nivelRow, "◀", UDim2.fromOffset(40, 34), COLOR.btn, 14)
+	prevBtn.LayoutOrder = 1
+	ui.level = btn(nivelRow, "", UDim2.new(1, -88, 1, 0), COLOR.card, 12)
+	ui.level.LayoutOrder = 2
+	local nextBtn = btn(nivelRow, "▶", UDim2.fromOffset(40, 34), COLOR.btn, 14)
+	nextBtn.LayoutOrder = 3
 
-local nivelRow = hRow(body, 4, 34)
-local prevBtn = btn(nivelRow, "◀", UDim2.fromOffset(40, 34), nil, COLOR.btn, 14)
-prevBtn.LayoutOrder = 1
-ui.level = btn(nivelRow, "", UDim2.new(1, -88, 1, 0), nil, COLOR.card, 12)
-ui.level.LayoutOrder = 2
-local nextBtn = btn(nivelRow, "▶", UDim2.fromOffset(40, 34), nil, COLOR.btn, 14)
-nextBtn.LayoutOrder = 3
-
-prevBtn.Activated:Connect(function()
-	S.levelIdx = S.levelIdx - 1
-	if S.levelIdx < 0 then S.levelIdx = #CFG.LEVELS end
-	refreshUI()
-end)
-nextBtn.Activated:Connect(function()
-	S.levelIdx = S.levelIdx + 1
-	if S.levelIdx > #CFG.LEVELS then S.levelIdx = 0 end
-	refreshUI()
-end)
-ui.level.Activated:Connect(function()
-	S.levelIdx = (S.levelIdx + 1) % (#CFG.LEVELS + 1)
-	refreshUI()
-end)
-
--- 4) Tipos de pila (cuadrícula 4 x 2)
-local pilasTitulo = lbl(body, "PILAS A RECOGER", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
-pilasTitulo.LayoutOrder = 5
-
-local grid = Instance.new("Frame")
-grid.Size = UDim2.new(1, 0, 0, 58)
-grid.BackgroundTransparency = 1
-grid.LayoutOrder = 6
-grid.Parent = body
-local gridLayout = Instance.new("UIGridLayout")
-gridLayout.CellSize = UDim2.fromOffset(54, 26)
-gridLayout.CellPadding = UDim2.fromOffset(4, 4)
-gridLayout.SortOrder = Enum.SortOrder.LayoutOrder
-gridLayout.Parent = grid
-
-for i, nombre in ipairs(CFG.PILE_LABELS) do
-	local b = btn(grid, nombre, UDim2.fromOffset(54, 26), nil, COLOR.accent, 9)
-	b.LayoutOrder = i
-	b.Activated:Connect(function()
-		S.pileOn[i] = not S.pileOn[i]
+	prevBtn.Activated:Connect(function()
+		S.levelIdx = S.levelIdx - 1
+		if S.levelIdx < 0 then S.levelIdx = #CFG.LEVELS end
 		refreshUI()
 	end)
-	ui.piles[i] = b
+	nextBtn.Activated:Connect(function()
+		S.levelIdx = S.levelIdx + 1
+		if S.levelIdx > #CFG.LEVELS then S.levelIdx = 0 end
+		refreshUI()
+	end)
+	ui.level.Activated:Connect(function()
+		S.levelIdx = (S.levelIdx + 1) % (#CFG.LEVELS + 1)
+		refreshUI()
+	end)
+
+	-- Tipos de pila
+	local pilasTitulo = lbl(body, "PILAS A RECOGER", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
+	pilasTitulo.LayoutOrder = 5
+
+	local grid = Instance.new("Frame")
+	grid.Size = UDim2.new(1, 0, 0, 58)
+	grid.BackgroundTransparency = 1
+	grid.LayoutOrder = 6
+	grid.Parent = body
+	local gridLayout = Instance.new("UIGridLayout")
+	gridLayout.CellSize = UDim2.fromOffset(54, 26)
+	gridLayout.CellPadding = UDim2.fromOffset(4, 4)
+	gridLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	gridLayout.Parent = grid
+
+	for i, nombre in ipairs(CFG.PILE_LABELS) do
+		local b = btn(grid, nombre, UDim2.fromOffset(54, 26), COLOR.accent, 9)
+		b.LayoutOrder = i
+		b.Activated:Connect(function()
+			S.pileOn[i] = not S.pileOn[i]
+			refreshUI()
+		end)
+		ui.piles[i] = b
+	end
+
+	-- Velocidad
+	local velCard = card(body, 7, 38)
+	lbl(velCard, "Vuelo", UDim2.new(0, 60, 1, 0), UDim2.fromOffset(10, 0), 11, COLOR.sub, Enum.Font.GothamBold)
+	local velMinus = btn(velCard, "−", UDim2.fromOffset(36, 28), COLOR.btn, 16)
+	velMinus.Position = UDim2.new(1, -116, 0.5, -14)
+	ui.vel = lbl(velCard, "", UDim2.fromOffset(44, 28), UDim2.new(1, -78, 0.5, -14), 14, COLOR.cyan, Enum.Font.GothamBlack)
+	ui.vel.TextXAlignment = Enum.TextXAlignment.Center
+	local velPlus = btn(velCard, "+", UDim2.fromOffset(36, 28), COLOR.btn, 16)
+	velPlus.Position = UDim2.new(1, -40, 0.5, -14)
+
+	velMinus.Activated:Connect(function()
+		S.vel = math.max(CFG.VEL_MIN, S.vel - CFG.VEL_STEP)
+		refreshUI()
+	end)
+	velPlus.Activated:Connect(function()
+		S.vel = math.min(CFG.VEL_MAX, S.vel + CFG.VEL_STEP)
+		refreshUI()
+	end)
+
+	-- Base
+	local acciones = hRow(body, 8, 30)
+	local baseBtn = btn(acciones, "📍 Guardar base", UDim2.new(0.5, -3, 1, 0), COLOR.btn, 11)
+	baseBtn.LayoutOrder = 1
+	local limpiarBtn = btn(acciones, "↺ Borrar base", UDim2.new(0.5, -3, 1, 0), COLOR.btn, 11)
+	limpiarBtn.LayoutOrder = 2
+	limpiarBtn.TextColor3 = COLOR.red
+
+	baseBtn.Activated:Connect(function()
+		local part = parteMovil()
+		if not part then
+			setMsg("❌ Sin personaje", COLOR.red)
+			return
+		end
+		S.base = part.Position
+		setMsg("✅ Base guardada aquí", COLOR.green)
+		refreshUI()
+	end)
+	limpiarBtn.Activated:Connect(function()
+		S.base = nil
+		setMsg("↺ Base borrada", COLOR.amber)
+		refreshUI()
+	end)
+
+	-- Stats
+	local statsBtn = btn(body, "📊 Ver stats del mecha (F9)", UDim2.new(1, 0, 0, 28), COLOR.btn, 11)
+	statsBtn.LayoutOrder = 9
+	statsBtn.Activated:Connect(function()
+		local mech = getMech()
+		if not mech then
+			setMsg("❌ No encuentro tu mecha", COLOR.red)
+			return
+		end
+		print("--- STATS DE MECHA ---")
+		print("Nombre:", mech.Name)
+		print("MechId:", mech:GetAttribute("MechId"))
+		print("PilotMode:", mech:GetAttribute("PilotMode"))
+		print("CarryTotal:", mech:GetAttribute("CarryTotal"))
+		print("CarryCapacity:", mech:GetAttribute("CarryCapacity"))
+		print("CarryMax:", mech:GetAttribute("CarryMax"))
+		print("Carry_Light:", mech:GetAttribute("Carry_Light"))
+		print("Carry_Scrap:", mech:GetAttribute("Carry_Scrap"))
+		setMsg("✅ Stats impresos en F9", COLOR.green)
+	end)
+
+	-- Información
+	ui.base = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
+	ui.base.LayoutOrder = 10
+	ui.base.TextXAlignment = Enum.TextXAlignment.Center
+
+	ui.mech = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
+	ui.mech.LayoutOrder = 11
+	ui.mech.TextXAlignment = Enum.TextXAlignment.Center
+
+	ui.msg = lbl(body, "", UDim2.new(1, 0, 0, 16), nil, 10, COLOR.sub, Enum.Font.Gotham)
+	ui.msg.LayoutOrder = 12
+	ui.msg.TextXAlignment = Enum.TextXAlignment.Center
+
+	-- Burbuja
+	local bubble = Instance.new("TextButton")
+	bubble.Name = "Bubble"
+	bubble.Size = UDim2.fromOffset(CFG.BUBBLE, CFG.BUBBLE)
+	bubble.BackgroundColor3 = COLOR.accent
+	bubble.BorderSizePixel = 0
+	bubble.AutoButtonColor = false
+	bubble.Text = "🤖"
+	bubble.TextSize = 20
+	bubble.Font = Enum.Font.GothamBold
+	bubble.Visible = false
+	bubble.ZIndex = 10
+	bubble.Parent = screen
+	corner(bubble, CFG.BUBBLE / 2)
+	stroke(bubble, COLOR.white, 0.4, 1.5)
+	ui.bubble = bubble
+
+	-- Minimizar / cerrar / arrastrar
+	local function setMinimized(v)
+		S.minimized = v
+		if v then
+			local x, y = clampPos(panel.Position.X.Offset, panel.Position.Y.Offset, CFG.BUBBLE, CFG.BUBBLE)
+			bubble.Position = UDim2.fromOffset(x, y)
+		else
+			local w = CFG.PANEL_W * ui.panelScale.Scale
+			local h = CFG.PANEL_H * ui.panelScale.Scale
+			local x, y = clampPos(bubble.Position.X.Offset, bubble.Position.Y.Offset, w, h)
+			panel.Position = UDim2.fromOffset(x, y)
+		end
+		panel.Visible = not v
+		bubble.Visible = v
+	end
+
+	minBtn.Activated:Connect(function()
+		setMinimized(true)
+	end)
+
+	closeBtn.Activated:Connect(function()
+		S.closed = true
+		S.on = false
+		screen:Destroy()
+	end)
+
+	makeDrag(header, panel, nil, function()
+		local w = CFG.PANEL_W * ui.panelScale.Scale
+		local h = CFG.PANEL_H * ui.panelScale.Scale
+		local x, y = clampPos(panel.Position.X.Offset, panel.Position.Y.Offset, w, h)
+		panel.Position = UDim2.fromOffset(x, y)
+	end)
+
+	makeDrag(bubble, bubble,
+		function() setMinimized(false) end,
+		function()
+			local x, y = clampPos(bubble.Position.X.Offset, bubble.Position.Y.Offset, CFG.BUBBLE, CFG.BUBBLE)
+			bubble.Position = UDim2.fromOffset(x, y)
+		end)
+
+	return screen
 end
 
--- 5) Velocidad de desplazamiento
-local velCard = card(body, 7, 38)
-lbl(velCard, "Vuelo", UDim2.new(0, 60, 1, 0), UDim2.fromOffset(10, 0), 11, COLOR.sub, Enum.Font.GothamBold)
-local velMinus = btn(velCard, "−", UDim2.fromOffset(36, 28), UDim2.new(1, -116, 0.5, -14), COLOR.btn, 16)
-ui.vel = lbl(velCard, "", UDim2.fromOffset(44, 28), UDim2.new(1, -78, 0.5, -14), 14, COLOR.cyan, Enum.Font.GothamBlack)
-ui.vel.TextXAlignment = Enum.TextXAlignment.Center
-local velPlus = btn(velCard, "+", UDim2.fromOffset(36, 28), UDim2.new(1, -40, 0.5, -14), COLOR.btn, 16)
-
-velMinus.Activated:Connect(function()
-	S.vel = math.max(CFG.VEL_MIN, S.vel - CFG.VEL_STEP)
-	refreshUI()
-end)
-velPlus.Activated:Connect(function()
-	S.vel = math.min(CFG.VEL_MAX, S.vel + CFG.VEL_STEP)
-	refreshUI()
-end)
-
--- 6) Base y acciones
-local acciones = hRow(body, 8, 30)
-local baseBtn = btn(acciones, "📍 Guardar base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
-baseBtn.LayoutOrder = 1
-local limpiarBtn = btn(acciones, "↺ Borrar base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
-limpiarBtn.LayoutOrder = 2
-limpiarBtn.TextColor3 = COLOR.red
-
-baseBtn.Activated:Connect(function()
-	local part = parteMovil()
-	if not part then
-		setMsg("❌ Sin personaje", COLOR.red)
-		return
-	end
-	S.base = part.Position
-	setMsg("✅ Base guardada aquí", COLOR.green)
-	refreshUI()
-end)
-
-limpiarBtn.Activated:Connect(function()
-	S.base = nil
-	setMsg("↺ Base borrada", COLOR.amber)
-	refreshUI()
-end)
-
-local statsBtn = btn(body, "📊 Ver stats del mecha (F9)", UDim2.new(1, 0, 0, 28), nil, COLOR.btn, 11)
-statsBtn.LayoutOrder = 9
-statsBtn.Activated:Connect(function()
-	local mech = getMech()
-	if not mech then
-		setMsg("❌ No encuentro tu mecha", COLOR.red)
-		return
-	end
-	print("--- STATS DE MECHA ---")
-	print("Nombre:", mech.Name)
-	print("MechId:", mech:GetAttribute("MechId"))
-	print("PilotMode:", mech:GetAttribute("PilotMode"))
-	print("CarryTotal:", mech:GetAttribute("CarryTotal"))
-	print("CarryCapacity:", mech:GetAttribute("CarryCapacity"))
-	print("CarryMax:", mech:GetAttribute("CarryMax"))
-	print("Carry_Light:", mech:GetAttribute("Carry_Light"))
-	print("Carry_Scrap:", mech:GetAttribute("Carry_Scrap"))
-	setMsg("✅ Stats impresos en F9", COLOR.green)
-end)
-
--- 7) Información y mensajes
-ui.base = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
-ui.base.LayoutOrder = 10
-ui.base.TextXAlignment = Enum.TextXAlignment.Center
-
-ui.mech = lbl(body, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
-ui.mech.LayoutOrder = 11
-ui.mech.TextXAlignment = Enum.TextXAlignment.Center
-
-ui.msg = lbl(body, "", UDim2.new(1, 0, 0, 16), nil, 10, COLOR.sub, Enum.Font.Gotham)
-ui.msg.LayoutOrder = 12
-ui.msg.TextXAlignment = Enum.TextXAlignment.Center
-
--- Burbuja
-ui.bubble = Instance.new("TextButton")
-ui.bubble.Name = "Bubble"
-ui.bubble.Size = UDim2.fromOffset(CFG.BUBBLE, CFG.BUBBLE)
-ui.bubble.BackgroundColor3 = COLOR.accent
-ui.bubble.BorderSizePixel = 0
-ui.bubble.AutoButtonColor = false
-ui.bubble.Text = "🤖"
-ui.bubble.TextSize = 20
-ui.bubble.Font = Enum.Font.GothamBold
-ui.bubble.Visible = false
-ui.bubble.ZIndex = 10
-ui.bubble.Parent = screen
-corner(ui.bubble, CFG.BUBBLE / 2)
-stroke(ui.bubble, COLOR.white, 0.4, 1.5)
-
----------------------------------------------------------------
--- POSICIÓN, ESCALA Y MINIMIZADO
----------------------------------------------------------------
+-- Posiciona el panel en pantalla (se llama al inicio y al girar el teléfono)
 local function layout()
+	if not ui.panelScale then return end
 	ui.panelScale.Scale = fitScale()
 	local w = CFG.PANEL_W * ui.panelScale.Scale
 	local h = CFG.PANEL_H * ui.panelScale.Scale
@@ -835,56 +863,33 @@ local function layout()
 	if not S.placed then
 		S.placed = true
 		local x, y = clampPos((vp.X - w) / 2, vp.Y * 0.14, w, h)
-		panel.Position = UDim2.fromOffset(x, y)
+		ui.panel.Position = UDim2.fromOffset(x, y)
 		ui.bubble.Position = UDim2.fromOffset(vp.X - CFG.BUBBLE - 12, vp.Y * 0.45)
 	else
-		local x, y = clampPos(panel.Position.X.Offset, panel.Position.Y.Offset, w, h)
-		panel.Position = UDim2.fromOffset(x, y)
+		local x, y = clampPos(ui.panel.Position.X.Offset, ui.panel.Position.Y.Offset, w, h)
+		ui.panel.Position = UDim2.fromOffset(x, y)
 	end
 end
 
-local function setMinimized(v)
-	S.minimized = v
-	if v then
-		local x, y = clampPos(panel.Position.X.Offset, panel.Position.Y.Offset, CFG.BUBBLE, CFG.BUBBLE)
-		ui.bubble.Position = UDim2.fromOffset(x, y)
-	else
-		local w = CFG.PANEL_W * ui.panelScale.Scale
-		local h = CFG.PANEL_H * ui.panelScale.Scale
-		local x, y = clampPos(ui.bubble.Position.X.Offset, ui.bubble.Position.Y.Offset, w, h)
-		panel.Position = UDim2.fromOffset(x, y)
-	end
-	panel.Visible = not v
-	ui.bubble.Visible = v
+---------------------------------------------------------------
+-- ARRANQUE
+---------------------------------------------------------------
+local okBuild, errBuild = pcall(build)
+if not okBuild then
+	warn("[MECHA] Error al crear el panel: " .. tostring(errBuild))
+	return
+end
+print("[MECHA] Panel creado")
+
+layout()
+setEstado("Parado", COLOR.sub)
+refreshUI()
+
+local cam = Workspace.CurrentCamera
+if cam then
+	cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
 end
 
-minBtn.Activated:Connect(function()
-	setMinimized(true)
-end)
-
-closeBtn.Activated:Connect(function()
-	S.closed = true
-	S.on = false
-	screen:Destroy()
-end)
-
-makeDrag(header, panel, nil, function()
-	local w = CFG.PANEL_W * ui.panelScale.Scale
-	local h = CFG.PANEL_H * ui.panelScale.Scale
-	local x, y = clampPos(panel.Position.X.Offset, panel.Position.Y.Offset, w, h)
-	panel.Position = UDim2.fromOffset(x, y)
-end)
-
-makeDrag(ui.bubble, ui.bubble,
-	function() setMinimized(false) end,
-	function()
-		local x, y = clampPos(ui.bubble.Position.X.Offset, ui.bubble.Position.Y.Offset, CFG.BUBBLE, CFG.BUBBLE)
-		ui.bubble.Position = UDim2.fromOffset(x, y)
-	end)
-
----------------------------------------------------------------
--- BUCLES
----------------------------------------------------------------
 -- Ciclo de recolección (solo corre cuando está encendido)
 task.spawn(function()
 	while not S.closed do
@@ -909,11 +914,3 @@ task.spawn(function()
 		task.wait(0.25)
 	end
 end)
-
-layout()
-local cam = Workspace.CurrentCamera
-if cam then
-	cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
-end
-setEstado("Parado", COLOR.sub)
-refreshUI()
