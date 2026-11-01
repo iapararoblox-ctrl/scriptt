@@ -1,11 +1,16 @@
--- MECHA PANEL v3 · Auto-recolección por arenas + retorno a la base (LocalScript móvil)
+-- MECHA PANEL v3.1 · Auto-recolección por arenas + retorno a la base (LocalScript móvil)
+-- NUEVO v3.1:
+--   • Pestaña "Cupos": cantidad máxima por tipo de pieza (escribes tú el número)
+--   • Elegir manualmente qué mecha usar (sus propiedades Carry* y su velocidad)
+--   • Velocidad con interruptor ON/OFF: al apagar vuelve al valor original
+--   • Todo se guarda (writefile) y se mantiene al volver a ejecutar el script
 -- Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
--- Mecha: modelo en Workspace con tu OwnerName/Owner. Carga: CarryTotal / CarryCapacity / CarryMax.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 ---------------------------------------------------------------
@@ -13,6 +18,7 @@ local LocalPlayer = Players.LocalPlayer
 ---------------------------------------------------------------
 local CFG = {
 	GUI_NAME = "MechaMobilePanel",
+	SAVE_FILE = "MechaPanel_v3.json",
 	PANEL_W = 250,
 	PANEL_H = 360,
 	BUBBLE = 48,
@@ -21,21 +27,22 @@ local CFG = {
 	SPEED_MAX = 150,
 	SPEED_STEP = 10,
 	SPEED_DEFAULT = 40,
+	SPEED_REAPPLY = 1,       -- segundos entre reaplicaciones de la velocidad (para que se quede)
 
 	CAP_DEFECTO = 16,        -- límite si el mecha no tiene CarryCapacity ni CarryMax
-	VUELO_VEL = 110,         -- studs por segundo al deslizarse
-	MAX_VUELO = 60,          -- segundos máximos por trayecto
-	ALTURA = 4,              -- studs sobre el punto de destino
-	RANGO_RECOGER = 40,      -- studs para el botón manual 🧲 Recoger
+	VUELO_VEL = 110,
+	MAX_VUELO = 60,
+	ALTURA = 4,
+	RANGO_RECOGER = 40,
 
-	ESPERA_PROMPT = 0.25,    -- pausa entre intentos de recoger una pila
-	SIN_PROGRESO = 3,        -- segundos sin que suba la carga para dar por terminada una pila
-	TIMEOUT_PILA = 12,       -- máximo de segundos por pila
-	BLOQUEO = 30,            -- segundos que se ignora una pila que no se pudo recoger
-	FALLOS_LLENO = 3,        -- pilas seguidas sin recoger (con carga encima) = se considera lleno
-	ESPERA_DESCARGA = 8,     -- segundos máximos esperando que se vacíe en la base
-	RESCAN = 2,              -- segundos entre escaneos de PartPiles
-	TICK = 0.6,              -- espera entre ciclos si no hay piezas
+	ESPERA_PROMPT = 0.25,
+	SIN_PROGRESO = 3,
+	TIMEOUT_PILA = 12,
+	BLOQUEO = 30,
+	FALLOS_LLENO = 3,
+	ESPERA_DESCARGA = 8,
+	RESCAN = 2,
+	TICK = 0.6,
 }
 
 local COLOR = {
@@ -53,7 +60,6 @@ local COLOR = {
 	track = Color3.fromRGB(44, 48, 64),
 }
 
--- Tipos de pieza dentro de PartPiles
 local TYPES = {
 	{ key = "Chunk", es = "Trozo" },
 	{ key = "LightPartPile", es = "Pila ligera" },
@@ -65,7 +71,6 @@ local TYPES = {
 	{ key = "BigScrapPartPile", es = "Pila de chatarra grande" },
 }
 
--- Áreas conocidas (se usan solo si no se puede leer Workspace.World.Arenas)
 local STATIC_AREAS = {
 	"Level1_ScrapYard",
 	"Level2_RustyRails",
@@ -83,19 +88,25 @@ local S = {
 	closed = false,
 	on = false,
 	speed = CFG.SPEED_DEFAULT,
+	speedOn = false,       -- ¿velocidad modificada activa?
+	speedMech = nil,       -- mecha al que se le aplicó la velocidad
 	state = "Parado",
 	total = 0,
 	limit = CFG.CAP_DEFECTO,
-	base = nil,            -- Vector3 guardado con 📍 Base
-	zone = nil,            -- Vector3 guardado con 📍 Zona (se va ahí si no hay piezas cargadas)
+	base = nil,
+	zone = nil,
 	placed = false,
 	minimized = false,
 
-	areaName = "*ALL",     -- "*ALL" o el nombre de la carpeta del nivel
-	types = {},            -- tipo -> true/false
-	limitMode = "MAX",     -- "MAX" = CarryMax, "CAP" = CarryCapacity
-	moveMode = "GLIDE",    -- "GLIDE" = deslizar, "TP" = teletransporte
+	areaName = "*ALL",
+	types = {},
+	caps = {},             -- tipo -> cantidad máxima (nil = sin límite)
+	session = {},          -- tipo -> cantidad contada por el script (respaldo si el mecha no tiene Carry_<tipo>)
+	limitMode = "MAX",
+	moveMode = "GLIDE",
 
+	mechPick = nil,        -- mecha elegido a mano (instancia)
+	mechPickName = nil,    -- nombre del mecha elegido (nil = automático)
 	mech = nil,
 	mechTime = -100,
 	deepTime = -100,
@@ -103,7 +114,7 @@ local S = {
 	pileCache = nil,
 	pileTime = -100,
 	pileDirty = true,
-	black = setmetatable({}, { __mode = "k" }),  -- pila -> hora hasta la que se ignora
+	black = setmetatable({}, { __mode = "k" }),
 
 	collected = 0,
 	fails = 0,
@@ -113,6 +124,74 @@ for _, t in ipairs(TYPES) do
 end
 
 local ui = {}
+
+---------------------------------------------------------------
+-- GUARDADO / CARGA (necesita writefile/readfile del ejecutor)
+---------------------------------------------------------------
+local function saveNow()
+	if not writefile then return end
+	local data = {
+		speed = S.speed,
+		speedOn = S.speedOn,
+		limitMode = S.limitMode,
+		moveMode = S.moveMode,
+		areaName = S.areaName,
+		types = S.types,
+		caps = S.caps,
+		mech = S.mechPickName,
+		base = S.base and { S.base.X, S.base.Y, S.base.Z } or nil,
+		zone = S.zone and { S.zone.X, S.zone.Y, S.zone.Z } or nil,
+	}
+	pcall(function()
+		writefile(CFG.SAVE_FILE, HttpService:JSONEncode(data))
+	end)
+end
+
+local saveTok = 0
+local function save()
+	saveTok += 1
+	local my = saveTok
+	task.delay(0.5, function()
+		if my == saveTok then saveNow() end
+	end)
+end
+
+local function loadSaved()
+	if not (readfile and isfile) then return end
+	local ok, data = pcall(function()
+		if isfile(CFG.SAVE_FILE) then
+			return HttpService:JSONDecode(readfile(CFG.SAVE_FILE))
+		end
+	end)
+	if not ok or type(data) ~= "table" then return end
+
+	if tonumber(data.speed) then
+		S.speed = math.clamp(tonumber(data.speed), CFG.SPEED_MIN, CFG.SPEED_MAX)
+	end
+	S.speedOn = data.speedOn == true
+	if data.limitMode == "MAX" or data.limitMode == "CAP" then S.limitMode = data.limitMode end
+	if data.moveMode == "GLIDE" or data.moveMode == "TP" then S.moveMode = data.moveMode end
+	if type(data.areaName) == "string" then S.areaName = data.areaName end
+	if type(data.types) == "table" then
+		for _, t in ipairs(TYPES) do
+			if data.types[t.key] ~= nil then S.types[t.key] = data.types[t.key] == true end
+		end
+	end
+	if type(data.caps) == "table" then
+		for _, t in ipairs(TYPES) do
+			local v = tonumber(data.caps[t.key])
+			if v and v > 0 then S.caps[t.key] = math.floor(v) end
+		end
+	end
+	if type(data.mech) == "string" and data.mech ~= "" then S.mechPickName = data.mech end
+	if type(data.base) == "table" and #data.base == 3 then
+		S.base = Vector3.new(data.base[1], data.base[2], data.base[3])
+	end
+	if type(data.zone) == "table" and #data.zone == 3 then
+		S.zone = Vector3.new(data.zone[1], data.zone[2], data.zone[3])
+	end
+end
+loadSaved()
 
 ---------------------------------------------------------------
 -- HELPERS DE INTERFAZ
@@ -172,7 +251,6 @@ local function lbl(parent, text, size, pos, textSize, color, font)
 	return l
 end
 
--- Texto largo que crece hacia abajo
 local function note(parent, order, textSize)
 	local l = Instance.new("TextLabel")
 	l.Size = UDim2.new(1, 0, 0, 0)
@@ -273,7 +351,6 @@ local function fitScale()
 	return math.clamp(math.min(vp.X * 0.9 / CFG.PANEL_W, vp.Y * 0.8 / CFG.PANEL_H, 1.1), 0.6, 1.1)
 end
 
--- Arrastrar con dedo o ratón. onTap = toque corto, onEnd = al soltar tras arrastrar
 local function makeDrag(handle, target, onTap, onEnd)
 	local dragging, moved = false, false
 	local startInput, startPos
@@ -318,14 +395,13 @@ local function makeDrag(handle, target, onTap, onEnd)
 end
 
 ---------------------------------------------------------------
--- MECHA ACTIVO (modelo en Workspace con tu OwnerName / Owner)
+-- MECHA (automático o elegido a mano)
 ---------------------------------------------------------------
 local function hrpNow()
 	local char = LocalPlayer.Character
 	return char and char:FindFirstChild("HumanoidRootPart")
 end
 
--- ¿El modelo es tuyo? Atributos OwnerName/Owner o nombre tipo MechId_Jugador_N
 local function ownedBy(m)
 	local name = LocalPlayer.Name
 	local display = LocalPlayer.DisplayName
@@ -368,6 +444,7 @@ local function scoreMech(m)
 	return s
 end
 
+-- Detección automática (solo mechas tuyos)
 local function findMech()
 	local best, bestScore
 	local function consider(m)
@@ -383,7 +460,6 @@ local function findMech()
 		consider(o)
 	end
 
-	-- Respaldo (cada 5 s): por si el mecha está dentro de otra carpeta
 	if not best and os.clock() - S.deepTime > 5 then
 		S.deepTime = os.clock()
 		for _, o in ipairs(Workspace:GetDescendants()) do
@@ -395,14 +471,83 @@ local function findMech()
 	return best
 end
 
+-- Todos los mechas que se ven (para elegir a mano). Los tuyos primero
+local function listMechs()
+	local out, seen = {}, {}
+	local function consider(m)
+		if m:IsA("Model") and not seen[m] and scoreMech(m) > 0 then
+			seen[m] = true
+			table.insert(out, m)
+		end
+	end
+	for _, o in ipairs(Workspace:GetChildren()) do
+		consider(o)
+	end
+	for _, o in ipairs(Workspace:GetDescendants()) do
+		if o:IsA("Model") and o:GetAttribute("MechId") ~= nil then
+			consider(o)
+		end
+	end
+	table.sort(out, function(a, b)
+		local oa, ob = ownedBy(a), ownedBy(b)
+		if oa ~= ob then return oa end
+		return a.Name < b.Name
+	end)
+	return out
+end
+
+-- Busca por nombre el mecha elegido (por si se vuelve a crear)
+local function findByName(name)
+	for _, o in ipairs(Workspace:GetChildren()) do
+		if o:IsA("Model") and o.Name == name and scoreMech(o) > 0 then
+			return o
+		end
+	end
+	if os.clock() - S.deepTime > 5 then
+		S.deepTime = os.clock()
+		for _, o in ipairs(Workspace:GetDescendants()) do
+			if o:IsA("Model") and o.Name == name and o:GetAttribute("MechId") ~= nil then
+				return o
+			end
+		end
+	end
+	return nil
+end
+
 local function getMech()
 	local now = os.clock()
+
+	-- Elegido a mano: se usa SOLO ese
+	if S.mechPickName then
+		if S.mechPick and S.mechPick.Parent then
+			S.mech = S.mechPick
+			return S.mech
+		end
+		if now - S.mechTime >= 2 then
+			S.mechTime = now
+			S.mechPick = findByName(S.mechPickName)
+		end
+		S.mech = S.mechPick
+		return S.mech
+	end
+
+	-- Automático
 	if S.mech and S.mech.Parent and now - S.mechTime < 2 then
 		return S.mech
 	end
 	S.mech = findMech()
 	S.mechTime = now
 	return S.mech
+end
+
+local function setMechPick(m)
+	S.mechPick = m
+	S.mechPickName = m and m.Name or nil
+	S.mech = m
+	S.mechTime = os.clock()
+	S.session = {}
+	S.fails = 0
+	save()
 end
 
 -- Devuelve total, límite activo, CarryCapacity, CarryMax
@@ -416,10 +561,27 @@ local function getCarry(mech)
 	else
 		limit = cap or max or CFG.CAP_DEFECTO
 	end
+	if total <= 0 and next(S.session) ~= nil then
+		S.session = {}
+	end
 	return total, limit, cap, max
 end
 
--- ¿Estás pilotando el mecha?
+-- Cantidad que lleva ahora de un tipo: atributo Carry_<tipo> si existe; si no, el conteo del script
+local function shortName(key)
+	return (key:gsub("PartPile$", ""))
+end
+
+local function typeCount(mech, key)
+	for _, n in ipairs({ "Carry_" .. shortName(key), "Carry_" .. key }) do
+		local v = mech:GetAttribute(n)
+		if v ~= nil then
+			return tonumber(v) or 0
+		end
+	end
+	return S.session[key] or 0
+end
+
 local function pilotActive(mech)
 	local p = mech:GetAttribute("Pilot")
 	if p ~= nil then
@@ -433,7 +595,6 @@ local function pilotActive(mech)
 	return mech:GetAttribute("PilotMode") == "Seat"
 end
 
--- Base: la que guardaste a mano, o workspace.YourBaseMarker
 local function getBasePos()
 	if S.base then
 		return S.base
@@ -446,22 +607,50 @@ local function getBasePos()
 	return nil
 end
 
-local function applySpeed()
-	local mech = getMech()
-	if not mech then
-		return false
+---------------------------------------------------------------
+-- VELOCIDAD (reversible: guarda el valor original)
+---------------------------------------------------------------
+local origSpeed = setmetatable({}, { __mode = "k" })  -- mecha -> { attrs = {}, hums = {} }
+
+local function applySpeed(mech)
+	local o = origSpeed[mech]
+	if not o then
+		o = { attrs = {}, hums = {} }
+		origSpeed[mech] = o
+		for _, k in ipairs({ "WalkSpeed", "RunSpeed" }) do
+			local v = mech:GetAttribute(k)
+			if v ~= nil then o.attrs[k] = v end
+		end
 	end
-	if mech:GetAttribute("WalkSpeed") ~= nil then
+
+	if mech:GetAttribute("WalkSpeed") ~= nil and mech:GetAttribute("WalkSpeed") ~= S.speed then
 		mech:SetAttribute("WalkSpeed", S.speed)
 	end
-	if mech:GetAttribute("RunSpeed") ~= nil then
+	if mech:GetAttribute("RunSpeed") ~= nil and mech:GetAttribute("RunSpeed") ~= S.speed + 20 then
 		mech:SetAttribute("RunSpeed", S.speed + 20)
 	end
 	for _, d in ipairs(mech:GetDescendants()) do
 		if d:IsA("Humanoid") then
-			d.WalkSpeed = S.speed
+			if o.hums[d] == nil then
+				o.hums[d] = d.WalkSpeed
+			end
+			if d.WalkSpeed ~= S.speed then
+				d.WalkSpeed = S.speed
+			end
 		end
 	end
+end
+
+local function restoreSpeed(mech)
+	local o = mech and origSpeed[mech]
+	if not o then return false end
+	for k, v in pairs(o.attrs) do
+		if mech.Parent then mech:SetAttribute(k, v) end
+	end
+	for h, v in pairs(o.hums) do
+		if h.Parent then h.WalkSpeed = v end
+	end
+	origSpeed[mech] = nil
 	return true
 end
 
@@ -494,7 +683,6 @@ local function placeAt(mech, pos)
 	end
 end
 
--- Va hasta "target". Devuelve true si llegó
 local function moveTo(mech, target)
 	if S.moveMode == "TP" then
 		placeAt(mech, target)
@@ -537,7 +725,6 @@ local function splitCamel(s)
 	return (s:gsub("(%l)(%u)", "%1 %2"))
 end
 
--- Lista de áreas para el selector: "Todas" + las que existan en Arenas
 local function buildAreaOptions()
 	local opts = { { name = "*ALL", label = "Todas las áreas" } }
 	local found = {}
@@ -589,7 +776,6 @@ local function typeLabel(key)
 	return key
 end
 
--- Tipo de pieza según el nombre (acepta sufijos, p. ej. LightPartPile_12)
 local function typeOf(name)
 	for _, t in ipairs(TYPES) do
 		if name == t.key or name:sub(1, #t.key) == t.key then
@@ -599,7 +785,6 @@ local function typeOf(name)
 	return nil
 end
 
--- Piezas recolectables dentro de un PartPiles. Cada una: { inst, kind, area }
 local function collectCandidates(partPiles, areaName)
 	local isCand = {}
 	local descendants = partPiles:GetDescendants()
@@ -612,7 +797,6 @@ local function collectCandidates(partPiles, areaName)
 			end
 		end
 	end
-	-- Carpetas con el nombre del tipo: sus hijos son las piezas
 	for _, d in ipairs(descendants) do
 		if d:IsA("Folder") then
 			local k = typeOf(d.Name)
@@ -628,7 +812,6 @@ local function collectCandidates(partPiles, areaName)
 
 	local list = {}
 	for inst, k in pairs(isCand) do
-		-- Si está dentro de otra pieza, solo cuenta la de fuera
 		local nested = false
 		local p = inst.Parent
 		while p and p ~= partPiles do
@@ -645,7 +828,6 @@ local function collectCandidates(partPiles, areaName)
 	return list
 end
 
--- Piezas cargadas ahora en el área elegida (se cachea unos segundos)
 local function getPiles()
 	local now = os.clock()
 	if S.pileCache and not S.pileDirty and now - S.pileTime < CFG.RESCAN then
@@ -703,7 +885,6 @@ local function firstPart(inst)
 	return inst:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- Intenta recoger una pieza: prompts y, si no tiene, contacto. Devuelve true si intentó algo
 local function triggerPile(inst)
 	local fired = false
 	if fireproximityprompt then
@@ -737,24 +918,40 @@ local function triggerPile(inst)
 	return false
 end
 
--- Pieza válida más cercana (según área, tipos activos y bloqueos)
-local function nextPile(origin)
+-- Pieza válida más cercana. Salta los tipos cuyo cupo ya está completo.
+-- Devuelve: pieza, y true si alguna se saltó solo por cupo lleno
+local function nextPile(mech, origin)
 	local now = os.clock()
 	local best, bestDist
+	local capBlocked = false
+	local full = {}
+
 	for _, e in ipairs(getPiles()) do
 		local expiry = S.black[e.inst]
 		local blocked = expiry ~= nil and expiry > now
 		if S.types[e.kind] and not blocked and pileAlive(e.inst) then
-			local p = pilePos(e.inst)
-			if p then
-				local d = (p - origin).Magnitude
-				if not bestDist or d < bestDist then
-					best, bestDist = e, d
+			local cap = S.caps[e.kind]
+			local isFull = false
+			if cap then
+				if full[e.kind] == nil then
+					full[e.kind] = typeCount(mech, e.kind) >= cap
+				end
+				isFull = full[e.kind]
+			end
+			if isFull then
+				capBlocked = true
+			else
+				local p = pilePos(e.inst)
+				if p then
+					local d = (p - origin).Magnitude
+					if not bestDist or d < bestDist then
+						best, bestDist = e, d
+					end
 				end
 			end
 		end
 	end
-	return best
+	return best, capBlocked
 end
 
 ---------------------------------------------------------------
@@ -800,12 +997,16 @@ local function refreshMechInfo()
 	if not ui.mechNote then return end
 	local mech = getMech()
 	if not mech then
-		ui.mechNote.Text = "No encuentro tu mecha. Debe ser un modelo en Workspace con tu OwnerName/Owner y atributos Carry*."
+		if S.mechPickName then
+			ui.mechNote.Text = "No encuentro el mecha elegido: " .. S.mechPickName .. ". Pulsa 🔄 o vuelve a Automático."
+		else
+			ui.mechNote.Text = "No encuentro tu mecha. Debe ser un modelo en Workspace con tu OwnerName/Owner y atributos Carry*."
+		end
 		return
 	end
 	local total, limit, cap, max = getCarry(mech)
 	local lines = {}
-	table.insert(lines, "Mecha: " .. mech.Name)
+	table.insert(lines, "Mecha (" .. (S.mechPickName and "manual" or "auto") .. "): " .. mech.Name)
 	table.insert(lines, "MechId: " .. tostring(mech:GetAttribute("MechId"))
 		.. " · Piloto: " .. (pilotActive(mech) and "sí" or "no")
 		.. " (PilotMode=" .. tostring(mech:GetAttribute("PilotMode")) .. ")")
@@ -813,6 +1014,10 @@ local function refreshMechInfo()
 	local br = carryBreakdown(mech)
 	if br ~= "" then
 		table.insert(lines, "Detalle: " .. br)
+	end
+	local o = origSpeed[mech]
+	if o then
+		table.insert(lines, "Velocidad original: WalkSpeed " .. tostring(o.attrs.WalkSpeed) .. " · RunSpeed " .. tostring(o.attrs.RunSpeed))
 	end
 	ui.mechNote.Text = table.concat(lines, "\n")
 end
@@ -826,6 +1031,9 @@ local function refreshUI()
 	ui.fill.BackgroundColor3 = (r >= 1 and COLOR.red) or (r >= 0.7 and COLOR.amber) or COLOR.green
 
 	ui.speedVal.Text = tostring(S.speed)
+	ui.speedBtn.Text = S.speedOn and "Velocidad: ENCENDIDA (tocar = original)" or "Velocidad: APAGADA (original)"
+	ui.speedBtn.BackgroundColor3 = S.speedOn and COLOR.green or COLOR.btn
+	ui.speedBtn.TextColor3 = S.speedOn and COLOR.white or COLOR.text
 
 	ui.autoBtn.Text = S.on and "■  DETENER AUTO" or "▶  AUTO RECOLECTAR"
 	ui.autoBtn.BackgroundColor3 = S.on and COLOR.red or COLOR.green
@@ -834,17 +1042,35 @@ local function refreshUI()
 	ui.areaLbl.Text = areaLabel()
 	ui.limitBtn.Text = S.limitMode == "MAX" and "Límite: CarryMax" or "Límite: CarryCapacity"
 	ui.moveBtn.Text = S.moveMode == "GLIDE" and "Mover: Deslizar" or "Mover: Teletransporte"
+	ui.mechLbl.Text = S.mechPickName or "Automático"
 
 	local baseTxt = S.base and "guardada" or (getBasePos() and "marcador" or "✖")
 	ui.infoLbl.Text = "Base: " .. baseTxt .. " · Zona: " .. (S.zone and "✔" or "✖") .. " · Recogidas: " .. S.collected
+
+	-- Cupos: cuánto lleva de cada tipo
+	local mech = S.mech
+	local sum = 0
+	for _, t in ipairs(TYPES) do
+		local cap = S.caps[t.key]
+		if cap then sum += cap end
+		local cnt = mech and mech.Parent and typeCount(mech, t.key) or 0
+		local l = ui.capLbl[t.key]
+		if l then
+			l.Text = t.es .. "  " .. cnt .. (cap and ("/" .. cap) or "")
+			l.TextColor3 = (cap and cnt >= cap) and COLOR.amber or COLOR.text
+		end
+	end
+	if ui.capSum then
+		local txt = "Suma de cupos: " .. sum .. " · Capacidad del mecha: " .. S.limit
+		if sum > S.limit then
+			txt = txt .. "\n(la capacidad total del mecha manda)"
+		end
+		ui.capSum.Text = txt
+	end
 end
 
 ---------------------------------------------------------------
--- AUTO-RECOLECCIÓN (nueva)
---   1. Elige la pieza válida más cercana del área/tipos elegidos
---   2. Se mueve hasta ella y la recoge hasta que sube la carga, desaparece o se agota el tiempo
---   3. Si CarryTotal llega al límite (o varias pilas seguidas no se pueden recoger), vuelve a la base
---   4. Espera a que se vacíe y repite
+-- AUTO-RECOLECCIÓN
 ---------------------------------------------------------------
 local function collectPile(mech, entry)
 	local inst = entry.inst
@@ -873,10 +1099,17 @@ local function collectPile(mech, entry)
 
 		if total > last then
 			progressed = true
+			S.session[entry.kind] = (S.session[entry.kind] or 0) + (total - last)
 			last = total
 			tProg = os.clock()
 		end
 		if total >= limit then
+			break
+		end
+		-- Cupo de este tipo completo: no sigue con esta pieza
+		local cap = S.caps[entry.kind]
+		if cap and typeCount(mech, entry.kind) >= cap then
+			progressed = true
 			break
 		end
 		if not pileAlive(inst) then
@@ -928,7 +1161,6 @@ local function unloadStep(mech)
 			lowest = total
 			lastChange = os.clock()
 		end
-		-- Ya bajó y lleva un rato estable: se da por descargado
 		if lowest < startTotal and os.clock() - lastChange > 2 then
 			break
 		end
@@ -961,19 +1193,24 @@ local function autoStep()
 	local total, limit = getCarry(mech)
 	S.total, S.limit = total, limit
 
-	-- Lleno, o varias pilas seguidas sin poder recoger con carga encima: a la base
 	if total >= limit or (S.fails >= CFG.FALLOS_LLENO and total > 0) then
 		unloadStep(mech)
 		return
 	end
 
-	local entry = nextPile(origin)
+	local entry, capBlocked = nextPile(mech, origin)
 	if entry then
 		collectPile(mech, entry)
 		return
 	end
 
-	-- Sin piezas cargadas en el área: ir a la zona guardada para que carguen
+	-- Solo quedan piezas de tipos con el cupo completo: a la base
+	if capBlocked and total > 0 then
+		setState("Cupos completos", COLOR.amber)
+		unloadStep(mech)
+		return
+	end
+
 	if S.zone and (S.zone - origin).Magnitude > 30 then
 		setState("Sin piezas · voy a la zona", COLOR.cyan)
 		moveTo(mech, S.zone + Vector3.new(0, CFG.ALTURA, 0))
@@ -981,7 +1218,6 @@ local function autoStep()
 		return
 	end
 
-	-- Ya no quedan piezas y llevas carga: descargar
 	if total > 0 then
 		unloadStep(mech)
 		return
@@ -1004,7 +1240,6 @@ local function setAuto(v)
 	refreshUI()
 end
 
--- Botón manual: activa las piezas que tengas cerca (según tipos activos)
 local function recogerCercanas()
 	if not fireproximityprompt and not firetouchinterest then
 		return -1
@@ -1032,7 +1267,6 @@ local function recogerCercanas()
 	return n
 end
 
--- Diagnóstico: qué hay en cada PartPiles y si tiene prompts
 local function scanPiles()
 	local arenas = getArenas()
 	if not arenas then
@@ -1067,7 +1301,6 @@ local function scanPiles()
 			end
 
 			if #list == 0 then
-				-- Muestra qué hijos hay, para ver cómo se llaman
 				local seen, names = {}, {}
 				for _, c in ipairs(pp:GetChildren()) do
 					local key = c.Name .. "(" .. c.ClassName .. ")"
@@ -1107,7 +1340,6 @@ screen.DisplayOrder = 999998
 screen.Parent = parent
 ui.screen = screen
 
--- Panel
 local panel = Instance.new("Frame")
 panel.Size = UDim2.fromOffset(CFG.PANEL_W, CFG.PANEL_H)
 panel.BackgroundColor3 = COLOR.bg
@@ -1120,7 +1352,6 @@ ui.panel = panel
 ui.panelScale = Instance.new("UIScale")
 ui.panelScale.Parent = panel
 
--- Cabecera (zona para arrastrar)
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 38)
 header.BackgroundTransparency = 1
@@ -1132,7 +1363,6 @@ local minBtn = btn(header, "–", UDim2.fromOffset(28, 28), UDim2.new(1, -64, 0,
 local closeBtn = btn(header, "✕", UDim2.fromOffset(28, 28), UDim2.new(1, -32, 0, 5), COLOR.btn, 12)
 closeBtn.TextColor3 = COLOR.red
 
--- Pestañas
 local tabRow = Instance.new("Frame")
 tabRow.Position = UDim2.fromOffset(8, 40)
 tabRow.Size = UDim2.new(1, -16, 0, 26)
@@ -1146,7 +1376,7 @@ do
 	l.Parent = tabRow
 end
 
-local tabNames = { "Auto", "Tipos", "Mecha" }
+local tabNames = { "Auto", "Tipos", "Cupos", "Mecha" }
 local tabButtons, pages = {}, {}
 
 local function newPage()
@@ -1171,6 +1401,7 @@ end
 
 local pageAuto = newPage()
 local pageTipos = newPage()
+local pageCupos = newPage()
 local pageMecha = newPage()
 
 local function showTab(i)
@@ -1184,7 +1415,7 @@ local function showTab(i)
 end
 
 for i, name in ipairs(tabNames) do
-	local b = btn(tabRow, name, UDim2.new(1 / #tabNames, -3, 1, 0), nil, COLOR.btn, 12)
+	local b = btn(tabRow, name, UDim2.new(1 / #tabNames, -3, 1, 0), nil, COLOR.btn, 11)
 	b.LayoutOrder = i
 	tabButtons[i] = b
 	b.Activated:Connect(function() showTab(i) end)
@@ -1193,7 +1424,6 @@ end
 ---------------------------------------------------------------
 -- PESTAÑA AUTO
 ---------------------------------------------------------------
--- Carga del mecha
 local carga = card(pageAuto, 1, 64)
 lbl(carga, "CARGA", UDim2.new(0.4, 0, 0, 12), UDim2.fromOffset(10, 6), 9, COLOR.sub, Enum.Font.GothamBold)
 ui.stateLbl = lbl(carga, "Parado", UDim2.new(0.6, -10, 0, 12), UDim2.new(0.4, 0, 0, 6), 9, COLOR.sub, Enum.Font.GothamBold)
@@ -1215,24 +1445,20 @@ ui.fill.BorderSizePixel = 0
 ui.fill.Parent = track
 corner(ui.fill, 3)
 
--- Botón principal
 ui.autoBtn = btn(pageAuto, "▶  AUTO RECOLECTAR", UDim2.new(1, 0, 0, 40), nil, COLOR.green, 13)
 ui.autoBtn.LayoutOrder = 2
 ui.autoBtn.TextColor3 = COLOR.white
 
--- Selector de área
 local areaCard = card(pageAuto, 3, 34)
 local prevArea = btn(areaCard, "◀", UDim2.fromOffset(34, 26), UDim2.fromOffset(4, 4), COLOR.btn, 13)
 local nextArea = btn(areaCard, "▶", UDim2.fromOffset(34, 26), UDim2.new(1, -38, 0, 4), COLOR.btn, 13)
 ui.areaLbl = lbl(areaCard, "", UDim2.new(1, -84, 1, 0), UDim2.fromOffset(42, 0), 11, COLOR.cyan, Enum.Font.GothamBold)
 ui.areaLbl.TextXAlignment = Enum.TextXAlignment.Center
 
--- Base y zona
 local rBases = row(pageAuto, 4, 34)
 ui.baseBtn = btn(rBases, "📍 Base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 ui.zoneBtn = btn(rBases, "📍 Zona", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
--- Acciones manuales
 local rActs = row(pageAuto, 5, 34)
 local pickBtn = btn(rActs, "🧲 Recoger", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 local clearBtn = btn(rActs, "↺ Limpiar", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
@@ -1254,6 +1480,7 @@ for i, t in ipairs(TYPES) do
 	typeToggles[t.key] = toggleRow(pageTipos, i, t.es .. "  (" .. t.key .. ")", S.types[t.key], function(v)
 		S.types[t.key] = v
 		S.pileDirty = true
+		save()
 	end)
 end
 
@@ -1265,6 +1492,62 @@ local typeNote = note(pageTipos, #TYPES + 2)
 typeNote.Text = "Solo se recogen los tipos marcados. Si una pila no se puede recoger (por ejemplo, pesa más de lo que te cabe), se ignora unos segundos y sigue con otra."
 
 ---------------------------------------------------------------
+-- PESTAÑA CUPOS (cantidad máxima por tipo, la escribes tú)
+---------------------------------------------------------------
+ui.capLbl = {}
+local capBoxes = {}
+
+local capNote = note(pageCupos, 1)
+capNote.Text = "Escribe cuántas piezas de cada tipo puede llevar el mecha. Vacío o 0 = sin límite. Ej.: capacidad 40 → Ligera 20 y Chatarra 20."
+
+for i, t in ipairs(TYPES) do
+	local f = Instance.new("Frame")
+	f.Size = UDim2.new(1, 0, 0, 30)
+	f.BackgroundColor3 = COLOR.card
+	f.BorderSizePixel = 0
+	f.LayoutOrder = i + 1
+	f.Parent = pageCupos
+	corner(f, 8)
+
+	ui.capLbl[t.key] = lbl(f, t.es, UDim2.new(1, -78, 1, 0), UDim2.fromOffset(10, 0), 11, COLOR.text)
+
+	local tb = Instance.new("TextBox")
+	tb.Size = UDim2.fromOffset(58, 22)
+	tb.Position = UDim2.new(1, -66, 0.5, -11)
+	tb.BackgroundColor3 = COLOR.btn
+	tb.BorderSizePixel = 0
+	tb.Text = S.caps[t.key] and tostring(S.caps[t.key]) or ""
+	tb.PlaceholderText = "∞"
+	tb.PlaceholderColor3 = COLOR.sub
+	tb.TextColor3 = COLOR.cyan
+	tb.TextSize = 13
+	tb.Font = Enum.Font.GothamBold
+	tb.ClearTextOnFocus = false
+	tb.Parent = f
+	corner(tb, 6)
+	capBoxes[t.key] = tb
+
+	tb.FocusLost:Connect(function()
+		local n = tonumber(tb.Text)
+		if n and n >= 1 then
+			n = math.floor(n)
+			S.caps[t.key] = n
+			tb.Text = tostring(n)
+		else
+			S.caps[t.key] = nil
+			tb.Text = ""
+		end
+		save()
+	end)
+end
+
+ui.capSum = note(pageCupos, #TYPES + 2)
+
+local clearCapsBtn = btn(pageCupos, "✖ Quitar todos los cupos", UDim2.new(1, 0, 0, 30), nil, COLOR.btn, 12)
+clearCapsBtn.LayoutOrder = #TYPES + 3
+clearCapsBtn.TextColor3 = COLOR.red
+
+---------------------------------------------------------------
 -- PESTAÑA MECHA
 ---------------------------------------------------------------
 local spd = card(pageMecha, 1, 46)
@@ -1274,8 +1557,8 @@ local plusBtn = btn(spd, "+", UDim2.fromOffset(40, 26), UDim2.new(1, -48, 0, 16)
 ui.speedVal = lbl(spd, "40", UDim2.new(1, -110, 0, 26), UDim2.fromOffset(55, 16), 16, COLOR.cyan, Enum.Font.GothamBlack)
 ui.speedVal.TextXAlignment = Enum.TextXAlignment.Center
 
-local applyBtn = btn(pageMecha, "⚡ Aplicar velocidad", UDim2.new(1, 0, 0, 32), nil, COLOR.btn, 12)
-applyBtn.LayoutOrder = 2
+ui.speedBtn = btn(pageMecha, "", UDim2.new(1, 0, 0, 32), nil, COLOR.btn, 11)
+ui.speedBtn.LayoutOrder = 2
 
 ui.limitBtn = btn(pageMecha, "", UDim2.new(1, 0, 0, 32), nil, COLOR.btn, 12)
 ui.limitBtn.LayoutOrder = 3
@@ -1283,14 +1566,25 @@ ui.limitBtn.LayoutOrder = 3
 ui.moveBtn = btn(pageMecha, "", UDim2.new(1, 0, 0, 32), nil, COLOR.btn, 12)
 ui.moveBtn.LayoutOrder = 4
 
-local rDiag = row(pageMecha, 5, 32)
+-- Selector de mecha
+local mechCard = card(pageMecha, 5, 34)
+local prevMech = btn(mechCard, "◀", UDim2.fromOffset(34, 26), UDim2.fromOffset(4, 4), COLOR.btn, 13)
+local nextMech = btn(mechCard, "▶", UDim2.fromOffset(34, 26), UDim2.new(1, -38, 0, 4), COLOR.btn, 13)
+ui.mechLbl = lbl(mechCard, "Automático", UDim2.new(1, -84, 1, 0), UDim2.fromOffset(42, 0), 10, COLOR.cyan, Enum.Font.GothamBold)
+ui.mechLbl.TextXAlignment = Enum.TextXAlignment.Center
+
+local rMech = row(pageMecha, 6, 32)
+local autoMechBtn = btn(rMech, "🤖 Automático", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+local listMechBtn = btn(rMech, "🔄 Ver mechas", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+
+local rDiag = row(pageMecha, 7, 32)
 local statsBtn = btn(rDiag, "📊 Stats", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 local scanBtn = btn(rDiag, "🔎 Escanear", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
-ui.mechNote = note(pageMecha, 6)
-ui.scanNote = note(pageMecha, 7)
+ui.mechNote = note(pageMecha, 8)
+ui.scanNote = note(pageMecha, 9)
 
--- Burbuja (aparece al minimizar)
+-- Burbuja
 ui.bubble = Instance.new("TextButton")
 ui.bubble.Name = "Bubble"
 ui.bubble.Size = UDim2.fromOffset(CFG.BUBBLE, CFG.BUBBLE)
@@ -1342,6 +1636,34 @@ local function setMinimized(v)
 end
 
 ---------------------------------------------------------------
+-- VELOCIDAD: encender / apagar
+---------------------------------------------------------------
+local function setSpeedOn(v)
+	if v then
+		local mech = getMech()
+		if not mech then
+			setStatus("❌ No se encontró el mecha", COLOR.red)
+			return
+		end
+		S.speedOn = true
+		S.speedMech = mech
+		applySpeed(mech)
+		setStatus("✅ Velocidad " .. S.speed .. " activada", COLOR.green)
+	else
+		S.speedOn = false
+		local mech = S.speedMech or getMech()
+		if restoreSpeed(mech) then
+			setStatus("↩ Velocidad original restaurada", COLOR.amber)
+		else
+			setStatus("Velocidad apagada", COLOR.sub)
+		end
+		S.speedMech = nil
+	end
+	save()
+	refreshUI()
+end
+
+---------------------------------------------------------------
 -- EVENTOS
 ---------------------------------------------------------------
 ui.autoBtn.Activated:Connect(function()
@@ -1363,6 +1685,7 @@ local function cycleArea(step)
 	S.areaName = opts[idx].name
 	S.pileDirty = true
 	S.fails = 0
+	save()
 	refreshUI()
 end
 
@@ -1375,13 +1698,13 @@ ui.baseBtn.Activated:Connect(function()
 		setStatus("❌ Sin personaje", COLOR.red)
 		return
 	end
-	-- Si pilotas, la base se guarda donde está el mecha
 	local mech = getMech()
 	if mech and pilotActive(mech) then
 		S.base = mech:GetPivot().Position
 	else
 		S.base = root.Position
 	end
+	save()
 	setStatus("✅ Base guardada aquí", COLOR.green)
 	refreshUI()
 end)
@@ -1398,12 +1721,14 @@ ui.zoneBtn.Activated:Connect(function()
 	else
 		S.zone = root.Position
 	end
+	save()
 	setStatus("✅ Zona guardada aquí", COLOR.green)
 	refreshUI()
 end)
 
 clearBtn.Activated:Connect(function()
 	S.base, S.zone = nil, nil
+	save()
 	setStatus("↺ Base y zona borradas", COLOR.amber)
 	refreshUI()
 end)
@@ -1427,6 +1752,7 @@ allBtn.Activated:Connect(function()
 		typeToggles[t.key].set(true)
 	end
 	S.pileDirty = true
+	save()
 end)
 
 noneBtn.Activated:Connect(function()
@@ -1435,40 +1761,95 @@ noneBtn.Activated:Connect(function()
 		typeToggles[t.key].set(false)
 	end
 	S.pileDirty = true
+	save()
+end)
+
+clearCapsBtn.Activated:Connect(function()
+	for _, t in ipairs(TYPES) do
+		S.caps[t.key] = nil
+		capBoxes[t.key].Text = ""
+	end
+	save()
+	setStatus("✖ Cupos quitados", COLOR.amber)
 end)
 
 minusBtn.Activated:Connect(function()
 	S.speed = math.max(CFG.SPEED_MIN, S.speed - CFG.SPEED_STEP)
+	save()
 	refreshUI()
 end)
 
 plusBtn.Activated:Connect(function()
 	S.speed = math.min(CFG.SPEED_MAX, S.speed + CFG.SPEED_STEP)
+	save()
 	refreshUI()
 end)
 
-applyBtn.Activated:Connect(function()
-	if applySpeed() then
-		setStatus("✅ Velocidad " .. S.speed .. " aplicada", COLOR.green)
-	else
-		setStatus("❌ No se encontró tu mecha", COLOR.red)
-	end
+ui.speedBtn.Activated:Connect(function()
+	setSpeedOn(not S.speedOn)
 end)
 
 ui.limitBtn.Activated:Connect(function()
 	S.limitMode = (S.limitMode == "MAX") and "CAP" or "MAX"
+	save()
 	refreshUI()
 end)
 
 ui.moveBtn.Activated:Connect(function()
 	S.moveMode = (S.moveMode == "GLIDE") and "TP" or "GLIDE"
+	save()
 	refreshUI()
+end)
+
+-- Selector de mecha: Automático + todos los que se vean
+local function cycleMech(step)
+	local list = listMechs()
+	local idx = 0 -- 0 = automático
+	for i, m in ipairs(list) do
+		if m == S.mechPick or (S.mechPickName and m.Name == S.mechPickName) then
+			idx = i
+			break
+		end
+	end
+	idx += step
+	if idx < 0 then idx = #list end
+	if idx > #list then idx = 0 end
+	if idx == 0 then
+		setMechPick(nil)
+		setStatus("🤖 Mecha: automático", COLOR.cyan)
+	else
+		setMechPick(list[idx])
+		setStatus("🤖 Mecha: " .. list[idx].Name, COLOR.cyan)
+	end
+	refreshMechInfo()
+	refreshUI()
+end
+
+prevMech.Activated:Connect(function() cycleMech(-1) end)
+nextMech.Activated:Connect(function() cycleMech(1) end)
+
+autoMechBtn.Activated:Connect(function()
+	setMechPick(nil)
+	setStatus("🤖 Mecha: automático", COLOR.cyan)
+	refreshMechInfo()
+	refreshUI()
+end)
+
+listMechBtn.Activated:Connect(function()
+	local list = listMechs()
+	local lines = { "Mechas encontrados: " .. #list }
+	for i, m in ipairs(list) do
+		table.insert(lines, i .. ". " .. m.Name .. (ownedBy(m) and " (tuyo)" or ""))
+	end
+	ui.scanNote.Text = table.concat(lines, "\n")
+	print("--- MECHAS ---")
+	for _, l in ipairs(lines) do print(l) end
 end)
 
 statsBtn.Activated:Connect(function()
 	local mech = getMech()
 	if not mech then
-		setStatus("❌ No se encontró tu mecha", COLOR.red)
+		setStatus("❌ No se encontró el mecha", COLOR.red)
 		return
 	end
 	local total, limit = getCarry(mech)
@@ -1497,6 +1878,10 @@ end)
 closeBtn.Activated:Connect(function()
 	S.closed = true
 	S.on = false
+	-- Al cerrar el panel, el mecha vuelve a su velocidad original
+	if S.speedOn then
+		restoreSpeed(S.speedMech or S.mech)
+	end
 	screen:Destroy()
 end)
 
@@ -1517,7 +1902,6 @@ makeDrag(ui.bubble, ui.bubble,
 ---------------------------------------------------------------
 -- BUCLES
 ---------------------------------------------------------------
--- Ciclo de recolección (solo corre cuando está encendido)
 task.spawn(function()
 	while not S.closed do
 		if S.on then
@@ -1533,17 +1917,30 @@ task.spawn(function()
 	end
 end)
 
--- Refresco de la interfaz
+-- Mantiene la velocidad aplicada (se queda aunque el juego la resetee)
+task.spawn(function()
+	while not S.closed do
+		if S.speedOn then
+			local mech = getMech()
+			if mech then
+				if S.speedMech and S.speedMech ~= mech then
+					restoreSpeed(S.speedMech)
+				end
+				S.speedMech = mech
+				pcall(applySpeed, mech)
+			end
+		end
+		task.wait(CFG.SPEED_REAPPLY)
+	end
+end)
+
 task.spawn(function()
 	local tick = 0
 	while not S.closed do
-		-- Con el auto apagado también se actualiza la carga mostrada
-		if not S.on then
-			local mech = getMech()
-			if mech then
-				local total, limit = getCarry(mech)
-				S.total, S.limit = total, limit
-			end
+		local mech = getMech()
+		if mech and not S.on then
+			local total, limit = getCarry(mech)
+			S.total, S.limit = total, limit
 		end
 		refreshUI()
 		tick += 1
