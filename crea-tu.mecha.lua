@@ -1,5 +1,5 @@
--- MECHA PANEL v4 · LocalScript móvil
--- Colócalo en StarterPlayer > StarterPlayerScripts (o ejecútalo con tu ejecutor)
+-- MECHA PANEL v5 · LocalScript móvil
+-- Compatible con ejecutores que no tienen gethui ni fireproximityprompt
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -8,13 +8,13 @@ local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[MECHA] Iniciando panel...")
+print("[MECHA] paso 1: servicios cargados")
 
 ---------------------------------------------------------------
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local CFG = {
-	GUI_NAME = "MechaPanelV4",
+	GUI_NAME = "MechaPanelV5",
 	PANEL_W = 250,
 	PANEL_H = 440,
 	BUBBLE = 48,
@@ -88,13 +88,19 @@ local S = {
 	chatarra = 0,
 	max = 0,
 	base = nil,
-	estado = "Parado",
 	placed = false,
-	minimized = false,
 }
 
-local cooldown = setmetatable({}, { __mode = "k" })
+local cooldown = {}
 local ui = { piles = {} }
+
+---------------------------------------------------------------
+-- COMPROBACIÓN DE FUNCIONES DEL EJECUTOR
+---------------------------------------------------------------
+local hasFirePrompt = type(fireproximityprompt) == "function"
+local hasWriteClip = false
+
+print("[MECHA] paso 2: fireproximityprompt disponible = " .. tostring(hasFirePrompt))
 
 ---------------------------------------------------------------
 -- HELPERS
@@ -142,14 +148,6 @@ local function num(v, d)
 	return tonumber(v) or d
 end
 
-local function getGuiParent()
-	local ok, h = pcall(function() return gethui and gethui() end)
-	if ok and h then
-		return h
-	end
-	return PlayerGui
-end
-
 ---------------------------------------------------------------
 -- MECHA
 ---------------------------------------------------------------
@@ -187,15 +185,15 @@ local function getMech()
 end
 
 local function leerCarga(m)
+	local cap = num(m:GetAttribute("CarryCapacity"), 16)
 	return
 		num(m:GetAttribute("CarryTotal"), 0),
-		num(m:GetAttribute("CarryCapacity"), 16),
+		cap,
 		num(m:GetAttribute("Carry_Light"), 0),
 		num(m:GetAttribute("Carry_Scrap"), 0),
-		num(m:GetAttribute("CarryMax"), num(m:GetAttribute("CarryCapacity"), 16))
+		num(m:GetAttribute("CarryMax"), cap)
 end
 
--- Parte que se mueve: el asiento del mecha si estás pilotando, si no tu personaje
 local function parteMovil()
 	local char = LocalPlayer.Character
 	if not char then return nil end
@@ -245,7 +243,7 @@ local function glideTo(target, tolerancia)
 end
 
 ---------------------------------------------------------------
--- PILAS (solo dentro de World.Arenas.<nivel>.PartPiles)
+-- PILAS
 ---------------------------------------------------------------
 local function listarPilas()
 	local lista = {}
@@ -287,17 +285,17 @@ local function listarPilas()
 end
 
 local function activarPrompt(prompt)
+	if not hasFirePrompt then
+		return false
+	end
 	pcall(function()
 		prompt.RequiresLineOfSight = false
 		if prompt.MaxActivationDistance < CFG.RANGO_PROMPT then
 			prompt.MaxActivationDistance = CFG.RANGO_PROMPT
 		end
 	end)
-	if fireproximityprompt then
-		pcall(fireproximityprompt, prompt)
-		return true
-	end
-	return false
+	pcall(fireproximityprompt, prompt)
+	return true
 end
 
 local function recolectar(p, mech)
@@ -308,7 +306,7 @@ local function recolectar(p, mech)
 		return false, "parado"
 	end
 	if not activarPrompt(p.prompt) then
-		return false, "sin fireproximityprompt"
+		return false, "tu ejecutor no tiene fireproximityprompt"
 	end
 
 	local antes = leerCarga(mech)
@@ -329,10 +327,9 @@ local function recolectar(p, mech)
 end
 
 ---------------------------------------------------------------
--- TEXTOS Y ESTADO EN PANTALLA
+-- TEXTOS
 ---------------------------------------------------------------
 local function setEstado(texto, color)
-	S.estado = texto
 	if ui.estado then
 		ui.estado.Text = texto
 		ui.estado.TextColor3 = color or COLOR.sub
@@ -574,10 +571,9 @@ local function makeDrag(handle, target, onTap, onEnd)
 	end)
 end
 
--- Construye toda la interfaz. Devuelve la ScreenGui.
 local function build()
-	local parent = getGuiParent()
-	local old = parent:FindFirstChild(CFG.GUI_NAME) or PlayerGui:FindFirstChild(CFG.GUI_NAME)
+	-- Sin gethui: se usa PlayerGui, que siempre se ve
+	local old = PlayerGui:FindFirstChild(CFG.GUI_NAME)
 	if old then old:Destroy() end
 
 	local screen = Instance.new("ScreenGui")
@@ -585,8 +581,9 @@ local function build()
 	screen.ResetOnSpawn = false
 	screen.IgnoreGuiInset = true
 	screen.DisplayOrder = 999998
-	screen.Parent = parent
+	screen.Parent = PlayerGui
 	ui.screen = screen
+	print("[MECHA] paso 3: ScreenGui creada")
 
 	local panel = Instance.new("Frame")
 	panel.Name = "Panel"
@@ -594,7 +591,6 @@ local function build()
 	panel.BackgroundColor3 = COLOR.bg
 	panel.BorderSizePixel = 0
 	panel.ClipsDescendants = true
-	panel.Visible = true
 	panel.Parent = screen
 	corner(panel, 12)
 	stroke(panel, COLOR.accent, 0.5, 1)
@@ -690,7 +686,7 @@ local function build()
 		refreshUI()
 	end)
 
-	-- Tipos de pila
+	-- Pilas
 	local pilasTitulo = lbl(body, "PILAS A RECOGER", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.GothamBold)
 	pilasTitulo.LayoutOrder = 5
 
@@ -809,9 +805,7 @@ local function build()
 	stroke(bubble, COLOR.white, 0.4, 1.5)
 	ui.bubble = bubble
 
-	-- Minimizar / cerrar / arrastrar
 	local function setMinimized(v)
-		S.minimized = v
 		if v then
 			local x, y = clampPos(panel.Position.X.Offset, panel.Position.Y.Offset, CFG.BUBBLE, CFG.BUBBLE)
 			bubble.Position = UDim2.fromOffset(x, y)
@@ -852,7 +846,6 @@ local function build()
 	return screen
 end
 
--- Posiciona el panel en pantalla (se llama al inicio y al girar el teléfono)
 local function layout()
 	if not ui.panelScale then return end
 	ui.panelScale.Scale = fitScale()
@@ -879,7 +872,7 @@ if not okBuild then
 	warn("[MECHA] Error al crear el panel: " .. tostring(errBuild))
 	return
 end
-print("[MECHA] Panel creado")
+print("[MECHA] paso 4: panel creado")
 
 layout()
 setEstado("Parado", COLOR.sub)
@@ -890,7 +883,6 @@ if cam then
 	cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
 end
 
--- Ciclo de recolección (solo corre cuando está encendido)
 task.spawn(function()
 	while not S.closed do
 		if S.on then
@@ -906,7 +898,6 @@ task.spawn(function()
 	end
 end)
 
--- Refresco de la interfaz
 task.spawn(function()
 	while not S.closed do
 		getMech()
@@ -914,3 +905,5 @@ task.spawn(function()
 		task.wait(0.25)
 	end
 end)
+
+print("[MECHA] paso 5: listo")
