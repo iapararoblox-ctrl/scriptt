@@ -1,5 +1,5 @@
--- MECHA PANEL v6 · Delta (móvil)
--- LocalScript en StarterPlayer > StarterPlayerScripts, o ejecutado con Delta
+-- MECHA PANEL v7 · Delta (móvil)
+-- Sin fireproximityprompt: usa InputHoldBegin/InputHoldEnd de ProximityPrompt
 
 local function main()
 	local Players = game:GetService("Players")
@@ -9,13 +9,10 @@ local function main()
 	local LocalPlayer = Players.LocalPlayer
 	local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-	-- Función de recogida del ejecutor (nil si tu Delta no la tiene)
-	local firePrompt = fireproximityprompt
-
 	---------------------------------------------------------------
 	-- CONFIGURACIÓN
 	---------------------------------------------------------------
-	local GUI_NAME = "MechaPanelV6"
+	local GUI_NAME = "MechaPanelV7"
 	local PANEL_W, PANEL_H = 250, 440
 	local BUBBLE = 48
 
@@ -35,10 +32,10 @@ local function main()
 	local PILE_LABELS = { "Chunk", "Ligera", "Chatarra", "Pesada", "Media", "Colosal", "Titán", "G.Chat" }
 
 	local VEL_MIN, VEL_MAX, VEL_STEP, VEL_DEFAULT = 20, 250, 10, 90
-	local ALTURA = 3          -- studs sobre la pila o la base
-	local LLEGADA = 5         -- distancia para considerar que llegaste
+	local ALTURA = 3
+	local LLEGADA = 5
 	local RANGO_PROMPT = 20
-	local ESPERA_CARGA = 1.5  -- segundos esperando que suba CarryTotal
+	local ESPERA_CARGA = 2
 	local ESPERA_DESCARGA = 25
 	local COOLDOWN_OK = 2
 	local COOLDOWN_FALLO = 6
@@ -237,7 +234,6 @@ local function main()
 	---------------------------------------------------------------
 	-- PILAS (solo World.Arenas.<nivel>.PartPiles)
 	---------------------------------------------------------------
-	-- Devuelve la lista de pilas (la más cercana primero) y si existe World.Arenas
 	local function listarPilas()
 		local lista = {}
 		local arenas = ruta(Workspace, ARENAS)
@@ -279,22 +275,33 @@ local function main()
 		return lista, true
 	end
 
-	-- Activa el ProximityPrompt. Devuelve false si tu ejecutor no tiene la función
-	local function activarPrompt(prompt)
-		if not firePrompt then
-			return false
-		end
+	-- Mantiene pulsado el ProximityPrompt (método de Roblox, no del ejecutor).
+	-- Devuelve false si el método no está disponible.
+	local function mantenerPrompt(prompt)
 		pcall(function()
 			prompt.RequiresLineOfSight = false
 			if prompt.MaxActivationDistance < RANGO_PROMPT then
 				prompt.MaxActivationDistance = RANGO_PROMPT
 			end
 		end)
-		pcall(firePrompt, prompt)
+
+		local okBegin = pcall(function()
+			prompt:InputHoldBegin()
+		end)
+		if not okBegin then
+			return false
+		end
+
+		local espera = math.max(num(prompt.HoldDuration, 0), 0) + 0.2
+		task.wait(espera)
+
+		pcall(function()
+			prompt:InputHoldEnd()
+		end)
 		return true
 	end
 
-	-- Va a la pila, la activa y espera a que suba la carga. Devuelve ok, motivo
+	-- Va a la pila, activa el prompt y espera a que suba la carga. Devuelve ok, motivo
 	local function recolectar(p, mech)
 		if not glideTo(p.pos + Vector3.new(0, ALTURA, 0), LLEGADA) then
 			return false, "no llegué"
@@ -302,8 +309,8 @@ local function main()
 		if not S.on then
 			return false, "parado"
 		end
-		if not activarPrompt(p.prompt) then
-			return false, "tu Delta no tiene fireproximityprompt"
+		if not mantenerPrompt(p.prompt) then
+			return false, "no pude activar el prompt; tócalo tú"
 		end
 
 		local antes = leerCarga(mech)
@@ -378,10 +385,9 @@ local function main()
 			ui.mech.Text = "Sin mecha detectado"
 		end
 
-		local tieneBase = (S.base ~= nil) or (getBase() ~= nil)
 		if S.base then
 			ui.base.Text = "Base: guardada aquí"
-		elseif tieneBase then
+		elseif getBase() then
 			ui.base.Text = "Base: marcador del mapa"
 		else
 			ui.base.Text = "Base: ✖ sin base"
@@ -601,7 +607,7 @@ local function main()
 	ui.panelScale = Instance.new("UIScale")
 	ui.panelScale.Parent = panel
 
-	-- Cabecera (zona para arrastrar)
+	-- Cabecera
 	local header = Instance.new("Frame")
 	header.Size = UDim2.new(1, 0, 0, 38)
 	header.BackgroundTransparency = 1
@@ -879,7 +885,6 @@ local function main()
 	---------------------------------------------------------------
 	-- BUCLES
 	---------------------------------------------------------------
-	-- Ciclo de recolección (solo cuando está encendido)
 	task.spawn(function()
 		while not S.closed do
 			if S.on then
@@ -895,7 +900,6 @@ local function main()
 		end
 	end)
 
-	-- Refresco de la interfaz
 	task.spawn(function()
 		while not S.closed do
 			getMech()
