@@ -1,4 +1,6 @@
--- MECHA PANEL v10 · Detección robusta del mecha + atributos visibles
+-- MECHA PANEL v10.1 · Detección robusta del mecha + atributos visibles
+-- Cambio v10.1: el contador de la pila acepta varios nombres (count, Count, Amount...)
+--               y una pila SIN contador ya no se descarta como vacía.
 -- LocalScript móvil. Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
 -- Plot: atributo "Plot" de tu jugador -> Workspace.World.Plots.Plot<n>
 -- Todo lo que cambies se guarda en MechaPanel_v3.json (writefile)
@@ -94,6 +96,8 @@ local LIMIT_LABEL = {
 
 local HEALTH_NAMES = { "Health" }
 local MAXHEALTH_NAMES = { "MaxHealth", "MaxHP", "HealthMax", "MaxHp" }
+-- Nombres posibles del contador de piezas de una pila
+local COUNT_NAMES = { "count", "Count", "Amount", "amount", "Quantity", "quantity" }
 -- Atributos que identifican al modelo que lleva la carga y la vida del mecha
 local MECH_ATTRS = { "CarryCapacity", "CarryMax", "CarryTotal", "MechId", "Health" }
 
@@ -1116,19 +1120,23 @@ local function pilePos(inst)
 	return nil
 end
 
+-- Contador de la pila. Prueba varios nombres (COUNT_NAMES) en la pila y en su padre.
+-- Devuelve nil si la pila no expone ningún contador.
 local function pileCount(inst)
 	local cur, depth = inst, 0
 	while cur and depth < 2 do
-		local v = cur:GetAttribute("count")
-		if v == nil then
-			local c = cur:FindFirstChild("count")
-			if c and c:IsA("ValueBase") then
-				v = c.Value
+		for _, nm in ipairs(COUNT_NAMES) do
+			local v = cur:GetAttribute(nm)
+			if v == nil then
+				local c = cur:FindFirstChild(nm)
+				if c and c:IsA("ValueBase") then
+					v = c.Value
+				end
 			end
-		end
-		local n = tonumber(v)
-		if n then
-			return math.max(0, math.floor(n))
+			local n = tonumber(v)
+			if n then
+				return math.max(0, math.floor(n))
+			end
 		end
 		cur = cur.Parent
 		depth += 1
@@ -1161,8 +1169,10 @@ local function pileUsable(inst)
 	if not pileAlive(inst) then
 		return false
 	end
+	-- Solo se descarta si la pila SÍ tiene contador y está en 0.
+	-- Una pila sin contador se considera recogible.
 	local c = pileCount(inst)
-	if c == nil or c <= 0 then
+	if c ~= nil and c <= 0 then
 		return false
 	end
 	for _, p in ipairs(promptsOf(inst)) do
@@ -1955,7 +1965,7 @@ local allBtn = btn(rAll, "✔ Todos", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 
 local noneBtn = btn(rAll, "✖ Ninguno", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
 local typeNote = note(pageTipos, #TYPES + 2)
-typeNote.Text = "Solo se recogen los tipos marcados. Las pilas sin cantidad (count 0 o sin count) se ignoran y se busca otra."
+typeNote.Text = "Solo se recogen los tipos marcados. Las pilas con count 0 se ignoran; las pilas sin count se intentan igual."
 
 ---------------------------------------------------------------
 -- PESTAÑA CUPOS
