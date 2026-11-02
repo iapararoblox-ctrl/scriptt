@@ -1,5 +1,6 @@
--- MECHA PANEL v6 · Auto-recolección rápida, capacidad del mecha elegido + conteo por pieza (count)
+-- MECHA PANEL v7 · Plot automático + auto-recolección rápida
 -- LocalScript móvil. Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
+-- Plot: atributo "Plot" de tu jugador -> Workspace.World.Plots.Plot<n>
 -- Todo lo que cambies se guarda en MechaPanel_v3.json (writefile)
 
 local Players = game:GetService("Players")
@@ -97,7 +98,7 @@ local S = {
 	state = "Parado",
 	total = 0,
 	limit = CFG.CAP_DEFECTO,
-	base = nil,
+	base = nil,           -- respaldo manual (solo si no encuentras tu Plot)
 	zone = nil,
 	placed = false,
 	minimized = false,
@@ -416,6 +417,50 @@ local function makeDrag(handle, target, onTap, onEnd)
 end
 
 ---------------------------------------------------------------
+-- PLOT (Workspace.World.Plots.Plot<n>, n = atributo "Plot" de tu jugador)
+---------------------------------------------------------------
+local function plotNumber()
+	local v = LocalPlayer:GetAttribute("Plot")
+	if v == nil then
+		local c = LocalPlayer:FindFirstChild("Plot")
+		if c and c:IsA("ValueBase") then
+			v = c.Value
+		end
+	end
+	if v == nil then return nil end
+	return tostring(v)
+end
+
+local function getPlot()
+	local n = plotNumber()
+	if not n then
+		return nil, "No tienes el atributo Plot"
+	end
+	local world = Workspace:FindFirstChild("World")
+	local folder = world and world:FindFirstChild("Plots")
+	if not folder then
+		return nil, "No encuentro World.Plots"
+	end
+	for _, c in ipairs(folder:GetChildren()) do
+		if c.Name == "Plot" .. n or c.Name == n then
+			return c
+		end
+	end
+	return nil, "No encuentro Plot" .. n
+end
+
+local function plotPos(obj)
+	if obj:IsA("Model") then
+		return obj:GetPivot().Position
+	end
+	if obj:IsA("BasePart") then
+		return obj.Position
+	end
+	local bp = obj:FindFirstChildWhichIsA("BasePart", true)
+	return bp and bp.Position
+end
+
+---------------------------------------------------------------
 -- MECHA (solo los tuyos)
 ---------------------------------------------------------------
 local function hrpNow()
@@ -465,7 +510,6 @@ local function scoreMech(m)
 	return s
 end
 
--- Mecha tuyo automático
 local function findMech()
 	local best, bestScore
 	local function consider(m)
@@ -492,7 +536,6 @@ local function findMech()
 	return best
 end
 
--- Lista SOLO de tus mechas
 local function listMechs()
 	local out, seen = {}, {}
 	local function consider(m)
@@ -513,7 +556,6 @@ local function listMechs()
 	return out
 end
 
--- Busca tu mecha elegido por nombre (si se vuelve a crear). Nunca un mecha ajeno.
 local function findByName(name)
 	for _, o in ipairs(Workspace:GetChildren()) do
 		if o:IsA("Model") and o.Name == name and scoreMech(o) > 0 and ownedBy(o) then
@@ -534,7 +576,6 @@ end
 ---------------------------------------------------------------
 -- CAPACIDAD DEL MECHA ELEGIDO
 ---------------------------------------------------------------
--- Copia CarryMax (o CarryCapacity en modo CarryCapacity) a tu capacidad manual
 local function syncCapFromMech(mech)
 	if not mech then return false end
 	local cap = tonumber(mech:GetAttribute("CarryCapacity"))
@@ -554,7 +595,6 @@ end
 local watchedMech = nil
 local watchConns = {}
 
--- Vigila CarryCapacity y CarryMax del mecha elegido para actualizar la capacidad si cambian
 local function watchMech(mech, doSync)
 	for _, c in ipairs(watchConns) do
 		c:Disconnect()
@@ -607,7 +647,6 @@ local function getMech()
 	return m
 end
 
--- Al elegir un mecha (o Automático) se toma su capacidad
 local function setMechPick(m)
 	S.mechPick = m
 	S.mechPickName = m and m.Name or nil
@@ -621,7 +660,6 @@ local function setMechPick(m)
 	save()
 end
 
--- Devuelve: total actual, límite activo
 local function getCarry(mech)
 	if S.limitMode == "MANUAL" then
 		return S.carried, math.max(1, S.manualCap)
@@ -672,14 +710,19 @@ local function pilotActive(mech)
 	return mech:GetAttribute("PilotMode") == "Seat"
 end
 
+-- Destino de descarga: tu Plot. Si no se encuentra, la base manual. Si tampoco, el marcador del mapa.
 local function getBasePos()
+	local plot = getPlot()
+	if plot then
+		local p = plotPos(plot)
+		if p then return p end
+	end
 	if S.base then
 		return S.base
 	end
 	local m = Workspace:FindFirstChild("YourBaseMarker")
 	if m then
-		if m:IsA("BasePart") then return m.Position end
-		if m:IsA("Model") then return m:GetPivot().Position end
+		return plotPos(m)
 	end
 	return nil
 end
@@ -732,10 +775,10 @@ local function restoreSpeed(mech)
 end
 
 ---------------------------------------------------------------
--- MOVIMIENTO
+-- MOVIMIENTO (mech puede ser nil: entonces se mueve tu personaje)
 ---------------------------------------------------------------
 local function currentPos(mech)
-	if pilotActive(mech) then
+	if mech and pilotActive(mech) then
 		return mech:GetPivot().Position
 	end
 	local r = hrpNow()
@@ -743,7 +786,7 @@ local function currentPos(mech)
 end
 
 local function placeAt(mech, pos)
-	if pilotActive(mech) then
+	if mech and pilotActive(mech) then
 		local cf = mech:GetPivot()
 		mech:PivotTo(CFrame.new(pos) * (cf - cf.Position))
 		local pp = mech.PrimaryPart or mech:FindFirstChildWhichIsA("BasePart", true)
@@ -760,7 +803,14 @@ local function placeAt(mech, pos)
 	end
 end
 
-local function moveTo(mech, target)
+-- force = true: se mueve aunque el auto esté apagado (para el botón 🏠)
+local function moveTo(mech, target, force)
+	local function running()
+		if S.closed then return false end
+		if mech and not mech.Parent then return false end
+		return force == true or S.on
+	end
+
 	if S.moveMode == "TP" then
 		placeAt(mech, target)
 		task.wait(0.1)
@@ -772,7 +822,7 @@ local function moveTo(mech, target)
 	local timeout = math.clamp((target - first).Magnitude / CFG.VUELO_VEL * 1.5 + 4, 8, CFG.MAX_VUELO)
 	local t0 = os.clock()
 
-	while S.on and not S.closed and mech.Parent do
+	while running() do
 		local cur = currentPos(mech)
 		if not cur then return false end
 		local delta = target - cur
@@ -788,6 +838,34 @@ local function moveTo(mech, target)
 		placeAt(mech, cur + delta.Unit * math.min(dist, CFG.VUELO_VEL * dt))
 	end
 	return false
+end
+
+-- Lleva tu mecha (o tu personaje) a tu Plot con el botón 🏠
+local function goToPlot()
+	if S.on then
+		setStatus("Detén el auto antes de ir al Plot", COLOR.amber)
+		return
+	end
+	local plot, err = getPlot()
+	if not plot then
+		setStatus("❌ " .. tostring(err), COLOR.red)
+		return
+	end
+	local pos = plotPos(plot)
+	if not pos then
+		setStatus("❌ El Plot no tiene posición", COLOR.red)
+		return
+	end
+	local mech = getMech()
+	setStatus("🏠 Yendo a " .. plot.Name .. "...", COLOR.cyan)
+	task.spawn(function()
+		local ok = moveTo(mech, pos + Vector3.new(0, CFG.ALTURA, 0), true)
+		if ok then
+			setStatus("🏠 Estás en " .. plot.Name, COLOR.green)
+		else
+			setStatus("⚠ No pude llegar al Plot", COLOR.amber)
+		end
+	end)
 end
 
 ---------------------------------------------------------------
@@ -945,7 +1023,6 @@ local function pilePos(inst)
 	return nil
 end
 
--- Lee el atributo "count" de la pila (piezas que quedan). Si no existe, cuenta 1.
 local function readCount(inst)
 	local cur, depth = inst, 0
 	while cur and depth < 2 do
@@ -1016,7 +1093,6 @@ local function triggerPile(inst)
 	return false
 end
 
--- Pila válida más cercana. Salta los tipos cuyo cupo ya está completo.
 local function nextPile(mech, origin)
 	local now = os.clock()
 	local best, bestDist
@@ -1081,11 +1157,13 @@ local function setState(text, color)
 end
 
 local msgToken = 0
-local function setStatus(text, color)
+function setStatus(text, color)
 	msgToken += 1
 	local my = msgToken
-	ui.msgLbl.Text = text
-	ui.msgLbl.TextColor3 = color or COLOR.sub
+	if ui.msgLbl then
+		ui.msgLbl.Text = text
+		ui.msgLbl.TextColor3 = color or COLOR.sub
+	end
 	task.delay(3, function()
 		if my == msgToken and ui.msgLbl and ui.msgLbl.Parent then
 			ui.msgLbl.Text = ""
@@ -1168,8 +1246,11 @@ local function refreshUI()
 	ui.moveBtn.Text = S.moveMode == "GLIDE" and "Mover: Deslizar" or "Mover: Teletransporte"
 	ui.mechLbl.Text = S.mechPickName or "Automático"
 
-	local baseTxt = S.base and "guardada" or (getBasePos() and "marcador" or "✖")
-	ui.infoLbl.Text = "Base: " .. baseTxt .. " · Zona: " .. (S.zone and "✔" or "✖") .. " · Recogidas: " .. S.collected
+	local plot, errPlot = getPlot()
+	local plotTxt = plot and (plot.Name .. " ✔") or "✖ (" .. tostring(errPlot) .. ")"
+	local manualTxt = S.base and "guardada" or "✖"
+	ui.infoLbl.Text = "Plot: " .. plotTxt .. " · Base manual: " .. manualTxt
+		.. " · Zona: " .. (S.zone and "✔" or "✖") .. " · Recogidas: " .. S.collected
 
 	local mech = S.mech
 	local sum = 0
@@ -1189,16 +1270,6 @@ local function refreshUI()
 			txt = txt .. "\n(la capacidad total manda)"
 		end
 		ui.capSum.Text = txt
-	end
-end
-
----------------------------------------------------------------
--- EVASIÓN Y ESPERAS SEGURAS (sin cambios)
----------------------------------------------------------------
-local function esperarSeguro(seg)
-	local t0 = os.clock()
-	while os.clock() - t0 < seg and not S.closed and S.on do
-		RunService.Heartbeat:Wait()
 	end
 end
 
@@ -1271,12 +1342,12 @@ end
 local function unloadStep(mech)
 	local base = getBasePos()
 	if not base then
-		setState("Lleno · guarda tu base", COLOR.red)
+		setState("Lleno · sin Plot ni base", COLOR.red)
 		task.wait(2)
 		return
 	end
 
-	setState("Lleno · vuelvo a base", COLOR.amber)
+	setState("Lleno · vuelvo al Plot", COLOR.amber)
 	if not moveTo(mech, base + Vector3.new(0, CFG.ALTURA, 0)) then
 		return
 	end
@@ -1320,7 +1391,7 @@ local function unloadStep(mech)
 	if finalTotal < startTotal then
 		S.fails = 0
 	else
-		setStatus("⚠ No se vació en la base: revisa tu 📍 Base", COLOR.amber)
+		setStatus("⚠ No se vació en el Plot", COLOR.amber)
 		task.wait(2)
 	end
 end
@@ -1626,21 +1697,27 @@ local nextArea = btn(areaCard, "▶", UDim2.fromOffset(34, 26), UDim2.new(1, -38
 ui.areaLbl = lbl(areaCard, "", UDim2.new(1, -84, 1, 0), UDim2.fromOffset(42, 0), 11, COLOR.cyan, Enum.Font.GothamBold)
 ui.areaLbl.TextXAlignment = Enum.TextXAlignment.Center
 
-local rBases = row(pageAuto, 5, 34)
-ui.baseBtn = btn(rBases, "📍 Base", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
-ui.zoneBtn = btn(rBases, "📍 Zona", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
+-- Fila: ir al Plot + recoger
+local rPlot = row(pageAuto, 5, 34)
+local plotBtn = btn(rPlot, "🏠 Ir a mi Plot", UDim2.new(0.5, -3, 1, 0), nil, COLOR.accent, 12)
+plotBtn.TextColor3 = COLOR.bg
+local pickBtn = btn(rPlot, "🧲 Recoger", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
-local rActs = row(pageAuto, 6, 34)
-local pickBtn = btn(rActs, "🧲 Recoger", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
-local clearBtn = btn(rActs, "↺ Limpiar", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
+-- Fila: respaldo manual y zona
+local rSet = row(pageAuto, 6, 34)
+local baseBtn = btn(rSet, "📍 Base manual", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+local zoneBtn = btn(rSet, "📍 Zona", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+
+local rClear = row(pageAuto, 7, 30)
+local clearBtn = btn(rClear, "↺ Borrar base manual y zona", UDim2.new(1, 0, 1, 0), nil, COLOR.btn, 11)
 clearBtn.TextColor3 = COLOR.red
 
 ui.msgLbl = lbl(pageAuto, "", UDim2.new(1, 0, 0, 16), nil, 10, COLOR.sub, Enum.Font.Gotham)
-ui.msgLbl.LayoutOrder = 7
+ui.msgLbl.LayoutOrder = 8
 ui.msgLbl.TextXAlignment = Enum.TextXAlignment.Center
 
 ui.infoLbl = lbl(pageAuto, "", UDim2.new(1, 0, 0, 14), nil, 9, COLOR.sub, Enum.Font.Gotham)
-ui.infoLbl.LayoutOrder = 8
+ui.infoLbl.LayoutOrder = 9
 ui.infoLbl.TextXAlignment = Enum.TextXAlignment.Center
 
 ---------------------------------------------------------------
@@ -1843,6 +1920,10 @@ ui.autoBtn.Activated:Connect(function()
 	setAuto(not S.on)
 end)
 
+plotBtn.Activated:Connect(function()
+	goToPlot()
+end)
+
 manualBox.FocusLost:Connect(function()
 	local n = tonumber(manualBox.Text)
 	if n and n >= 1 then
@@ -1881,7 +1962,8 @@ end
 prevArea.Activated:Connect(function() cycleArea(-1) end)
 nextArea.Activated:Connect(function() cycleArea(1) end)
 
-ui.baseBtn.Activated:Connect(function()
+-- Respaldo manual: solo se usa si no se encuentra tu Plot
+baseBtn.Activated:Connect(function()
 	local root = hrpNow()
 	if not root then
 		setStatus("❌ Sin personaje", COLOR.red)
@@ -1894,11 +1976,11 @@ ui.baseBtn.Activated:Connect(function()
 		S.base = root.Position
 	end
 	saveNow()
-	setStatus("✅ Base guardada aquí", COLOR.green)
+	setStatus("✅ Base manual guardada (solo si no hay Plot)", COLOR.green)
 	refreshUI()
 end)
 
-ui.zoneBtn.Activated:Connect(function()
+zoneBtn.Activated:Connect(function()
 	local root = hrpNow()
 	if not root then
 		setStatus("❌ Sin personaje", COLOR.red)
@@ -1918,7 +2000,7 @@ end)
 clearBtn.Activated:Connect(function()
 	S.base, S.zone = nil, nil
 	saveNow()
-	setStatus("↺ Base y zona borradas", COLOR.amber)
+	setStatus("↺ Base manual y zona borradas", COLOR.amber)
 	refreshUI()
 end)
 
@@ -1979,7 +2061,6 @@ ui.speedBtn.Activated:Connect(function()
 end)
 
 -- Ciclo de límite: CarryMax -> CarryCapacity -> Manual -> CarryMax
--- Al entrar en Manual toma la capacidad del mecha elegido
 ui.limitBtn.Activated:Connect(function()
 	if S.limitMode == "MAX" then
 		S.limitMode = "CAP"
@@ -2002,7 +2083,6 @@ ui.moveBtn.Activated:Connect(function()
 	refreshUI()
 end)
 
--- Selector: Automático + solo tus mechas
 local function cycleMech(step)
 	local list = listMechs()
 	local idx = 0
@@ -2135,7 +2215,6 @@ task.spawn(function()
 	end
 end)
 
--- Mantiene la velocidad aplicada mientras esté encendida
 task.spawn(function()
 	while not S.closed do
 		if S.speedOn then
@@ -2152,7 +2231,6 @@ task.spawn(function()
 	end
 end)
 
--- Refresco de la interfaz
 task.spawn(function()
 	local tick = 0
 	while not S.closed do
