@@ -1,4 +1,4 @@
--- MECHA PANEL v7 · Plot automático + auto-recolección rápida
+-- MECHA PANEL v8 · Plot automático + recolección solo en pilas con piezas (count > 0)
 -- LocalScript móvil. Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
 -- Plot: atributo "Plot" de tu jugador -> Workspace.World.Plots.Plot<n>
 -- Todo lo que cambies se guarda en MechaPanel_v3.json (writefile)
@@ -98,7 +98,7 @@ local S = {
 	state = "Parado",
 	total = 0,
 	limit = CFG.CAP_DEFECTO,
-	base = nil,           -- respaldo manual (solo si no encuentras tu Plot)
+	base = nil,
 	zone = nil,
 	placed = false,
 	minimized = false,
@@ -840,7 +840,6 @@ local function moveTo(mech, target, force)
 	return false
 end
 
--- Lleva tu mecha (o tu personaje) a tu Plot con el botón 🏠
 local function goToPlot()
 	if S.on then
 		setStatus("Detén el auto antes de ir al Plot", COLOR.amber)
@@ -1023,7 +1022,8 @@ local function pilePos(inst)
 	return nil
 end
 
-local function readCount(inst)
+-- Piezas que quedan en la pila (atributo "count"). nil si la pila no tiene ese atributo.
+local function pileCount(inst)
 	local cur, depth = inst, 0
 	while cur and depth < 2 do
 		local v = cur:GetAttribute("count")
@@ -1040,7 +1040,12 @@ local function readCount(inst)
 		cur = cur.Parent
 		depth += 1
 	end
-	return 1
+	return nil
+end
+
+-- Lectura segura para cálculos: si no hay "count", cuenta 1
+local function readCount(inst)
+	return pileCount(inst) or 1
 end
 
 local function promptsOf(inst)
@@ -1058,6 +1063,24 @@ local function firstPart(inst)
 		return inst
 	end
 	return inst:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- Una pila solo es útil si: existe, tiene piezas (count > 0 cuando hay count),
+-- y tiene un prompt activo (o el ejecutor puede tocarla)
+local function pileUsable(inst)
+	if not pileAlive(inst) then
+		return false
+	end
+	local c = pileCount(inst)
+	if c ~= nil and c <= 0 then
+		return false
+	end
+	for _, p in ipairs(promptsOf(inst)) do
+		if p.Enabled then
+			return true
+		end
+	end
+	return firetouchinterest ~= nil and firstPart(inst) ~= nil
 end
 
 local function triggerPile(inst)
@@ -1093,6 +1116,7 @@ local function triggerPile(inst)
 	return false
 end
 
+-- Pila útil más cercana. Ignora pilas vacías (count = 0) y tipos con cupo completo.
 local function nextPile(mech, origin)
 	local now = os.clock()
 	local best, bestDist
@@ -1102,7 +1126,7 @@ local function nextPile(mech, origin)
 	for _, e in ipairs(getPiles()) do
 		local expiry = S.black[e.inst]
 		local blocked = expiry ~= nil and expiry > now
-		if S.types[e.kind] and not blocked and pileAlive(e.inst) then
+		if S.types[e.kind] and not blocked and pileUsable(e.inst) then
 			local cap = S.caps[e.kind]
 			local isFull = false
 			if cap then
@@ -1280,11 +1304,23 @@ local function collectPile(mech, entry)
 	local inst = entry.inst
 	local name = typeLabel(entry.kind)
 
+	-- Si la pila se vació mientras íbamos hacia ella, no vamos
+	if not pileUsable(inst) then
+		S.pileDirty = true
+		return
+	end
+
 	setState("Yendo: " .. name, COLOR.cyan)
 	local pos = pilePos(inst)
 	if not pos or not moveTo(mech, pos + Vector3.new(0, CFG.ALTURA, 0)) then
 		S.black[inst] = os.clock() + CFG.BLOQUEO
 		S.fails += 1
+		return
+	end
+
+	-- Al llegar, si ya no tiene piezas, se salta sin esperar
+	if not pileUsable(inst) then
+		S.pileDirty = true
 		return
 	end
 
@@ -1311,6 +1347,10 @@ local function collectPile(mech, entry)
 				got = true
 				break
 			end
+			-- Pila vacía: se termina aquí
+			if c1 <= 0 then
+				break
+			end
 		else
 			local total = getCarry(mech)
 			if total > last then
@@ -1321,6 +1361,10 @@ local function collectPile(mech, entry)
 			end
 			if not pileAlive(inst) then
 				got = true
+				break
+			end
+			local c1 = pileCount(inst)
+			if c1 ~= nil and c1 <= 0 then
 				break
 			end
 		end
@@ -1337,6 +1381,7 @@ local function collectPile(mech, entry)
 		S.black[inst] = os.clock() + CFG.BLOQUEO
 		S.fails += 1
 	end
+	S.pileDirty = true
 end
 
 local function unloadStep(mech)
@@ -1443,7 +1488,7 @@ local function autoStep()
 		return
 	end
 
-	setState("Sin piezas en " .. areaLabel(), COLOR.sub)
+	setState("Sin piezas con cantidad en " .. areaLabel(), COLOR.sub)
 	S.pileDirty = true
 	task.wait(CFG.TICK)
 end
@@ -1474,7 +1519,7 @@ local function recogerCercanas()
 	S.pileDirty = true
 	local n = 0
 	for _, e in ipairs(getPiles()) do
-		if S.types[e.kind] and pileAlive(e.inst) then
+		if S.types[e.kind] and pileUsable(e.inst) then
 			local p = pilePos(e.inst)
 			if p and (p - center).Magnitude <= CFG.RANGO_RECOGER then
 				if triggerPile(e.inst) then
@@ -1495,7 +1540,7 @@ local function scanPiles()
 	end
 
 	local lines = {}
-	local totalPiles, withPrompt = 0, 0
+	local totalPiles, withPrompt, withCount, empty = 0, 0, 0, 0
 	for _, area in ipairs(arenas:GetChildren()) do
 		local pp = area:FindFirstChild("PartPiles", true)
 		if not pp then
@@ -1512,6 +1557,13 @@ local function scanPiles()
 				totalPiles += 1
 				if #promptsOf(e.inst) > 0 then
 					withPrompt += 1
+				end
+				local c = pileCount(e.inst)
+				if c ~= nil then
+					withCount += 1
+					if c <= 0 then
+						empty += 1
+					end
 				end
 			end
 			table.sort(order)
@@ -1536,7 +1588,10 @@ local function scanPiles()
 		end
 	end
 
-	table.insert(lines, 1, "Piezas cargadas: " .. totalPiles .. " · con prompt: " .. withPrompt)
+	table.insert(lines, 1, "Piezas: " .. totalPiles
+		.. " · con prompt: " .. withPrompt
+		.. " · con count: " .. withCount
+		.. " · vacías (count 0): " .. empty)
 	ui.scanNote.Text = table.concat(lines, "\n")
 
 	print("--- ESCANEO DE PARTPILES ---")
@@ -1697,13 +1752,11 @@ local nextArea = btn(areaCard, "▶", UDim2.fromOffset(34, 26), UDim2.new(1, -38
 ui.areaLbl = lbl(areaCard, "", UDim2.new(1, -84, 1, 0), UDim2.fromOffset(42, 0), 11, COLOR.cyan, Enum.Font.GothamBold)
 ui.areaLbl.TextXAlignment = Enum.TextXAlignment.Center
 
--- Fila: ir al Plot + recoger
 local rPlot = row(pageAuto, 5, 34)
 local plotBtn = btn(rPlot, "🏠 Ir a mi Plot", UDim2.new(0.5, -3, 1, 0), nil, COLOR.accent, 12)
 plotBtn.TextColor3 = COLOR.bg
 local pickBtn = btn(rPlot, "🧲 Recoger", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
--- Fila: respaldo manual y zona
 local rSet = row(pageAuto, 6, 34)
 local baseBtn = btn(rSet, "📍 Base manual", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
 local zoneBtn = btn(rSet, "📍 Zona", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
@@ -1737,7 +1790,7 @@ local allBtn = btn(rAll, "✔ Todos", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 
 local noneBtn = btn(rAll, "✖ Ninguno", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
 local typeNote = note(pageTipos, #TYPES + 2)
-typeNote.Text = "Solo se recogen los tipos marcados. Si una pila no da nada en pocos segundos, se salta y sigue con otra."
+typeNote.Text = "Solo se recogen los tipos marcados. Las pilas con count 0 se ignoran."
 
 ---------------------------------------------------------------
 -- PESTAÑA CUPOS
@@ -1962,7 +2015,6 @@ end
 prevArea.Activated:Connect(function() cycleArea(-1) end)
 nextArea.Activated:Connect(function() cycleArea(1) end)
 
--- Respaldo manual: solo se usa si no se encuentra tu Plot
 baseBtn.Activated:Connect(function()
 	local root = hrpNow()
 	if not root then
@@ -2010,7 +2062,7 @@ pickBtn.Activated:Connect(function()
 		if n < 0 then
 			setStatus("❌ Tu ejecutor no soporta fireproximityprompt", COLOR.red)
 		elseif n == 0 then
-			setStatus("No hay piezas a menos de " .. CFG.RANGO_RECOGER .. " studs", COLOR.amber)
+			setStatus("No hay piezas con cantidad a menos de " .. CFG.RANGO_RECOGER .. " studs", COLOR.amber)
 		else
 			setStatus("✅ Piezas activadas: " .. n, COLOR.green)
 		end
@@ -2060,7 +2112,6 @@ ui.speedBtn.Activated:Connect(function()
 	setSpeedOn(not S.speedOn)
 end)
 
--- Ciclo de límite: CarryMax -> CarryCapacity -> Manual -> CarryMax
 ui.limitBtn.Activated:Connect(function()
 	if S.limitMode == "MAX" then
 		S.limitMode = "CAP"
