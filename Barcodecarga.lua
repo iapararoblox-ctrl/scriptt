@@ -3,6 +3,7 @@
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
@@ -10,8 +11,9 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local GUI_NAME = "TPDestinosPanel"
-local OFFSET_Y = 4          -- studs por encima del punto de destino (evita quedar dentro del suelo)
-local USAR_EN_VIVO = true   -- true: usa la posición del objeto si existe; false: usa solo la coordenada fija
+local ALTURA_CAIDA = 150      -- studs por ENCIMA del destino: apareces arriba y caes hasta la isla
+local USAR_EN_VIVO = true     -- true: usa la posición del objeto si existe; false: usa solo la coordenada fija
+local AUTO_MINIMIZAR = false  -- true: el panel se minimiza solo después de teletransportarte
 
 -- ruta: carpetas desde Workspace hasta el objeto
 -- pos: coordenada fija de respaldo
@@ -38,6 +40,9 @@ local C = {
 	sub = Color3.fromRGB(135, 140, 160),
 	white = Color3.fromRGB(255, 255, 255),
 }
+
+local PANEL_W, PANEL_H = 260, 420
+local BUBBLE = 54
 
 ---------------------------------------------------------------
 -- UTILIDADES
@@ -82,19 +87,23 @@ local function moverRoot()
 	if not char then return nil end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if hum and hum.SeatPart then
-		return hum.SeatPart
+		return hum.SeatPart, hum
 	end
-	return char:FindFirstChild("HumanoidRootPart")
+	return char:FindFirstChild("HumanoidRootPart"), hum
 end
 
+-- Te lleva ENCIMA del destino y dejas que la gravedad te baje
 local function tpTo(pos)
-	local root = moverRoot()
+	local root, hum = moverRoot()
 	if not root then
 		return false
 	end
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
-	root.CFrame = CFrame.new(pos + Vector3.new(0, OFFSET_Y, 0))
+	root.CFrame = CFrame.new(pos + Vector3.new(0, ALTURA_CAIDA, 0))
+	if hum and not hum.SeatPart then
+		hum:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
 	return true
 end
 
@@ -142,35 +151,6 @@ local function button(parent, text, size, pos, color, textSize)
 	return b
 end
 
--- Arrastrar el panel desde la cabecera
-local function makeDrag(handle, target)
-	local UIS = game:GetService("UserInputService")
-	local dragging, startInput, startPos = false, nil, nil
-	handle.InputBegan:Connect(function(input)
-		local t = input.UserInputType
-		if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
-			dragging = true
-			startInput = input.Position
-			startPos = Vector2.new(target.Position.X.Offset, target.Position.Y.Offset)
-			local conn
-			conn = input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-					conn:Disconnect()
-				end
-			end)
-		end
-	end)
-	UIS.InputChanged:Connect(function(input)
-		if not dragging then return end
-		local t = input.UserInputType
-		if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseMovement then
-			local d = input.Position - startInput
-			target.Position = UDim2.fromOffset(startPos.X + d.X, startPos.Y + d.Y)
-		end
-	end)
-end
-
 local old = PlayerGui:FindFirstChild(GUI_NAME)
 if old then old:Destroy() end
 
@@ -181,21 +161,104 @@ screen.IgnoreGuiInset = true
 screen.DisplayOrder = 999997
 screen.Parent = PlayerGui
 
+-- Escala según la pantalla
+local escala = 1
+do
+	local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(390, 844)
+	escala = math.clamp(math.min(vp.X * 0.92 / PANEL_W, vp.Y * 0.8 / PANEL_H), 0.6, 1)
+end
+local rootW, rootH = PANEL_W * escala, PANEL_H * escala
+
+local connections = {}
+
+-- Mantiene un objeto dentro de la pantalla (posición en píxeles reales)
+local function clampPos(x, y, w, h)
+	local sz = screen.AbsoluteSize
+	return math.clamp(x, 0, math.max(0, sz.X - w)), math.clamp(y, 0, math.max(0, sz.Y - h))
+end
+
+-- Arrastrar: handle = lo que tocas, target = lo que se mueve, onTap = toque corto (opcional)
+local function makeDrag(handle, target, w, h, onTap)
+	local dragging, startInput, startAbs, moved, tracked = false, nil, nil, false, nil
+	handle.InputBegan:Connect(function(input)
+		local t = input.UserInputType
+		if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			moved = false
+			tracked = input
+			startInput = input.Position
+			startAbs = target.AbsolutePosition
+			local conn
+			conn = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					conn:Disconnect()
+					if onTap and not moved then
+						onTap()
+					end
+				end
+			end)
+		end
+	end)
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		local t = input.UserInputType
+		if t == Enum.UserInputType.Touch then
+			if input ~= tracked then return end
+		elseif t ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		local d = input.Position - startInput
+		if d.Magnitude > 8 then
+			moved = true
+		end
+		if moved then
+			local x, y = clampPos(startAbs.X + d.X, startAbs.Y + d.Y, w, h)
+			target.Position = UDim2.fromOffset(x, y)
+		end
+	end))
+end
+
+-- Contenedor del panel (en píxeles reales, para arrastrar y limitar a la pantalla)
+local root = Instance.new("Frame")
+root.Size = UDim2.fromOffset(rootW, rootH)
+root.Position = UDim2.fromOffset(12, 90)
+root.BackgroundTransparency = 1
+root.BorderSizePixel = 0
+root.Parent = screen
+
 local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(260, 420)
-panel.Position = UDim2.fromOffset(12, 90)
+panel.Size = UDim2.fromOffset(PANEL_W, PANEL_H)
 panel.BackgroundColor3 = C.bg
 panel.BorderSizePixel = 0
 panel.ClipsDescendants = true
-panel.Parent = screen
+panel.Parent = root
 corner(panel, 14)
 
 local uiScale = Instance.new("UIScale")
+uiScale.Scale = escala
 uiScale.Parent = panel
-do
-	local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(390, 844)
-	uiScale.Scale = math.clamp(math.min(vp.X * 0.92 / 260, vp.Y * 0.8 / 420), 0.6, 1)
-end
+
+-- Burbuja (panel minimizado)
+local bubble = Instance.new("TextButton")
+bubble.Name = "Burbuja"
+bubble.Size = UDim2.fromOffset(BUBBLE, BUBBLE)
+bubble.Position = UDim2.fromOffset(12, 90)
+bubble.BackgroundColor3 = C.card
+bubble.BorderSizePixel = 0
+bubble.AutoButtonColor = false
+bubble.Text = "📍"
+bubble.TextSize = 24
+bubble.TextColor3 = C.text
+bubble.Font = Enum.Font.GothamBold
+bubble.Visible = false
+bubble.Parent = screen
+corner(bubble, BUBBLE / 2)
+
+local bubbleStroke = Instance.new("UIStroke")
+bubbleStroke.Color = C.accent
+bubbleStroke.Thickness = 2
+bubbleStroke.Parent = bubble
 
 -- Cabecera
 local header = Instance.new("Frame")
@@ -206,10 +269,13 @@ header.Active = true
 header.Parent = panel
 corner(header, 14)
 
-label(header, "📍 Destinos", UDim2.new(1, -60, 1, 0), UDim2.fromOffset(14, 0), 15, C.text, true)
+label(header, "📍 Destinos", UDim2.new(1, -90, 1, 0), UDim2.fromOffset(14, 0), 15, C.text, true)
 
 local closeBtn = button(header, "✕", UDim2.fromOffset(30, 30), UDim2.new(1, -36, 0, 6), Color3.fromRGB(60, 30, 36), 13)
 closeBtn.TextColor3 = C.red
+
+local minBtn = button(header, "—", UDim2.fromOffset(30, 30), UDim2.new(1, -72, 0, 6), Color3.fromRGB(34, 52, 66), 14)
+minBtn.TextColor3 = C.accent
 
 -- Buscador
 local search = Instance.new("TextBox")
@@ -261,6 +327,30 @@ local function setStatus(text, color)
 	end)
 end
 
+---------------------------------------------------------------
+-- MINIMIZAR / RESTAURAR
+---------------------------------------------------------------
+local function minimizar()
+	local p = root.AbsolutePosition
+	local x, y = clampPos(p.X, p.Y, BUBBLE, BUBBLE)
+	bubble.Position = UDim2.fromOffset(x, y)
+	root.Visible = false
+	bubble.Visible = true
+end
+
+local function restaurar()
+	local p = bubble.AbsolutePosition
+	local x, y = clampPos(p.X, p.Y, rootW, rootH)
+	root.Position = UDim2.fromOffset(x, y)
+	bubble.Visible = false
+	root.Visible = true
+end
+
+minBtn.Activated:Connect(minimizar)
+
+---------------------------------------------------------------
+-- LISTA DE DESTINOS
+---------------------------------------------------------------
 local rows = {}
 for i, d in ipairs(DESTINOS) do
 	local f = Instance.new("TextButton")
@@ -279,7 +369,10 @@ for i, d in ipairs(DESTINOS) do
 	f.Activated:Connect(function()
 		local pos, fuente = resolve(d)
 		if tpTo(pos) then
-			setStatus("✅ Llegaste a " .. d.nombre .. " (" .. fuente .. ")", C.green)
+			setStatus("✅ Cayendo a " .. d.nombre .. " (" .. fuente .. ")", C.green)
+			if AUTO_MINIMIZAR then
+				minimizar()
+			end
 		else
 			setStatus("❌ No tengo personaje", C.red)
 		end
@@ -305,15 +398,22 @@ search:GetPropertyChangedSignal("Text"):Connect(function()
 end)
 
 closeBtn.Activated:Connect(function()
+	for _, c in ipairs(connections) do
+		c:Disconnect()
+	end
 	screen:Destroy()
 end)
 
-makeDrag(header, panel)
+-- Arrastre: el panel desde la cabecera, la burbuja desde ella misma (toque corto = abrir)
+makeDrag(header, root, rootW, rootH)
+makeDrag(bubble, bubble, BUBBLE, BUBBLE, restaurar)
 
 refreshRows()
 task.spawn(function()
 	while screen.Parent do
-		refreshRows()
+		if root.Visible then
+			refreshRows()
+		end
 		task.wait(1)
 	end
 end)
