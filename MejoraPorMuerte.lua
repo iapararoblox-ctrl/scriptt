@@ -1,7 +1,6 @@
--- MECHA PANEL v9 · Plot automático + regreso por vida baja + solo pilas con cantidad
+-- MECHA PANEL v10 · Detección robusta del mecha + atributos visibles
 -- LocalScript móvil. Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
 -- Plot: atributo "Plot" de tu jugador -> Workspace.World.Plots.Plot<n>
--- Vida: atributo/valor "Health" del mecha. Vida máxima: MaxHealth/MaxHP/HealthMax
 -- Todo lo que cambies se guarda en MechaPanel_v3.json (writefile)
 
 local Players = game:GetService("Players")
@@ -37,7 +36,7 @@ local CFG = {
 	VIDA_DEFECTO = 30,
 	VIDA_PASO = 10,
 	VIDA_MAX = 1000000,
-	ESPERA_VIDA = 120,        -- segundos máximos esperando curarse en el Plot
+	ESPERA_VIDA = 120,
 
 	ESPERA_PROMPT = 0.12,
 	SIN_PROGRESO = 1.2,
@@ -47,6 +46,7 @@ local CFG = {
 	ESPERA_DESCARGA = 8,
 	ESPERA_DESCARGA_MANUAL = 4,
 	RESCAN = 2,
+	RECHECK_MECH = 2,        -- segundos entre búsquedas completas del mecha (si el actual sigue existiendo)
 	TICK = 0.6,
 }
 
@@ -94,6 +94,8 @@ local LIMIT_LABEL = {
 
 local HEALTH_NAMES = { "Health" }
 local MAXHEALTH_NAMES = { "MaxHealth", "MaxHP", "HealthMax", "MaxHp" }
+-- Atributos que identifican al modelo que lleva la carga y la vida del mecha
+local MECH_ATTRS = { "CarryCapacity", "CarryMax", "CarryTotal", "MechId", "Health" }
 
 ---------------------------------------------------------------
 -- ESTADO
@@ -125,11 +127,11 @@ local S = {
 	healthMin = CFG.VIDA_DEFECTO,
 	maxHealthSeen = nil,
 
-	mechPick = nil,
+	mechPick = nil,       -- modelo fuente elegido a mano
 	mechPickName = nil,
-	mech = nil,
+	mech = nil,           -- modelo fuente que se está usando ahora
 	mechTime = -100,
-	deepTime = -100,
+	mechPath = "",
 
 	pileCache = nil,
 	pileTime = -100,
@@ -483,7 +485,7 @@ local function plotPos(obj)
 end
 
 ---------------------------------------------------------------
--- MECHA (solo los tuyos)
+-- MECHA: detección robusta
 ---------------------------------------------------------------
 local function hrpNow()
 	local char = LocalPlayer.Character
@@ -514,6 +516,28 @@ local function ownedBy(m)
 	return false
 end
 
+local function hasMechAttrs(m)
+	for _, n in ipairs(MECH_ATTRS) do
+		if m:GetAttribute(n) ~= nil then
+			return true
+		end
+	end
+	return false
+end
+
+-- Modelo que realmente tiene los atributos del mecha: el propio modelo o uno de sus hijos
+local function pickSource(m)
+	if hasMechAttrs(m) then
+		return m
+	end
+	for _, d in ipairs(m:GetDescendants()) do
+		if d:IsA("Model") and hasMechAttrs(d) then
+			return d
+		end
+	end
+	return nil
+end
+
 local function scoreMech(m)
 	local s = 0
 	if m:GetAttribute("CarryCapacity") ~= nil or m:GetAttribute("CarryMax") ~= nil or m:GetAttribute("CarryTotal") ~= nil then
@@ -521,6 +545,9 @@ local function scoreMech(m)
 	end
 	if m:GetAttribute("MechId") ~= nil then
 		s += 2
+	end
+	if m:GetAttribute("Health") ~= nil then
+		s += 1
 	end
 	if m:GetAttribute("PilotMode") == "Seat" then
 		s += 2
@@ -532,40 +559,19 @@ local function scoreMech(m)
 	return s
 end
 
-local function findMech()
-	local best, bestScore
-	local function consider(m)
-		if m:IsA("Model") and ownedBy(m) then
-			local sc = scoreMech(m)
-			if sc > 0 and (not bestScore or sc > bestScore) then
-				best, bestScore = m, sc
-			end
-		end
-	end
-
-	for _, o in ipairs(Workspace:GetChildren()) do
-		consider(o)
-	end
-
-	if not best and os.clock() - S.deepTime > 5 then
-		S.deepTime = os.clock()
-		for _, o in ipairs(Workspace:GetDescendants()) do
-			if o:IsA("Model") and o:GetAttribute("MechId") ~= nil then
-				consider(o)
-			end
-		end
-	end
-	return best
-end
-
+-- Lista de modelos fuente de TUS mechas (los de otros jugadores no entran)
 local function listMechs()
 	local out, seen = {}, {}
 	local function consider(m)
-		if m:IsA("Model") and not seen[m] and scoreMech(m) > 0 and ownedBy(m) then
-			seen[m] = true
-			table.insert(out, m)
-		end
+		if not m:IsA("Model") then return end
+		local src = pickSource(m)
+		if not src or seen[src] then return end
+		if not (ownedBy(m) or ownedBy(src)) then return end
+		if scoreMech(src) <= 0 then return end
+		seen[src] = true
+		table.insert(out, src)
 	end
+
 	for _, o in ipairs(Workspace:GetChildren()) do
 		consider(o)
 	end
@@ -578,26 +584,73 @@ local function listMechs()
 	return out
 end
 
-local function findByName(name)
-	for _, o in ipairs(Workspace:GetChildren()) do
-		if o:IsA("Model") and o.Name == name and scoreMech(o) > 0 and ownedBy(o) then
-			return o
+-- Entre varios de tus mechas, el de mayor puntuación; si empatan, el más cercano a tu personaje
+local function bestOf(list)
+	local root = hrpNow()
+	local myPos = root and root.Position
+	local best, bestScore, bestDist
+	for _, m in ipairs(list) do
+		local sc = scoreMech(m)
+		local d = myPos and (m:GetPivot().Position - myPos).Magnitude or math.huge
+		if not best or sc > bestScore or (sc == bestScore and d < bestDist) then
+			best, bestScore, bestDist = m, sc, d
 		end
 	end
-	if os.clock() - S.deepTime > 5 then
-		S.deepTime = os.clock()
-		for _, o in ipairs(Workspace:GetDescendants()) do
-			if o:IsA("Model") and o.Name == name and o:GetAttribute("MechId") ~= nil and ownedBy(o) then
-				return o
-			end
-		end
-	end
-	return nil
+	return best
 end
 
----------------------------------------------------------------
--- CAPACIDAD DEL MECHA ELEGIDO
----------------------------------------------------------------
+local function setMechPick(m)
+	S.mechPick = m
+	S.mechPickName = m and m.Name or nil
+	S.mech = m
+	S.mechTime = 0
+	if S.limitMode ~= "MANUAL" then
+		S.session = {}
+	end
+	S.fails = 0
+	save()
+end
+
+-- Devuelve el modelo fuente del mecha que se usa ahora.
+-- Re-busca cuando el actual ya no existe, al cambiar de personaje o cada CFG.RECHECK_MECH segundos.
+local function resolveMech(force)
+	local now = os.clock()
+
+	-- Mecha elegido a mano: se mantiene mientras exista
+	if S.mechPickName then
+		if not force and S.mechPick and S.mechPick.Parent and ownedBy(S.mechPick) and now - S.mechTime < CFG.RECHECK_MECH then
+			S.mech = S.mechPick
+			return S.mech
+		end
+		local list = listMechs()
+		local found, bestD
+		local root = hrpNow()
+		for _, m in ipairs(list) do
+			if m.Name == S.mechPickName then
+				local d = root and (m:GetPivot().Position - root.Position).Magnitude or 0
+				if not found or d < bestD then
+					found, bestD = m, d
+				end
+			end
+		end
+		S.mechPick = found
+		S.mech = found
+		S.mechTime = now
+		return found
+	end
+
+	-- Automático
+	if not force and S.mech and S.mech.Parent and ownedBy(S.mech) and now - S.mechTime < CFG.RECHECK_MECH then
+		return S.mech
+	end
+	S.mech = bestOf(listMechs())
+	S.mechTime = now
+	return S.mech
+end
+
+local watchedMech = nil
+local watchConns = {}
+
 local function syncCapFromMech(mech)
 	if not mech then return false end
 	local cap = tonumber(mech:GetAttribute("CarryCapacity"))
@@ -613,9 +666,6 @@ local function syncCapFromMech(mech)
 	saveNow()
 	return true
 end
-
-local watchedMech = nil
-local watchConns = {}
 
 local function watchMech(mech, doSync)
 	for _, c in ipairs(watchConns) do
@@ -637,54 +687,28 @@ local function watchMech(mech, doSync)
 	end
 end
 
-local function resolveMech()
-	local now = os.clock()
-
-	if S.mechPickName then
-		if S.mechPick and S.mechPick.Parent and ownedBy(S.mechPick) then
-			S.mech = S.mechPick
-			return S.mech
-		end
-		if now - S.mechTime >= 2 then
-			S.mechTime = now
-			S.mechPick = findByName(S.mechPickName)
-		end
-		S.mech = S.mechPick
-		return S.mech
-	end
-
-	if S.mech and S.mech.Parent and now - S.mechTime < 2 then
-		return S.mech
-	end
-	S.mech = findMech()
-	S.mechTime = now
-	return S.mech
-end
-
 local function getMech()
-	local m = resolveMech()
+	local m = resolveMech(false)
 	if m ~= watchedMech then
 		watchMech(m, false)
 	end
 	return m
 end
 
-local function setMechPick(m)
-	S.mechPick = m
-	S.mechPickName = m and m.Name or nil
-	S.mech = m
-	S.mechTime = os.clock()
-	if S.limitMode ~= "MANUAL" then
-		S.session = {}
+local function forceRedetect()
+	local m = resolveMech(true)
+	if m ~= watchedMech then
+		watchMech(m, false)
 	end
-	S.fails = 0
-	watchMech(m, m ~= nil)
-	save()
+	return m
 end
 
 local function getCarry(mech)
 	if S.limitMode == "MANUAL" then
 		return S.carried, math.max(1, S.manualCap)
+	end
+	if not mech then
+		return 0, CFG.CAP_DEFECTO
 	end
 
 	local total = tonumber(mech:GetAttribute("CarryTotal")) or 0
@@ -732,7 +756,6 @@ local function pilotActive(mech)
 	return mech:GetAttribute("PilotMode") == "Seat"
 end
 
--- Destino de descarga y curación: tu Plot. Si no se encuentra, la base manual. Si tampoco, el marcador del mapa.
 local function getBasePos()
 	local plot = getPlot()
 	if plot then
@@ -753,6 +776,7 @@ end
 -- VIDA DEL MECHA
 ---------------------------------------------------------------
 local function readNum(mech, names)
+	if not mech then return nil end
 	for _, n in ipairs(names) do
 		local v = mech:GetAttribute(n)
 		if v == nil then
@@ -770,13 +794,11 @@ local function readNum(mech, names)
 end
 
 local function healthNow(mech)
-	if not mech then return nil end
 	return readNum(mech, HEALTH_NAMES)
 end
 
--- Vida "llena": MaxHealth si existe; si no, la mayor vida vista en el mecha
 local function healthTarget(mech)
-	local mx = mech and readNum(mech, MAXHEALTH_NAMES)
+	local mx = readNum(mech, MAXHEALTH_NAMES)
 	if mx and mx > 0 then
 		return mx
 	end
@@ -794,7 +816,6 @@ local function learnHealth(mech)
 	end
 end
 
--- true si la vida está en o por debajo del mínimo elegido
 local function needsHeal(mech)
 	if not S.healOn or not mech then return false end
 	local h = healthNow(mech)
@@ -877,7 +898,6 @@ local function placeAt(mech, pos)
 	end
 end
 
--- force = true: se mueve aunque el auto esté apagado (para el botón 🏠)
 local function moveTo(mech, target, force)
 	local function running()
 		if S.closed then return false end
@@ -1096,7 +1116,6 @@ local function pilePos(inst)
 	return nil
 end
 
--- Piezas que quedan en la pila (atributo "count"). nil si la pila no tiene ese atributo.
 local function pileCount(inst)
 	local cur, depth = inst, 0
 	while cur and depth < 2 do
@@ -1138,7 +1157,6 @@ local function firstPart(inst)
 	return inst:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- Una pila solo es útil si: existe, tiene count mayor que 0 y tiene un prompt activo (o se puede tocar)
 local function pileUsable(inst)
 	if not pileAlive(inst) then
 		return false
@@ -1188,7 +1206,6 @@ local function triggerPile(inst)
 	return false
 end
 
--- Pila útil más cercana. Ignora pilas sin cantidad y tipos con cupo completo.
 local function nextPile(mech, origin)
 	local now = os.clock()
 	local best, bestDist
@@ -1267,54 +1284,75 @@ setStatus = function(text, color)
 	end)
 end
 
-local function carryBreakdown(mech)
-	local items = {}
-	for k, v in pairs(mech:GetAttributes()) do
-		if k:sub(1, 6) == "Carry_" then
-			table.insert(items, { k = k:sub(7), v = v })
-		end
+-- Ruta corta del modelo fuente (para saber cuál se está usando)
+local function pathOf(inst)
+	if not inst then return "ninguno" end
+	local names = {}
+	local cur = inst
+	local depth = 0
+	while cur and cur ~= Workspace and depth < 4 do
+		table.insert(names, 1, cur.Name)
+		cur = cur.Parent
+		depth += 1
 	end
-	table.sort(items, function(a, b) return a.k < b.k end)
-	local parts = {}
-	for _, it in ipairs(items) do
-		table.insert(parts, it.k .. " " .. tostring(it.v))
+	return table.concat(names, " > ")
+end
+
+-- Lista de todos los atributos del modelo que el script está usando
+local function attributeDump(mech)
+	local keys = {}
+	for k in pairs(mech:GetAttributes()) do
+		table.insert(keys, k)
 	end
-	return table.concat(parts, " · ")
+	table.sort(keys)
+	local lines = {}
+	for _, k in ipairs(keys) do
+		local v = mech:GetAttribute(k)
+		table.insert(lines, k .. " = " .. tostring(v))
+	end
+	if #lines == 0 then
+		table.insert(lines, "(sin atributos)")
+	end
+	return table.concat(lines, "\n")
 end
 
 local function refreshMechInfo()
 	if not ui.mechNote then return end
-	local mech = getMech()
-	if not mech then
-		if S.mechPickName then
-			ui.mechNote.Text = "No encuentro tu mecha elegido: " .. S.mechPickName .. ". Pulsa 🤖 Automático."
-		else
-			ui.mechNote.Text = "No encuentro tu mecha. Debe ser un modelo tuyo en Workspace con atributos Carry*."
+	local ok, err = pcall(function()
+		local mech = getMech()
+		if not mech then
+			if S.mechPickName then
+				ui.mechNote.Text = "No encuentro el mecha elegido: " .. S.mechPickName .. ". Pulsa 🔄 Re-detectar o 🤖 Automático."
+			else
+				ui.mechNote.Text = "No encuentro tu mecha. Debe ser un modelo tuyo en Workspace con atributos Carry*, MechId o Health."
+			end
+			return
 		end
-		return
+		local lines = {
+			"Modelo usado: " .. mech.Name,
+			"Ruta: " .. pathOf(mech),
+			"Modo: " .. (S.mechPickName and "manual" or "automático"),
+			"Piloto: " .. (pilotActive(mech) and "sí" or "no"),
+			"Vida: " .. tostring(healthNow(mech)) .. " / " .. tostring(healthTarget(mech)),
+			"CarryTotal: " .. tostring(mech:GetAttribute("CarryTotal"))
+				.. " · CarryCapacity: " .. tostring(mech:GetAttribute("CarryCapacity"))
+				.. " · CarryMax: " .. tostring(mech:GetAttribute("CarryMax")),
+			"— Atributos —",
+			attributeDump(mech),
+		}
+		ui.mechNote.Text = table.concat(lines, "\n")
+	end)
+	if not ok then
+		ui.mechNote.Text = "Error leyendo el mecha: " .. tostring(err)
 	end
-	local lines = {}
-	table.insert(lines, "Mecha (" .. (S.mechPickName and "manual" or "auto") .. "): " .. mech.Name)
-	table.insert(lines, "MechId: " .. tostring(mech:GetAttribute("MechId"))
-		.. " · Piloto: " .. (pilotActive(mech) and "sí" or "no")
-		.. " (PilotMode=" .. tostring(mech:GetAttribute("PilotMode")) .. ")")
-	table.insert(lines, "CarryTotal: " .. tostring(mech:GetAttribute("CarryTotal"))
-		.. " · CarryCapacity: " .. tostring(mech:GetAttribute("CarryCapacity"))
-		.. " · CarryMax: " .. tostring(mech:GetAttribute("CarryMax")))
-	table.insert(lines, "Health: " .. tostring(healthNow(mech)) .. " · vida llena: " .. tostring(healthTarget(mech)))
-	local br = carryBreakdown(mech)
-	if br ~= "" then
-		table.insert(lines, "Detalle: " .. br)
-	end
-	local o = origSpeed[mech]
-	if o then
-		table.insert(lines, "Velocidad original: WalkSpeed " .. tostring(o.attrs.WalkSpeed) .. " · RunSpeed " .. tostring(o.attrs.RunSpeed))
-	end
-	ui.mechNote.Text = table.concat(lines, "\n")
 end
 
 local function refreshUI()
 	if S.closed or not ui.carryNum then return end
+
+	local mech = S.mech
+	local total, limit = getCarry(mech)
+	S.total, S.limit = total, limit
 
 	ui.carryNum.Text = S.total .. " / " .. S.limit
 	local r = math.clamp(S.total / math.max(S.limit, 1), 0, 1)
@@ -1341,13 +1379,11 @@ local function refreshUI()
 	ui.areaLbl.Text = areaLabel()
 	ui.limitBtn.Text = LIMIT_LABEL[S.limitMode] or LIMIT_LABEL.MAX
 	ui.moveBtn.Text = S.moveMode == "GLIDE" and "Mover: Deslizar" or "Mover: Teletransporte"
-	ui.mechLbl.Text = S.mechPickName or "Automático"
+	ui.mechLbl.Text = (S.mechPickName or "Automático") .. (mech and "" or " (no encontrado)")
 
-	-- Vida
 	ui.healVal.Text = tostring(S.healthMin)
-	local mechH = S.mech
-	local hNow = healthNow(mechH)
-	local hTxt = hNow and (tostring(hNow) .. "/" .. tostring(healthTarget(mechH))) or "?"
+	local hNow = healthNow(mech)
+	local hTxt = hNow and (tostring(hNow) .. "/" .. tostring(healthTarget(mech))) or "?"
 	ui.healthLbl.Text = "Vida " .. hTxt .. " · regresa al Plot con " .. S.healthMin .. " o menos"
 		.. (S.healOn and "" or " (desactivado)")
 	ui.healthLbl.TextColor3 = (hNow and hNow <= S.healthMin and S.healOn) and COLOR.red or COLOR.sub
@@ -1359,7 +1395,6 @@ local function refreshUI()
 	ui.infoLbl.Text = "Plot: " .. plotTxt .. " · Base manual: " .. manualTxt
 		.. " · Zona: " .. (S.zone and "✔" or "✖") .. " · Recogidas: " .. S.collected
 
-	local mech = S.mech
 	local sum = 0
 	for _, t in ipairs(TYPES) do
 		local cap = S.caps[t.key]
@@ -1441,7 +1476,6 @@ local function collectPile(mech, entry)
 		return
 	end
 
-	-- Si la vida bajó mientras íbamos, no recolecta: el ciclo principal la atiende
 	if needsHeal(mech) then
 		return
 	end
@@ -1490,7 +1524,6 @@ local function collectPile(mech, entry)
 			end
 		end
 
-		-- La vida bajó durante la recogida: se corta sin castigar la pila
 		if needsHeal(mech) then
 			got = true
 			break
@@ -1545,8 +1578,8 @@ local function unloadStep(mech)
 
 	while S.on and not S.closed and mech.Parent and os.clock() - t0 < CFG.ESPERA_DESCARGA do
 		task.wait(0.4)
-		local total, limit = getCarry(mech)
-		S.total, S.limit = total, limit
+		local total = getCarry(mech)
+		S.total = total
 		if total <= 0 then
 			break
 		end
@@ -1583,7 +1616,6 @@ local function autoStep()
 		return
 	end
 
-	-- Prioridad 1: vida baja → Plot hasta tener la vida llena
 	if needsHeal(mech) then
 		healStep(mech)
 		return
@@ -2011,9 +2043,10 @@ local autoMechBtn = btn(rMech, "🤖 Automático", UDim2.new(0.5, -3, 1, 0), nil
 local listMechBtn = btn(rMech, "🔄 Mis mechas", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
 
 local rCap = row(pageMecha, 7, 32)
-local syncCapBtn = btn(rCap, "🔄 Tomar capacidad del mecha", UDim2.new(1, 0, 1, 0), nil, COLOR.btn, 11)
+local syncCapBtn = btn(rCap, "🔄 Tomar capacidad del mecha", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
+local redetectBtn = btn(rCap, "♻ Re-detectar mecha", UDim2.new(0.5, -3, 1, 0), nil, COLOR.accent, 11)
+redetectBtn.TextColor3 = COLOR.bg
 
--- Vida mínima para regresar al Plot
 local healCard = card(pageMecha, 8, 46)
 lbl(healCard, "VIDA MÍNIMA (regresa al Plot)", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 4), 9, COLOR.sub, Enum.Font.GothamBold)
 local hMinus = btn(healCard, "−", UDim2.fromOffset(40, 26), UDim2.fromOffset(8, 16), COLOR.btn, 16)
@@ -2115,7 +2148,7 @@ local function setSpeedOn(v)
 	else
 		S.speedOn = false
 		local mech = S.speedMech or getMech()
-		if restoreSpeed(mech) then
+		if mech and restoreSpeed(mech) then
 			setStatus("↩ Velocidad original restaurada", COLOR.amber)
 		else
 			setStatus("Velocidad apagada", COLOR.sub)
@@ -2311,8 +2344,10 @@ local function cycleMech(step)
 		setStatus("🤖 Mecha: automático", COLOR.cyan)
 	else
 		setMechPick(list[idx])
-		setStatus("🤖 Mecha: " .. list[idx].Name .. " · cap " .. S.manualCap, COLOR.cyan)
+		setStatus("🤖 Mecha: " .. list[idx].Name, COLOR.cyan)
 	end
+	forceRedetect()
+	watchMech(S.mech, S.mech ~= nil)
 	refreshMechInfo()
 	refreshUI()
 end
@@ -2322,7 +2357,19 @@ nextMech.Activated:Connect(function() cycleMech(1) end)
 
 autoMechBtn.Activated:Connect(function()
 	setMechPick(nil)
+	forceRedetect()
 	setStatus("🤖 Mecha: automático", COLOR.cyan)
+	refreshMechInfo()
+	refreshUI()
+end)
+
+redetectBtn.Activated:Connect(function()
+	local m = forceRedetect()
+	if m then
+		setStatus("♻ Mecha detectado: " .. m.Name, COLOR.green)
+	else
+		setStatus("❌ No encontré tu mecha", COLOR.red)
+	end
 	refreshMechInfo()
 	refreshUI()
 end)
@@ -2331,7 +2378,7 @@ listMechBtn.Activated:Connect(function()
 	local list = listMechs()
 	local lines = { "Tus mechas: " .. #list }
 	for i, m in ipairs(list) do
-		table.insert(lines, i .. ". " .. m.Name)
+		table.insert(lines, i .. ". " .. m.Name .. "  (" .. pathOf(m) .. ")")
 	end
 	if #list == 0 then
 		table.insert(lines, "No encontré mechas tuyos en Workspace.")
@@ -2361,9 +2408,8 @@ statsBtn.Activated:Connect(function()
 		setStatus("❌ No se encontró tu mecha", COLOR.red)
 		return
 	end
-	local total, limit = getCarry(mech)
 	print("--- STATS DE MECHA ---")
-	print("Nombre:", mech.Name)
+	print("Modelo:", mech.Name, "· Ruta:", pathOf(mech))
 	local keys = {}
 	for k in pairs(mech:GetAttributes()) do
 		table.insert(keys, k)
@@ -2373,7 +2419,7 @@ statsBtn.Activated:Connect(function()
 		print(k .. ":", mech:GetAttribute(k))
 	end
 	refreshMechInfo()
-	setStatus("✅ Stats impresos (F9): " .. total .. "/" .. limit, COLOR.green)
+	setStatus("✅ Stats impresos (F9)", COLOR.green)
 end)
 
 scanBtn.Activated:Connect(function()
@@ -2387,8 +2433,8 @@ end)
 closeBtn.Activated:Connect(function()
 	S.closed = true
 	S.on = false
-	if S.speedOn then
-		restoreSpeed(S.speedMech or S.mech)
+	if S.speedOn and S.speedMech then
+		restoreSpeed(S.speedMech)
 	end
 	saveNow()
 	screen:Destroy()
@@ -2428,13 +2474,13 @@ end)
 
 task.spawn(function()
 	while not S.closed do
-		if S.speedOn then
+		if S.speedOn and S.speedMech then
 			local mech = getMech()
-			if mech then
-				if S.speedMech and S.speedMech ~= mech then
-					restoreSpeed(S.speedMech)
-				end
+			if mech and mech ~= S.speedMech then
+				restoreSpeed(S.speedMech)
 				S.speedMech = mech
+			end
+			if mech then
 				pcall(applySpeed, mech)
 			end
 		end
@@ -2445,18 +2491,19 @@ end)
 task.spawn(function()
 	local tick = 0
 	while not S.closed do
-		local mech = getMech()
-		if mech then
-			learnHealth(mech)
+		local ok, err = pcall(function()
+			local mech = getMech()
+			if mech then
+				learnHealth(mech)
+			end
+			refreshUI()
+		end)
+		if not ok then
+			warn("[MECHA] UI: " .. tostring(err))
 		end
-		if not S.on and (mech or S.limitMode == "MANUAL") then
-			local total, limit = getCarry(mech)
-			S.total, S.limit = total, limit
-		end
-		refreshUI()
 		tick += 1
 		if tick % 4 == 0 then
-			pcall(refreshMechInfo)
+			refreshMechInfo()
 		end
 		task.wait(0.25)
 	end
