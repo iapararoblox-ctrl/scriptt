@@ -1,4 +1,4 @@
--- MECHA PANEL v5 · Auto-recolección rápida, capacidad manual + conteo por pieza (count)
+-- MECHA PANEL v6 · Auto-recolección rápida, capacidad del mecha elegido + conteo por pieza (count)
 -- LocalScript móvil. Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
 -- Todo lo que cambies se guarda en MechaPanel_v3.json (writefile)
 
@@ -27,15 +27,15 @@ local CFG = {
 
 	CAP_DEFECTO = 16,
 	MANUAL_DEFECTO = 16,
-	VUELO_VEL = 150,          -- studs por segundo al desplazarse (más alto = más rápido)
+	VUELO_VEL = 150,
 	MAX_VUELO = 60,
 	ALTURA = 4,
 	RANGO_RECOGER = 40,
 
-	ESPERA_PROMPT = 0.12,     -- pausa tras activar el prompt antes de mirar el contador
-	SIN_PROGRESO = 1.2,       -- si no baja el contador en este tiempo, se pasa a otra pila
+	ESPERA_PROMPT = 0.12,
+	SIN_PROGRESO = 1.2,
 	TIMEOUT_PILA = 6,
-	BLOQUEO = 10,             -- segundos que se evita una pila que no dio nada
+	BLOQUEO = 10,
 	FALLOS_LLENO = 3,
 	ESPERA_DESCARGA = 8,
 	ESPERA_DESCARGA_MANUAL = 4,
@@ -492,7 +492,7 @@ local function findMech()
 	return best
 end
 
--- Lista SOLO de tus mechas (los de otros jugadores no aparecen)
+-- Lista SOLO de tus mechas
 local function listMechs()
 	local out, seen = {}, {}
 	local function consider(m)
@@ -531,7 +531,51 @@ local function findByName(name)
 	return nil
 end
 
-local function getMech()
+---------------------------------------------------------------
+-- CAPACIDAD DEL MECHA ELEGIDO
+---------------------------------------------------------------
+-- Copia CarryMax (o CarryCapacity en modo CarryCapacity) a tu capacidad manual
+local function syncCapFromMech(mech)
+	if not mech then return false end
+	local cap = tonumber(mech:GetAttribute("CarryCapacity"))
+	local max = tonumber(mech:GetAttribute("CarryMax"))
+	local v
+	if S.limitMode == "CAP" then
+		v = cap or max
+	else
+		v = max or cap
+	end
+	if not v or v < 1 then return false end
+	S.manualCap = math.floor(v)
+	saveNow()
+	return true
+end
+
+local watchedMech = nil
+local watchConns = {}
+
+-- Vigila CarryCapacity y CarryMax del mecha elegido para actualizar la capacidad si cambian
+local function watchMech(mech, doSync)
+	for _, c in ipairs(watchConns) do
+		c:Disconnect()
+	end
+	watchConns = {}
+	watchedMech = mech
+	if not mech then return end
+
+	if doSync then
+		syncCapFromMech(mech)
+	end
+	for _, attr in ipairs({ "CarryCapacity", "CarryMax" }) do
+		table.insert(watchConns, mech:GetAttributeChangedSignal(attr):Connect(function()
+			if watchedMech == mech then
+				syncCapFromMech(mech)
+			end
+		end))
+	end
+end
+
+local function resolveMech()
 	local now = os.clock()
 
 	if S.mechPickName then
@@ -555,6 +599,15 @@ local function getMech()
 	return S.mech
 end
 
+local function getMech()
+	local m = resolveMech()
+	if m ~= watchedMech then
+		watchMech(m, false)
+	end
+	return m
+end
+
+-- Al elegir un mecha (o Automático) se toma su capacidad
 local function setMechPick(m)
 	S.mechPick = m
 	S.mechPickName = m and m.Name or nil
@@ -564,6 +617,7 @@ local function setMechPick(m)
 		S.session = {}
 	end
 	S.fails = 0
+	watchMech(m, m ~= nil)
 	save()
 end
 
@@ -1139,7 +1193,17 @@ local function refreshUI()
 end
 
 ---------------------------------------------------------------
--- AUTO-RECOLECCIÓN (rápida: pasa a la siguiente pieza en cuanto baja el contador)
+-- EVASIÓN Y ESPERAS SEGURAS (sin cambios)
+---------------------------------------------------------------
+local function esperarSeguro(seg)
+	local t0 = os.clock()
+	while os.clock() - t0 < seg and not S.closed and S.on do
+		RunService.Heartbeat:Wait()
+	end
+end
+
+---------------------------------------------------------------
+-- AUTO-RECOLECCIÓN
 ---------------------------------------------------------------
 local function collectPile(mech, entry)
 	local inst = entry.inst
@@ -1172,7 +1236,6 @@ local function collectPile(mech, entry)
 			end
 			local c1 = readCount(inst)
 			if c1 < c0 then
-				-- Pieza recogida: se cuenta y se pasa a la siguiente sin esperar
 				addCarried(entry.kind, c0 - c1)
 				got = true
 				break
@@ -1536,7 +1599,7 @@ ui.autoBtn.LayoutOrder = 2
 ui.autoBtn.TextColor3 = COLOR.white
 
 local manualCard = card(pageAuto, 3, 84)
-lbl(manualCard, "CAPACIDAD DE TU ROBOT (manual)", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 6), 9, COLOR.sub, Enum.Font.GothamBold)
+lbl(manualCard, "CAPACIDAD DE TU ROBOT (del mecha elegido)", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 6), 9, COLOR.sub, Enum.Font.GothamBold)
 
 local manualBox = Instance.new("TextBox")
 manualBox.Size = UDim2.fromOffset(90, 26)
@@ -1684,12 +1747,15 @@ local rMech = row(pageMecha, 6, 32)
 local autoMechBtn = btn(rMech, "🤖 Automático", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
 local listMechBtn = btn(rMech, "🔄 Mis mechas", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 11)
 
-local rDiag = row(pageMecha, 7, 32)
+local rCap = row(pageMecha, 7, 32)
+local syncCapBtn = btn(rCap, "🔄 Tomar capacidad del mecha", UDim2.new(1, 0, 1, 0), nil, COLOR.btn, 11)
+
+local rDiag = row(pageMecha, 8, 32)
 local statsBtn = btn(rDiag, "📊 Stats", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 local scanBtn = btn(rDiag, "🔎 Escanear", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
-ui.mechNote = note(pageMecha, 8)
-ui.scanNote = note(pageMecha, 9)
+ui.mechNote = note(pageMecha, 9)
+ui.scanNote = note(pageMecha, 10)
 
 -- Burbuja
 ui.bubble = Instance.new("TextButton")
@@ -1913,11 +1979,15 @@ ui.speedBtn.Activated:Connect(function()
 end)
 
 -- Ciclo de límite: CarryMax -> CarryCapacity -> Manual -> CarryMax
+-- Al entrar en Manual toma la capacidad del mecha elegido
 ui.limitBtn.Activated:Connect(function()
 	if S.limitMode == "MAX" then
 		S.limitMode = "CAP"
 	elseif S.limitMode == "CAP" then
 		S.limitMode = "MANUAL"
+		if S.mech then
+			syncCapFromMech(S.mech)
+		end
 	else
 		S.limitMode = "MAX"
 	end
@@ -1950,7 +2020,7 @@ local function cycleMech(step)
 		setStatus("🤖 Mecha: automático", COLOR.cyan)
 	else
 		setMechPick(list[idx])
-		setStatus("🤖 Mecha: " .. list[idx].Name, COLOR.cyan)
+		setStatus("🤖 Mecha: " .. list[idx].Name .. " · cap " .. S.manualCap, COLOR.cyan)
 	end
 	refreshMechInfo()
 	refreshUI()
@@ -1978,6 +2048,20 @@ listMechBtn.Activated:Connect(function()
 	ui.scanNote.Text = table.concat(lines, "\n")
 	print("--- MIS MECHAS ---")
 	for _, l in ipairs(lines) do print(l) end
+end)
+
+syncCapBtn.Activated:Connect(function()
+	local mech = getMech()
+	if not mech then
+		setStatus("❌ No hay mecha seleccionado", COLOR.red)
+		return
+	end
+	if syncCapFromMech(mech) then
+		setStatus("✅ Capacidad = " .. S.manualCap .. " (del mecha)", COLOR.green)
+	else
+		setStatus("❌ El mecha no tiene CarryCapacity ni CarryMax", COLOR.red)
+	end
+	refreshUI()
 end)
 
 statsBtn.Activated:Connect(function()
