@@ -1,6 +1,7 @@
--- MECHA PANEL v8 · Plot automático + recolección solo en pilas con piezas (count > 0)
+-- MECHA PANEL v9 · Plot automático + regreso por vida baja + solo pilas con cantidad
 -- LocalScript móvil. Piezas: Workspace.World.Arenas.<Nivel>.PartPiles
 -- Plot: atributo "Plot" de tu jugador -> Workspace.World.Plots.Plot<n>
+-- Vida: atributo/valor "Health" del mecha. Vida máxima: MaxHealth/MaxHP/HealthMax
 -- Todo lo que cambies se guarda en MechaPanel_v3.json (writefile)
 
 local Players = game:GetService("Players")
@@ -32,6 +33,11 @@ local CFG = {
 	MAX_VUELO = 60,
 	ALTURA = 4,
 	RANGO_RECOGER = 40,
+
+	VIDA_DEFECTO = 30,
+	VIDA_PASO = 10,
+	VIDA_MAX = 1000000,
+	ESPERA_VIDA = 120,        -- segundos máximos esperando curarse en el Plot
 
 	ESPERA_PROMPT = 0.12,
 	SIN_PROGRESO = 1.2,
@@ -86,6 +92,9 @@ local LIMIT_LABEL = {
 	MANUAL = "Límite: Manual (tu número)",
 }
 
+local HEALTH_NAMES = { "Health" }
+local MAXHEALTH_NAMES = { "MaxHealth", "MaxHP", "HealthMax", "MaxHp" }
+
 ---------------------------------------------------------------
 -- ESTADO
 ---------------------------------------------------------------
@@ -112,6 +121,10 @@ local S = {
 	manualCap = CFG.MANUAL_DEFECTO,
 	carried = 0,
 
+	healOn = true,
+	healthMin = CFG.VIDA_DEFECTO,
+	maxHealthSeen = nil,
+
 	mechPick = nil,
 	mechPickName = nil,
 	mech = nil,
@@ -131,6 +144,7 @@ for _, t in ipairs(TYPES) do
 end
 
 local ui = {}
+local setStatus -- se define más abajo
 
 ---------------------------------------------------------------
 -- GUARDADO / CARGA
@@ -148,6 +162,9 @@ local function saveNow()
 		manualCap = S.manualCap,
 		carried = S.carried,
 		session = S.session,
+		healOn = S.healOn,
+		healthMin = S.healthMin,
+		maxHealthSeen = S.maxHealthSeen,
 		mech = S.mechPickName,
 		base = S.base and { S.base.X, S.base.Y, S.base.Z } or nil,
 		zone = S.zone and { S.zone.X, S.zone.Y, S.zone.Z } or nil,
@@ -205,6 +222,11 @@ local function loadSaved()
 			if v and v > 0 then S.session[t.key] = math.floor(v) end
 		end
 	end
+	if data.healOn == false then S.healOn = false end
+	local hm = tonumber(data.healthMin)
+	if hm and hm >= 0 then S.healthMin = math.floor(hm) end
+	local mh = tonumber(data.maxHealthSeen)
+	if mh and mh > 0 then S.maxHealthSeen = mh end
 	if type(data.mech) == "string" and data.mech ~= "" then S.mechPickName = data.mech end
 	if type(data.base) == "table" and #data.base == 3 then
 		S.base = Vector3.new(data.base[1], data.base[2], data.base[3])
@@ -710,7 +732,7 @@ local function pilotActive(mech)
 	return mech:GetAttribute("PilotMode") == "Seat"
 end
 
--- Destino de descarga: tu Plot. Si no se encuentra, la base manual. Si tampoco, el marcador del mapa.
+-- Destino de descarga y curación: tu Plot. Si no se encuentra, la base manual. Si tampoco, el marcador del mapa.
 local function getBasePos()
 	local plot = getPlot()
 	if plot then
@@ -725,6 +747,58 @@ local function getBasePos()
 		return plotPos(m)
 	end
 	return nil
+end
+
+---------------------------------------------------------------
+-- VIDA DEL MECHA
+---------------------------------------------------------------
+local function readNum(mech, names)
+	for _, n in ipairs(names) do
+		local v = mech:GetAttribute(n)
+		if v == nil then
+			local c = mech:FindFirstChild(n)
+			if c and c:IsA("ValueBase") then
+				v = c.Value
+			end
+		end
+		local num = tonumber(v)
+		if num then
+			return num
+		end
+	end
+	return nil
+end
+
+local function healthNow(mech)
+	if not mech then return nil end
+	return readNum(mech, HEALTH_NAMES)
+end
+
+-- Vida "llena": MaxHealth si existe; si no, la mayor vida vista en el mecha
+local function healthTarget(mech)
+	local mx = mech and readNum(mech, MAXHEALTH_NAMES)
+	if mx and mx > 0 then
+		return mx
+	end
+	if S.maxHealthSeen and S.maxHealthSeen > 0 then
+		return S.maxHealthSeen
+	end
+	return 100
+end
+
+local function learnHealth(mech)
+	local h = healthNow(mech)
+	if h and h > (S.maxHealthSeen or 0) then
+		S.maxHealthSeen = h
+		save()
+	end
+end
+
+-- true si la vida está en o por debajo del mínimo elegido
+local function needsHeal(mech)
+	if not S.healOn or not mech then return false end
+	local h = healthNow(mech)
+	return h ~= nil and h <= S.healthMin
 end
 
 ---------------------------------------------------------------
@@ -1043,7 +1117,6 @@ local function pileCount(inst)
 	return nil
 end
 
--- Lectura segura para cálculos: si no hay "count", cuenta 1
 local function readCount(inst)
 	return pileCount(inst) or 1
 end
@@ -1065,14 +1138,13 @@ local function firstPart(inst)
 	return inst:FindFirstChildWhichIsA("BasePart", true)
 end
 
--- Una pila solo es útil si: existe, tiene piezas (count > 0 cuando hay count),
--- y tiene un prompt activo (o el ejecutor puede tocarla)
+-- Una pila solo es útil si: existe, tiene count mayor que 0 y tiene un prompt activo (o se puede tocar)
 local function pileUsable(inst)
 	if not pileAlive(inst) then
 		return false
 	end
 	local c = pileCount(inst)
-	if c ~= nil and c <= 0 then
+	if c == nil or c <= 0 then
 		return false
 	end
 	for _, p in ipairs(promptsOf(inst)) do
@@ -1116,7 +1188,7 @@ local function triggerPile(inst)
 	return false
 end
 
--- Pila útil más cercana. Ignora pilas vacías (count = 0) y tipos con cupo completo.
+-- Pila útil más cercana. Ignora pilas sin cantidad y tipos con cupo completo.
 local function nextPile(mech, origin)
 	local now = os.clock()
 	local best, bestDist
@@ -1181,7 +1253,7 @@ local function setState(text, color)
 end
 
 local msgToken = 0
-function setStatus(text, color)
+setStatus = function(text, color)
 	msgToken += 1
 	local my = msgToken
 	if ui.msgLbl then
@@ -1229,6 +1301,7 @@ local function refreshMechInfo()
 	table.insert(lines, "CarryTotal: " .. tostring(mech:GetAttribute("CarryTotal"))
 		.. " · CarryCapacity: " .. tostring(mech:GetAttribute("CarryCapacity"))
 		.. " · CarryMax: " .. tostring(mech:GetAttribute("CarryMax")))
+	table.insert(lines, "Health: " .. tostring(healthNow(mech)) .. " · vida llena: " .. tostring(healthTarget(mech)))
 	local br = carryBreakdown(mech)
 	if br ~= "" then
 		table.insert(lines, "Detalle: " .. br)
@@ -1270,6 +1343,16 @@ local function refreshUI()
 	ui.moveBtn.Text = S.moveMode == "GLIDE" and "Mover: Deslizar" or "Mover: Teletransporte"
 	ui.mechLbl.Text = S.mechPickName or "Automático"
 
+	-- Vida
+	ui.healVal.Text = tostring(S.healthMin)
+	local mechH = S.mech
+	local hNow = healthNow(mechH)
+	local hTxt = hNow and (tostring(hNow) .. "/" .. tostring(healthTarget(mechH))) or "?"
+	ui.healthLbl.Text = "Vida " .. hTxt .. " · regresa al Plot con " .. S.healthMin .. " o menos"
+		.. (S.healOn and "" or " (desactivado)")
+	ui.healthLbl.TextColor3 = (hNow and hNow <= S.healthMin and S.healOn) and COLOR.red or COLOR.sub
+	ui.healToggle.set(S.healOn)
+
 	local plot, errPlot = getPlot()
 	local plotTxt = plot and (plot.Name .. " ✔") or "✖ (" .. tostring(errPlot) .. ")"
 	local manualTxt = S.base and "guardada" or "✖"
@@ -1298,13 +1381,48 @@ local function refreshUI()
 end
 
 ---------------------------------------------------------------
+-- CURACIÓN: vuelve al Plot y espera hasta tener la vida llena
+---------------------------------------------------------------
+local function healStep(mech)
+	local base = getBasePos()
+	if not base then
+		setState("Vida baja · sin Plot", COLOR.red)
+		task.wait(2)
+		return
+	end
+
+	setState("Vida baja · vuelvo al Plot", COLOR.red)
+	if not moveTo(mech, base + Vector3.new(0, CFG.ALTURA, 0)) then
+		task.wait(1)
+		return
+	end
+
+	setState("Curándose...", COLOR.amber)
+	local t0 = os.clock()
+	while S.on and not S.closed and mech.Parent and os.clock() - t0 < CFG.ESPERA_VIDA do
+		local h = healthNow(mech)
+		if h == nil or h >= healthTarget(mech) then
+			break
+		end
+		task.wait(0.5)
+	end
+
+	local h = healthNow(mech)
+	if h and h >= healthTarget(mech) then
+		setStatus("✅ Vida llena, sigo recolectando", COLOR.green)
+	else
+		setStatus("⚠ Vida no llegó a llena; sigo con lo que hay", COLOR.amber)
+	end
+	S.pileDirty = true
+end
+
+---------------------------------------------------------------
 -- AUTO-RECOLECCIÓN
 ---------------------------------------------------------------
 local function collectPile(mech, entry)
 	local inst = entry.inst
 	local name = typeLabel(entry.kind)
 
-	-- Si la pila se vació mientras íbamos hacia ella, no vamos
 	if not pileUsable(inst) then
 		S.pileDirty = true
 		return
@@ -1318,9 +1436,13 @@ local function collectPile(mech, entry)
 		return
 	end
 
-	-- Al llegar, si ya no tiene piezas, se salta sin esperar
 	if not pileUsable(inst) then
 		S.pileDirty = true
+		return
+	end
+
+	-- Si la vida bajó mientras íbamos, no recolecta: el ciclo principal la atiende
+	if needsHeal(mech) then
 		return
 	end
 
@@ -1347,7 +1469,6 @@ local function collectPile(mech, entry)
 				got = true
 				break
 			end
-			-- Pila vacía: se termina aquí
 			if c1 <= 0 then
 				break
 			end
@@ -1367,6 +1488,12 @@ local function collectPile(mech, entry)
 			if c1 ~= nil and c1 <= 0 then
 				break
 			end
+		end
+
+		-- La vida bajó durante la recogida: se corta sin castigar la pila
+		if needsHeal(mech) then
+			got = true
+			break
 		end
 
 		if os.clock() - t0 > CFG.SIN_PROGRESO then
@@ -1453,6 +1580,12 @@ local function autoStep()
 	if not origin then
 		setState("Esperando personaje", COLOR.sub)
 		task.wait(1)
+		return
+	end
+
+	-- Prioridad 1: vida baja → Plot hasta tener la vida llena
+	if needsHeal(mech) then
+		healStep(mech)
 		return
 	end
 
@@ -1591,7 +1724,7 @@ local function scanPiles()
 	table.insert(lines, 1, "Piezas: " .. totalPiles
 		.. " · con prompt: " .. withPrompt
 		.. " · con count: " .. withCount
-		.. " · vacías (count 0): " .. empty)
+		.. " · vacías o sin count: " .. (totalPiles - withCount + empty))
 	ui.scanNote.Text = table.concat(lines, "\n")
 
 	print("--- ESCANEO DE PARTPILES ---")
@@ -1790,7 +1923,7 @@ local allBtn = btn(rAll, "✔ Todos", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 
 local noneBtn = btn(rAll, "✖ Ninguno", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
 local typeNote = note(pageTipos, #TYPES + 2)
-typeNote.Text = "Solo se recogen los tipos marcados. Las pilas con count 0 se ignoran."
+typeNote.Text = "Solo se recogen los tipos marcados. Las pilas sin cantidad (count 0 o sin count) se ignoran y se busca otra."
 
 ---------------------------------------------------------------
 -- PESTAÑA CUPOS
@@ -1880,12 +2013,39 @@ local listMechBtn = btn(rMech, "🔄 Mis mechas", UDim2.new(0.5, -3, 1, 0), nil,
 local rCap = row(pageMecha, 7, 32)
 local syncCapBtn = btn(rCap, "🔄 Tomar capacidad del mecha", UDim2.new(1, 0, 1, 0), nil, COLOR.btn, 11)
 
-local rDiag = row(pageMecha, 8, 32)
+-- Vida mínima para regresar al Plot
+local healCard = card(pageMecha, 8, 46)
+lbl(healCard, "VIDA MÍNIMA (regresa al Plot)", UDim2.new(1, -20, 0, 12), UDim2.fromOffset(10, 4), 9, COLOR.sub, Enum.Font.GothamBold)
+local hMinus = btn(healCard, "−", UDim2.fromOffset(40, 26), UDim2.fromOffset(8, 16), COLOR.btn, 16)
+local hPlus = btn(healCard, "+", UDim2.fromOffset(40, 26), UDim2.new(1, -48, 0, 16), COLOR.btn, 16)
+ui.healVal = lbl(healCard, "30", UDim2.new(1, -110, 0, 26), UDim2.fromOffset(55, 16), 16, COLOR.green, Enum.Font.GothamBlack)
+ui.healVal.TextXAlignment = Enum.TextXAlignment.Center
+
+hMinus.Activated:Connect(function()
+	S.healthMin = math.max(0, S.healthMin - CFG.VIDA_PASO)
+	saveNow()
+	refreshUI()
+end)
+hPlus.Activated:Connect(function()
+	S.healthMin = math.min(CFG.VIDA_MAX, S.healthMin + CFG.VIDA_PASO)
+	saveNow()
+	refreshUI()
+end)
+
+ui.healToggle = toggleRow(pageMecha, 9, "Regresar al Plot con poca vida", S.healOn, function(v)
+	S.healOn = v
+	saveNow()
+	refreshUI()
+end)
+
+ui.healthLbl = note(pageMecha, 10)
+
+local rDiag = row(pageMecha, 11, 32)
 local statsBtn = btn(rDiag, "📊 Stats", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 local scanBtn = btn(rDiag, "🔎 Escanear", UDim2.new(0.5, -3, 1, 0), nil, COLOR.btn, 12)
 
-ui.mechNote = note(pageMecha, 9)
-ui.scanNote = note(pageMecha, 10)
+ui.mechNote = note(pageMecha, 12)
+ui.scanNote = note(pageMecha, 13)
 
 -- Burbuja
 ui.bubble = Instance.new("TextButton")
@@ -2286,6 +2446,9 @@ task.spawn(function()
 	local tick = 0
 	while not S.closed do
 		local mech = getMech()
+		if mech then
+			learnHealth(mech)
+		end
 		if not S.on and (mech or S.limitMode == "MANUAL") then
 			local total, limit = getCarry(mech)
 			S.total, S.limit = total, limit
