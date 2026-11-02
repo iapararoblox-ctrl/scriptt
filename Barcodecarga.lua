@@ -11,7 +11,7 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- CONFIGURACIÓN
 ---------------------------------------------------------------
 local GUI_NAME = "TPDestinosPanel"
-local ALTURA_CAIDA = 150      -- studs por ENCIMA del destino: apareces arriba y caes hasta la isla
+local ALTURA_CAIDA = 10      -- studs por ENCIMA del destino: apareces arriba y caes hasta la isla
 local USAR_EN_VIVO = true     -- true: usa la posición del objeto si existe; false: usa solo la coordenada fija
 local AUTO_MINIMIZAR = false  -- true: el panel se minimiza solo después de teletransportarte
 
